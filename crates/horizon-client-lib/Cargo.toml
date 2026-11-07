@@ -6,7 +6,7 @@ autotests = false
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-rust-version = "1.90"
+rust-version.workspace = true
 description = "Reusable client systems, control tool and parity probes"
 
 [lib]
@@ -18,6 +18,8 @@ horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input" }
 horizon-client-render = { path = "../horizon-client-render" }
 horizon-command = { path = "../horizon-command" }
+# Emotes pose the player model (`Mob::emote`, `mobs::anim::setup`).
+horizon-cosmetics = { path = "../horizon-cosmetics" }
 horizon-items = { path = "../horizon-items" }
 horizon-core = { path = "../horizon-core" }
 # `horizon-ctl mcp`: the Model Context Protocol, shared with the launcher and the server.
@@ -30,6 +32,8 @@ horizon-world = { path = "../horizon-world" }
 horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
 horizon-server-files = { path = "../horizon-server-files" }
+# The control endpoint's token (control.rs), as horizon-server's and the relay's.
+getrandom = "0.3"
 # The dedicated server's anticheat, off unless server.toml's [anticheat] turns it on (docs/anticheat.md).
 horizon-anticheat = { path = "../horizon-anticheat" }
 # The dedicated server's chat filter: [chat_filter], the slur list, mutes (docs/chat-filter.md).

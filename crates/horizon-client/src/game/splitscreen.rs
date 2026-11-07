@@ -86,7 +86,7 @@ impl<'a> Game<'a> {
         };
         let audio = Audio::silent(&self.options.resources);
         // The resources outlive both games; the second borrows them as the first does.
-        let res = &self.resource_source;
+        let res = self.resource_source;
         let mut guest = Game::new(res, self.pack.clone(), gui, options, settings, audio, None)?;
         guest.splitscreen.guest = true;
         guest.focused = self.focused;

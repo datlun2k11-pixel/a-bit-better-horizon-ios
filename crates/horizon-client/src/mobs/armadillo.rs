@@ -160,6 +160,12 @@ impl Goal for BabyFollowAdult {
 pub fn scared(m: &Mob) -> bool {
     m.extra.armadillo.state != IDLE
 }
+/// `Armadillo.mobInteract` on a client: a rolled-up armadillo returns FAIL
+/// before `Animal.mobInteract`, so its food does not consume the click. A
+/// brush still goes on to `brushOffScute`.
+pub fn client_rejects_food(m: &Mob, item: &str) -> bool {
+    scared(m) && item != "minecraft:brush"
+}
 /// `ArmadilloState.shouldHideInShell`: the model shows its shell.
 pub fn hiding_in_shell(m: &Mob) -> bool {
     let a = &m.extra.armadillo;
@@ -266,6 +272,8 @@ pub fn environmental(kind: DamageKind) -> bool {
             | DamageKind::Lava
             | DamageKind::LightningBolt
             | DamageKind::HotFloor
+            | DamageKind::Freeze
+            | DamageKind::SulfurCubeHot
     )
 }
 /// The hurt sound: a ball's is muffled, and it has no ambient sound
@@ -594,6 +602,18 @@ mod tests {
         m
     }
 
+    /// Spider eyes are armadillo food. Rolled up, the click fails; a brush
+    /// does not. Idle, food is left to `Animal.mobInteract`.
+    #[test]
+    fn a_rolled_up_armadillo_refuses_food() {
+        let mut m = armadillo();
+        set_state(&mut m, SCARED);
+        assert!(client_rejects_food(&m, "minecraft:spider_eye"));
+        assert!(!client_rejects_food(&m, "minecraft:brush"));
+        set_state(&mut m, IDLE);
+        assert!(!client_rejects_food(&m, "minecraft:spider_eye"));
+    }
+
     #[test]
     fn a_hit_rolls_it_up_into_a_ball() {
         // Armadillo.actuallyHurt: a hit by a living thing curls it up and
@@ -786,5 +806,46 @@ mod tests {
         assert!(source.no_knockback());
         assert!(!source.causes_panic());
         assert!(!environmental(DamageKind::Campfire));
+    }
+}
+
+#[cfg(test)]
+mod panic_environmental_tests {
+    use super::*;
+
+    /// `#panic_environmental_causes` from the vanilla data: every type in it
+    /// panics the armadillo (`Armadillo.actuallyHurt` rolls out).
+    #[test]
+    fn the_environmental_causes_are_vanillas_tag() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION)
+            .join("data/minecraft/tags/damage_type/panic_environmental_causes.json");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut ids: Vec<&str> = json["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        let kinds = [
+            ("minecraft:cactus", DamageKind::Cactus),
+            ("minecraft:freeze", DamageKind::Freeze),
+            ("minecraft:hot_floor", DamageKind::HotFloor),
+            ("minecraft:in_fire", DamageKind::InFire),
+            ("minecraft:lava", DamageKind::Lava),
+            ("minecraft:lightning_bolt", DamageKind::LightningBolt),
+            ("minecraft:on_fire", DamageKind::OnFire),
+            ("minecraft:sulfur_cube_hot", DamageKind::SulfurCubeHot),
+        ];
+        assert_eq!(ids, kinds.map(|(id, _)| id).to_vec());
+        for (id, kind) in kinds {
+            assert!(environmental(kind), "{id}");
+        }
+        assert!(!environmental(DamageKind::Drown));
     }
 }

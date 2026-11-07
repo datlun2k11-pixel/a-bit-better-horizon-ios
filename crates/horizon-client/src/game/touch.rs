@@ -5,6 +5,7 @@
 use super::{Game, Screen, event_loop::EventLoopCtl};
 use horizon_client::{
     Result,
+    held::Source,
     hud::HudBatch,
     keymapping::SNEAK,
     touch::{self, Control, Out, Touches},
@@ -373,7 +374,7 @@ impl Game<'_> {
                         }
                         _ => {
                             if let Some(key) = key_of(control) {
-                                self.mapped_key(key, pressed, false, key)?;
+                                self.mapped_key(key, pressed, false, key, Source::Keyboard)?;
                             }
                         }
                     }
@@ -437,7 +438,7 @@ impl Game<'_> {
             // The same path as a live release: a toggle button ignores it.
             Control::Custom(id) => self.touch_custom_key(event_loop, id, false),
             _ => match key_of(control) {
-                Some(key) => self.mapped_key(key, false, false, key),
+                Some(key) => self.mapped_key(key, false, false, key, Source::Keyboard),
                 None => Ok(()),
             },
         }

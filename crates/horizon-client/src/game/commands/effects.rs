@@ -65,8 +65,9 @@ impl Game<'_> {
         for t in self.living_targets(ctx)? {
             let changed = match t {
                 Target::Player | Target::Guest(_) => {
-                    let mut instance = EffectInstance::new(effect.id, duration, amplifier);
-                    instance.visible = particles;
+                    // `new MobEffectInstance(effect, duration, amplifier, false, particles)`.
+                    let instance = EffectInstance::new(effect.id, duration, amplifier)
+                        .with_flags(false, particles);
                     self.for_player(t, |g| g.add_player_effect(instance))
                         .unwrap_or(false)
                 }
@@ -75,9 +76,18 @@ impl Game<'_> {
                         let name = namespaced(effect.id);
                         let new = !m.has_effect(name);
                         // `new MobEffectInstance(effect, duration, amplifier, false, particles)`.
-                        m.add_effect_with(name, duration, amplifier, false, particles);
+                        let changed =
+                            m.add_effect_with(name, duration, amplifier, false, particles);
+                        // MobEffect.onEffectAdded: an omen's sound, at the mob's feet.
+                        if new
+                            && changed
+                            && let Some(sound) = super::super::potions::sound_on_added(name)
+                        {
+                            let at = [m.position.x, m.position.y, m.position.z];
+                            self.audio.play(sound, Some(at), 1.0, 1.0);
+                        }
                         self.mod_effect_added(name, Some(id as i32), amplifier, new);
-                        true
+                        changed
                     }
                     None => false,
                 },

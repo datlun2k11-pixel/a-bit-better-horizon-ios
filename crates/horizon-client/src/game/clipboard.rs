@@ -13,13 +13,7 @@ impl Game<'_> {
             return None;
         }
         let m = self.modifiers;
-        let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.keys.contains(k));
-        // InputQuirks.EDIT_SHORTCUT_KEY_MODIFIER: Cmd on macOS, Ctrl elsewhere.
-        let edit = if cfg!(any(target_os = "macos", target_os = "ios")) {
-            m.super_key() || held([KeyCode::SuperLeft, KeyCode::SuperRight])
-        } else {
-            m.control_key() || held([KeyCode::ControlLeft, KeyCode::ControlRight])
-        };
+        let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.physical_keys.contains(k));
         clipboard::edit_shortcut(
             clipboard::shortcut_letter(&event.logical_key, event.physical_key),
             self.has_control_down_with_quirk(),
@@ -29,9 +23,11 @@ impl Game<'_> {
     }
     /// `InputWithModifiers.hasControlDownWithQuirk`: the edit shortcuts'
     /// modifier (`InputQuirks.EDIT_SHORTCUT_KEY_MODIFIER`: Cmd on macOS, Ctrl
-    /// elsewhere), held on the keyboard or by an agent.
+    /// elsewhere), held on the keyboard or by an agent. It reads the physical
+    /// keys, never `keys`: a latched sprint or sneak toggle puts Control or
+    /// Shift in `keys` without the key being down.
     pub(super) fn has_control_down_with_quirk(&self) -> bool {
-        let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.keys.contains(k));
+        let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.physical_keys.contains(k));
         if cfg!(target_os = "macos") {
             self.modifiers.super_key() || held([KeyCode::SuperLeft, KeyCode::SuperRight])
         } else {

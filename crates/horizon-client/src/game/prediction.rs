@@ -78,8 +78,9 @@ impl Game<'_> {
                 player: body,
                 scene: &mut self.world,
                 assets: &self.pack.assets,
-                collision_binding: &self.collision,
-                resources: &self.motion,
+                collision_binding: self.collision,
+                resources: self.motion,
+                health: &self.health_resources,
             }
             .replayed_tick(keys, sprinting)
         };
@@ -157,8 +158,10 @@ fn excused(g: &Guest, world: &World, entities: &[EntityState], guests: &[Guest])
     };
     let unsent = world
         .block_log
-        .as_ref()
-        .is_some_and(|log| log.iter().any(|&(x, y, z)| near(at, [x, y, z], slack)));
+        .iter()
+        .flatten()
+        .chain(&world.block_log_held)
+        .any(|&(x, y, z)| near(at, [x, y, z], slack));
     let pistons = world
         .moving_pistons
         .iter()
