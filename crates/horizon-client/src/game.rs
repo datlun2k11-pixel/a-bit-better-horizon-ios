@@ -17336,6 +17336,16 @@ impl ApplicationHandler for Game<'_> {
             attributes,
             winit::platform::ios::ValidOrientations::Landscape,
         );
+        // The hotbar sits under the home indicator on iPhone X and later, so a swipe to pick a slot
+        // quit to the Home screen. Auto-hide the bar and defer the system gestures on every edge:
+        // the first swipe now reveals the indicator, the second one leaves the app.
+        #[cfg(target_os = "ios")]
+        let attributes = {
+            use winit::platform::ios::{ScreenEdge, WindowAttributesExtIOS as _};
+            attributes
+                .with_prefers_home_indicator_hidden(true)
+                .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL)
+        };
         // On iOS winit makes the UIWindow's frame out of the inner size, so a desktop size larger than the
         // screen in points crops the game off the right and bottom; with none the window is the screen.
         #[cfg(not(target_os = "ios"))]
@@ -21482,6 +21492,16 @@ impl Loading {
             attributes,
             winit::platform::ios::ValidOrientations::Landscape,
         );
+        // The hotbar sits under the home indicator on iPhone X and later, so a swipe to pick a slot
+        // quit to the Home screen. Auto-hide the bar and defer the system gestures on every edge:
+        // the first swipe now reveals the indicator, the second one leaves the app.
+        #[cfg(target_os = "ios")]
+        let attributes = {
+            use winit::platform::ios::{ScreenEdge, WindowAttributesExtIOS as _};
+            attributes
+                .with_prefers_home_indicator_hidden(true)
+                .with_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL)
+        };
         // On iOS winit makes the UIWindow's frame out of the inner size, so a desktop size larger than the
         // screen in points crops the game off the right and bottom; with none the window is the screen.
         #[cfg(not(target_os = "ios"))]
