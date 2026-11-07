@@ -118,7 +118,7 @@ final class UpdateChecker: ObservableObject {
                 return
             }
             let mine = Self.parts(Self.currentVersion) ?? []
-            guard let newest = Self.parse(data).filter({ $0.version > mine }).max(by: { $0.version < $1.version }) else {
+            guard let newest = Self.parse(data).filter({ Self.isNewer($0.version, than: mine) }).max(by: { Self.isNewer($1.version, than: $0.version) }) else {
                 state = .upToDate
                 LauncherLog.write("update check: up to date")
                 return
@@ -155,6 +155,12 @@ final class UpdateChecker: ObservableObject {
             .prefix(while: { $0.isNumber || $0 == "." })
         let parts = numbers.split(separator: ".").compactMap { Int($0) }
         return parts.isEmpty ? nil : parts
+    }
+
+    /// Version arrays compare part by part (`0.2.10` is newer than `0.2.9`); Swift's arrays have no order of their own.
+    private static func isNewer(_ a: [Int], than b: [Int]) -> Bool {
+        for (lhs, rhs) in zip(a, b) where lhs != rhs { return lhs > rhs }
+        return a.count > b.count
     }
 }
 
