@@ -1,15 +1,19 @@
 name: ios
 # The game for iPhone and iPad, and nothing else: the Rust game cross-compiled for aarch64-apple-ios, wrapped by
-# packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa. No tests run here. The .ipa is then posted to Discord when the repository secret
-# DISCORD_IPA_WEBHOOK is set.
+# packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa. No tests run here. Every build —
+# a commit's CI run, a pull request, or the 06:00 America/New_York nightly schedule — replaces the .ipa on the single
+# `ios-nightly` pre-release, which always carries the newest build and names the commit it was made from in its notes.
 on:
   push:
     branches: [main]
   workflow_dispatch:
   pull_request:
     branches: [main]
+  schedule:
+    # 06:00 New York, whether Eastern Daylight or Standard time (GitHub cron evaluates in UTC).
+    - cron: '11 10 * * *'
 permissions:
-  contents: read
+  contents: write      # creating/updating the ios-nightly pre-release and its assets
 concurrency:
   group: ios-${{ github.sha }}
   cancel-in-progress: false
@@ -100,31 +104,38 @@ jobs:
           path: Horizon-game-unsigned.ipa
           retention-days: 7
           if-no-files-found: error
-      - name: Send the .ipa to Discord
-        # Delivery is optional: the IPA is already available in the run's artifacts.
-        continue-on-error: true
-        if: github.event_name != 'pull_request' && env.DISCORD_IPA_WEBHOOK != ''
+      - name: Publish on the ios-nightly pre-release
+        # The one place people try the newest iOS build: every CI build (a commit on main, a pull request, or the
+        # 06:00 New York schedule) replaces the .ipa on this single pre-release. Its notes always name the newest
+        # commit built and uploaded here. Forks have no releases to publish to.
+        if: github.repository == 'horizon-rust/horizon'
         env:
-          DISCORD_IPA_WEBHOOK: ${{ secrets.DISCORD_IPA_WEBHOOK }}
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          REF_NAME: ${{ github.event.pull_request.head.ref || github.ref_name }}
         run: |
-          set -uo pipefail
-          content=$(printf '%s\n' \
-            "**Horizon for iPhone and iPad, run #${GITHUB_RUN_NUMBER}**" \
-            "\`${GITHUB_REF_NAME}@${GITHUB_SHA::7}\`: an unsigned .ipa, with no assets" \
-            "🤖 Posted by \`.github/workflows/ios.yml\`, not by a person.")
-          response=$(mktemp)
-          trap 'rm -f "$response"' EXIT
-          if ! code=$(curl --connect-timeout 15 --max-time 120 -sS -o "$response" -w '%{http_code}' -X POST "$DISCORD_IPA_WEBHOOK" \
-            -F "content=$content" -F "file=@Horizon-game-unsigned.ipa;type=application/octet-stream"); then
-            echo "::warning::Could not reach Discord. The IPA is available in this run's artifacts."
-            exit 0
-          fi
-          case "$code" in
-            2*) echo "Posted the .ipa to Discord (HTTP $code)." ;;
-            404)
-              echo "::warning::Discord webhook no longer exists (HTTP 404). Replace the DISCORD_IPA_WEBHOOK repository secret. Download the IPA from this run's artifacts."
-              ;;
-            *)
-              echo "::warning::Discord delivery failed (HTTP $code). The IPA is available in this run's artifacts."
-              ;;
-          esac
+          set -euo pipefail
+          date=$(date -u +%Y-%m-%d)
+          {
+            echo "## Horizon iOS Nightly — unsigned test build"
+            echo
+            echo "> [!WARNING]"
+            echo "> This build has **not been reviewed or tested carefully**. It is an unsigned nightly for trying out"
+            echo "> the newest changes on iPhone and iPad; expect bugs and install it at your own risk."
+            echo
+            echo "**Latest commit built and uploaded:** \`${COMMIT}\` (\`${REF_NAME}\`, $date)"
+            echo
+            echo "Download \`Horizon-game-unsigned.ipa\` below and install it with your developer tooling (AltStore,"
+            echo "Sideloadly, Xcode, …): the .ipa is unsigned, so it must be re-signed for your own device."
+          } > notes.md
+          # Replace the asset in place: delete any old .ipa, then upload/create the release. `--target main` keeps
+          # the release pinned to main even when a pull request's build publishes it.
+          gh release delete-asset ios-nightly Horizon-game-unsigned.ipa --yes 2>/dev/null || true
+          gh release create ios-nightly --prerelease --latest=false --target main \
+            --title "iOS Nightly · $date · ${COMMIT:0:7}" \
+            --notes-file notes.md \
+            Horizon-game-unsigned.ipa 2>/dev/null \
+            || gh release upload ios-nightly Horizon-game-unsigned.ipa --clobber \
+            || { gh release edit ios-nightly --title "iOS Nightly · $date · ${COMMIT:0:7}"; \
+                 gh release upload ios-nightly Horizon-game-unsigned.ipa --clobber; }
+          gh release edit ios-nightly --notes-file notes.md
