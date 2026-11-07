@@ -305,6 +305,7 @@ impl Game<'_> {
         let (back, label) = self.back_button(layout);
         let atlas = &self.gui.atlas;
         let hover = inside(cursor, back);
+        horizon_client::widgets::declare_action(horizon_client::widgets::Action::Back, back, true);
         let sprite = if hover {
             "gui/sprites/widget/button_highlighted"
         } else {
@@ -452,6 +453,22 @@ impl Game<'_> {
                 );
             }
         }
+        if let Some((key, fallback)) = self.panel.transfer_warning {
+            let warning = self.translate(key, fallback);
+            let lines = [(
+                horizon_client::text::Text::literal(warning.clone()).resolve_legacy(),
+                rgba(255, 100, 100, 255),
+            )];
+            let (x, y, w, h) = Self::tooltip_geometry(
+                &self.gui.atlas,
+                &lines,
+                cursor,
+                (batch.width, batch.height),
+                [0.0; 2],
+            );
+            horizon_client::widgets::record(&warning, [x, y, w, h], false);
+            self.draw_tooltip_lines(batch, &lines, cursor.0, cursor.1);
+        }
     }
 
     /// The tabs, on slots; the selected one framed.
@@ -489,12 +506,11 @@ impl Game<'_> {
                 );
             }
             let name = self.pack.names.display_item(&stack.item);
-            horizon_client::widgets::record_as(
-                &format!("{name} tab"),
-                [x + 1.0, y + 1.0, 16.0, 16.0],
-                true,
-                horizon_client::widgets::Kind::Tab(i == selected),
-            );
+            let rect = [x + 1.0, y + 1.0, 16.0, 16.0];
+            let kind = horizon_client::widgets::Kind::Tab(i == selected);
+            horizon_client::widgets::record_as(&format!("{name} tab"), rect, true, kind);
+            // The kind reaches the bumpers only as a target (`key_focus::drawn_targets`).
+            horizon_client::widgets::target_as(rect, kind);
         }
     }
 

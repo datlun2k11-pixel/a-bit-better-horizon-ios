@@ -12,6 +12,8 @@ private var presentationPending = false
 public func horizonLauncherPresent(_ submit: HorizonSubmit?) -> Bool {
     Bridge.submit = submit
     Theme.registerFonts()
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    LauncherLog.write("launcher presented; Horizon \(version) on iOS \(UIDevice.current.systemVersion)")
     DispatchQueue.main.async { present(attempts: 20) }
     return true
 }
@@ -76,6 +78,7 @@ func turn(_ scene: UIWindowScene?, to orientations: UIInterfaceOrientationMask) 
         }
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: orientations)) { error in
             NSLog("Horizon orientation request failed: %@", error.localizedDescription)
+            LauncherLog.write("orientation request failed: \(error.localizedDescription)")
         }
     } else {
         // iOS 15 has no scene geometry request: UIKit turns when a view controller that supports the

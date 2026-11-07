@@ -134,6 +134,7 @@ final class GameOptions: ObservableObject {
 struct SettingsPage: View {
     @ObservedObject var link: GameLink
     @ObservedObject var download: GameFilesDownload
+    @ObservedObject var updates: UpdateChecker
     @State private var showingNews = false
 
     var body: some View {
@@ -141,8 +142,12 @@ struct SettingsPage: View {
             SectionHeader(title: "Game files")
             GameFilesCard(download: download, missing: !GameFolder.hasGameFiles)
 
+            SectionHeader(title: "Updates")
+            UpdateSettings(updates: updates)
+
             SectionHeader(title: "About")
             SecondaryButton(title: "What's New", icon: "sparkles") { showingNews = true }
+            ShareLogs()
             About(version: link.version)
         }
         .sheet(isPresented: $showingNews) {
@@ -153,6 +158,38 @@ struct SettingsPage: View {
             .horizonDetents(.large)
 
         }
+    }
+}
+
+/// The logs the engine and the launcher write, in one share sheet: what a bug report needs from the phone.
+private struct ShareLogs: View {
+    var body: some View {
+        SecondaryButton(title: "Share logs", icon: "square.and.arrow.up") { share() }
+    }
+
+    private func share() {
+        let documents = GameFolder.documents
+        var files = ["logs/latest.log", "logs/launcher.log", "logs/launcher-1.log", "horizon-boot.log"]
+            .map { documents.appendingPathComponent($0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        let crashes = documents.appendingPathComponent("crash-reports")
+        let newest = (try? FileManager.default.contentsOfDirectory(at: crashes, includingPropertiesForKeys: nil))?
+            .filter { $0.lastPathComponent.hasPrefix("crash-") && $0.pathExtension == "txt" }
+            .max { $0.lastPathComponent < $1.lastPathComponent }
+        if let newest { files.append(newest) }
+        guard let host = gameViewController() else { return }
+        let items: [Any]
+        if let archive = LogsArchive.write(files) {
+            items = [archive]
+        } else {
+            items = files.isEmpty ? ["Horizon has written no logs yet."] : files
+        }
+        let sheet = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let popover = sheet.popoverPresentationController {
+            popover.sourceView = host.view
+            popover.sourceRect = CGRect(x: host.view.bounds.midX, y: host.view.bounds.midY, width: 1, height: 1)
+        }
+        host.present(sheet, animated: true)
     }
 }
 

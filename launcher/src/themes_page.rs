@@ -214,10 +214,12 @@ impl Launcher {
                     })),
             )
             .child(self.field(Field::AccentHex, "#6b4bff", 96., cx).ml(px(4.)));
+        let wide = self.window_width >= crate::glass_home::WIDE;
         let control = div()
             .flex()
             .flex_col()
-            .items_end()
+            .when(wide, |d| d.items_end())
+            .when(!wide, |d| d.items_start())
             .gap(px(10.))
             .child(row)
             .when(self.accent_strip, |d| {
@@ -229,17 +231,18 @@ impl Launcher {
                         .overflow_hidden(),
                 )
             });
-        ui::setting_row(
-            tr("Accent colour"),
-            Some(
-                div()
-                    .child(tr(
-                        "Colours the buttons, the switches and the sky. Pick one, or type any hex colour.",
-                    ))
-                    .into_any_element(),
-            ),
-            Some(control.into_any_element()),
-        )
+        let note = Some(
+            div()
+                .child(tr(
+                    "Colours the buttons, the switches and the sky. Pick one, or type any hex colour.",
+                ))
+                .into_any_element(),
+        );
+        if wide {
+            ui::setting_row(tr("Accent colour"), note, Some(control.into_any_element()))
+        } else {
+            ui::setting_row_stacked(tr("Accent colour"), note, control.into_any_element())
+        }
     }
 
     /// The Glass or Blur row: the mockup's slider (a 4 px track filled in the soft accent, a
@@ -337,6 +340,32 @@ impl Launcher {
             tr(title),
             Some(div().child(tr(about)).into_any_element()),
             Some(control.into_any_element()),
+        )
+    }
+
+    /// The Performance mode row: the cheaper scene for older computers (a quarter-resolution
+    /// sky, a box blur, resizes baked in the background, no frame per mouse move).
+    pub(super) fn performance_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let t = self.theme;
+        let on = self.settings.performance();
+        ui::setting_row(
+            tr("Performance mode"),
+            Some(
+                div()
+                    .child(tr(
+                        "Smoother on older computers: a lower-resolution sky, a cheaper blur, window resizes baked in the background and no frame per mouse move.",
+                    ))
+                    .into_any_element(),
+            ),
+            Some(
+                crate::switch("performance", on, &t)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.settings.performance = Some(!this.settings.performance());
+                        this.save_settings();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            ),
         )
     }
 
@@ -526,7 +555,7 @@ impl Launcher {
     }
 
     /// The hue under the pointer, as the accent. Saving waits until the mouse comes up, so a drag
-    /// writes `settings.json` once.
+    /// writes `settings.json` once. A move that stays on the same degree changes nothing.
     fn pick_hue(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(area) = self.hue_area.get() else {
             return;
@@ -536,8 +565,12 @@ impl Launcher {
             return;
         }
         let across: f32 = (at.x - area.origin.x).into();
-        self.settings.accent = Accent::custom((across / width).clamp(0., 1.) * 360.);
+        let accent = Accent::custom(((across / width).clamp(0., 1.) * 360.).round());
         self.hue_dragging = true;
+        if accent == self.settings.accent {
+            return;
+        }
+        self.settings.accent = accent;
         self.theme = self.settings_theme(window);
         cx.notify();
     }

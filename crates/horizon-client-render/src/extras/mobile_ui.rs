@@ -6,6 +6,8 @@ pub enum Item {
     Fullbright,
     DynamicLights,
     OwnNameTag,
+    /// Not on the Extras page: Graphics' Particles group shows it, as on desktop.
+    HideBlockParticles,
     Zoom,
     ZoomKey,
     ZoomLevel,
@@ -97,6 +99,7 @@ impl Item {
             Item::Fullbright => "Fullbright",
             Item::DynamicLights => "Dynamic lights",
             Item::OwnNameTag => "Own name tag",
+            Item::HideBlockParticles => "Hide block-break particles",
             Item::Zoom => "Zoom",
             Item::ZoomKey => "Zoom key",
             Item::ZoomLevel => "Starting zoom",
@@ -142,9 +145,9 @@ impl Item {
             KeystrokesCorner | KeystrokesCps => Keystrokes,
             MouseTweaksWheel => MouseTweaks,
             SortKey => Sort,
-            Fullbright | DynamicLights | OwnNameTag | Zoom | Minimap | Fps | Keystrokes
-            | MouseTweaks | Sort | AutoReconnect | NoAi | AgentControl | DiscordPresence
-            | ReproKeys | Splitscreen => {
+            Fullbright | DynamicLights | OwnNameTag | HideBlockParticles | Zoom | Minimap | Fps
+            | Keystrokes | MouseTweaks | Sort | AutoReconnect | NoAi | AgentControl
+            | DiscordPresence | ReproKeys | Splitscreen => {
                 return None;
             }
         })
@@ -171,6 +174,9 @@ impl Item {
             Item::MinimapZoom => "Blocks per pixel: smaller shows more detail, larger more land.",
             Item::MinimapRotate => "Forward is up; off keeps north up.",
             Item::OwnNameTag => "Show your own name above the player model in third person.",
+            Item::HideBlockParticles => {
+                "Hides the debris particles that burst from a broken block and crumble off the one you mine. Other particles stay."
+            }
             Item::AutoReconnect => {
                 "Rejoins a server after a lost connection or a restart, never after a kick or ban."
             }
@@ -222,6 +228,7 @@ impl Item {
             Item::Fullbright => e.fullbright,
             Item::DynamicLights => e.dynamic_lights,
             Item::OwnNameTag => e.own_name_tag,
+            Item::HideBlockParticles => e.hide_block_particles,
             Item::Zoom => e.zoom,
             Item::ZoomSmooth => e.zoom_smooth,
             Item::ZoomSensitivity => e.zoom_sensitivity,
@@ -271,6 +278,7 @@ impl Item {
             Item::Fullbright => e.fullbright = !e.fullbright,
             Item::DynamicLights => e.dynamic_lights = !e.dynamic_lights,
             Item::OwnNameTag => e.own_name_tag = !e.own_name_tag,
+            Item::HideBlockParticles => e.hide_block_particles = !e.hide_block_particles,
             Item::Zoom => e.zoom = !e.zoom,
             Item::ZoomSmooth => e.zoom_smooth = !e.zoom_smooth,
             Item::ZoomSensitivity => e.zoom_sensitivity = !e.zoom_sensitivity,

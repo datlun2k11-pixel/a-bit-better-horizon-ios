@@ -1,9 +1,9 @@
 [package]
 name = "cargo-horizon-mod"
-version = "0.2.7"
+version = "0.2.8"
 edition.workspace = true
 license.workspace = true
-rust-version = "1.86"
+rust-version.workspace = true
 description = "cargo horizon-mod new/build/run/check: make Horizon content mods (docs/mods.md)"
 
 # `cargo binstall --git https://github.com/horizon-rust/horizon cargo-horizon-mod` (#2120) reads this: the archive

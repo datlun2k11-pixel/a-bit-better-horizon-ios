@@ -9,6 +9,7 @@ struct HomeView: View {
     @StateObject private var player = PlayerName()
     @StateObject private var head = SkinHead()
     @StateObject private var account = MicrosoftAccount()
+    @StateObject private var updates = UpdateChecker()
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var tab = Destination.play
     @State private var showingAccount = false
@@ -56,12 +57,27 @@ struct HomeView: View {
         .alert("Something went wrong", isPresented: Binding(
             get: { link.problem != nil }, set: { if !$0 { link.problem = nil } }
         )) { Button("OK", role: .cancel) {} } message: { Text(link.problem ?? "") }
+        .alert(item: $updates.offered) { release in
+            Alert(
+                title: Text("Horizon \(release.versionText) is out"),
+                message: Text("A new version has been released. Open its release page to see what changed and download it?"),
+                primaryButton: .default(Text("View release page")) { UIApplication.shared.open(release.url) },
+                secondaryButton: .cancel(Text("Later"))
+            )
+        }
         .task(id: shownName) { await head.load(shownName) }
         .task(id: account.profile) { await account.handOver() }
         .onChange(of: account.profile) { profile in
             if profile != nil { editingName = false; nameDraft = "" }
         }
-        .task { link.uncover = onPlay; await link.watch() }
+        .onChange(of: link.phase) { phase in
+            LauncherLog.write("game phase: \(String(describing: phase))")
+        }
+        .task {
+            await updates.check()
+            link.uncover = onPlay
+            await link.watch()
+        }
     }
 
     /// The iPad layout: a navigation rail beside the pages. NavigationSplitView is iOS 16; on iOS 15 a
@@ -162,7 +178,7 @@ struct HomeView: View {
                 case .packs: PacksPage(link: link)
                 case .settings:
                     VStack(spacing: 24) {
-                        SettingsPage(link: link, download: download)
+                        SettingsPage(link: link, download: download, updates: updates)
                         NavigationLink { page { GalleryPage() }.navigationTitle("Screenshots") } label: {
                             Label("Screenshots", systemImage: "photo.on.rectangle")
                                 .frame(maxWidth: .infinity, alignment: .leading).padding(16).card()
@@ -191,6 +207,12 @@ struct HomeView: View {
     private var home: some View {
         VStack(alignment: .leading, spacing: 28) {
             launchPanel
+            if updates.enabled && !updates.online {
+                Label("No internet connection — update checks are paused until you're back online.", systemImage: "wifi.slash")
+                    .font(Theme.sans(12)).foregroundStyle(Theme.warn)
+                    .padding(.horizontal, 4)
+                    .accessibilityIdentifier("launcher-update-offline")
+            }
             NavigationLink { page { ModsPage() }.navigationTitle("Mods") } label: {
                 HStack(spacing: 14) {
                     Image(systemName: "puzzlepiece.extension")
@@ -239,7 +261,7 @@ struct HomeView: View {
                     .accessibilityIdentifier("launcher-playing-as")
             }
             HStack {
-                Button { Task { await link.play() } } label: {
+                Button { LauncherLog.write("play pressed"); Task { await link.play() } } label: {
                     Label(playLabel, systemImage: "play.fill")
                         .font(.headline).frame(minWidth: 124, minHeight: 36)
                 }

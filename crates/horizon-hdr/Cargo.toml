@@ -1,9 +1,9 @@
 [package]
 name = "horizon-hdr"
-version = "0.2.7"
+version = "0.2.8"
 edition.workspace = true
 license.workspace = true
-rust-version = "1.85"
+rust-version.workspace = true
 description = "HDR metadata for the swapchain: the Vulkan calls the crates that forbid unsafe code can't make"
 
 [dependencies]

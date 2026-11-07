@@ -4,7 +4,7 @@
 //! goes as its persistent Codec's NBT, `ByteBufCodecs.fromCodecWithRegistries`).
 //! Item data has no length prefix, so a component read short or long makes
 //! everything after it unreadable.
-use super::{Component, Template};
+use super::{Component, Nested, Template};
 use crate::{
     Error, Result,
     buf::{Codec, Reader},
@@ -235,15 +235,21 @@ fn list(r: &mut Reader, element: Read) -> Result<()> {
     (0..n).try_for_each(|_| element(r))
 }
 /// ByteBufCodecs.holder: 0 and the value itself, or the registry id plus one.
+/// Vanilla looks the id up with `byIdOrThrow(id - 1)`, which refuses a negative one.
 fn holder(r: &mut Reader, direct: Read) -> Result<()> {
-    if r.varint()? == 0 { direct(r) } else { Ok(()) }
+    match r.varint()? {
+        0 => direct(r),
+        ..0 => Err(Error::new("negative holder id")),
+        _ => Ok(()),
+    }
 }
 /// ByteBufCodecs.holderSet: 0 and a tag id, or the size plus one and the ids.
+/// Vanilla's `new ArrayList(size)` refuses a negative size.
 fn holder_set(r: &mut Reader) -> Result<()> {
     match r.varint()? {
         0 => ident(r),
         n => {
-            let n = usize::try_from(n - 1).map_err(|_| Error::new("negative holder set size"))?;
+            let n = usize::try_from(n).map_err(|_| Error::new("negative holder set size"))? - 1;
             if n > r.remaining() {
                 return Err(Error::new("holder set past the end"));
             }
@@ -277,6 +283,7 @@ fn mob_effect(r: &mut Reader) -> Result<()> {
 /// MobEffectInstance.Details: amplifier, duration, ambient, showParticles, showIcon, then the
 /// hidden effect's Details, recursively.
 fn effect_details(r: &mut Reader) -> Result<()> {
+    let _nested = Nested::enter()?;
     varint(r)?;
     varint(r)?;
     boolean(r)?;
@@ -374,6 +381,16 @@ fn equippable(r: &mut Reader) -> Result<()> {
     optional(r, holder_set)?;
     (0..5).try_for_each(|_| boolean(r))?;
     sound(r)
+}
+/// Equippable as 1.21.5 writes it: the fields up to equipOnInteract. 26.3 adds canBeSheared and
+/// shearingSound after them (1.21.6).
+pub(super) fn equippable_before_1_21_6(r: &mut Reader) -> Result<()> {
+    varint(r)?;
+    sound(r)?;
+    optional(r, ident)?;
+    optional(r, ident)?;
+    optional(r, holder_set)?;
+    (0..4).try_for_each(|_| boolean(r))
 }
 /// BlocksAttacks: blockDelaySeconds, disableCooldownScale, damageReductions (angle, type,
 /// base, factor), itemDamage (threshold, base, factor), bypassedBy, blockSound, disableSound.

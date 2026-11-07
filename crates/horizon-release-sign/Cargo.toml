@@ -1,9 +1,9 @@
 [package]
 name = "horizon-release-sign"
-version = "0.2.7"
+version = "0.2.8"
 edition.workspace = true
 license.workspace = true
-rust-version = "1.85"
+rust-version.workspace = true
 description = "Signed release checksums: release.yml signs SHA256SUMS, the launcher and horizon-server check them before installing"
 
 [dependencies]

@@ -1,7 +1,8 @@
 [package]
 name = "xtask"
-version = "0.2.7"
+version = "0.2.8"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 description = "Repository tasks: cargo run -p xtask -- package BINARY OUTDIR | tokens"

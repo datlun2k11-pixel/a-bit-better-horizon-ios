@@ -1,9 +1,9 @@
 [package]
 name = "horizon-shaders"
-version = "0.2.7"
+version = "0.2.8"
 edition.workspace = true
 license.workspace = true
-rust-version = "1.85"
+rust-version.workspace = true
 description = "Shader packs (the shaders/ folder format): reading packs, their .properties and .lang files, and later their GLSL"
 
 [dependencies]

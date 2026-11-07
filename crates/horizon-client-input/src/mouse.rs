@@ -220,6 +220,11 @@ impl MouseLook {
         (self.accumulated_dx, self.accumulated_dy)
     }
 
+    /// Motion is waiting for this frame's `handle_accumulated_movement`.
+    pub fn has_accumulated(&self) -> bool {
+        self.accumulated_dx != 0.0 || self.accumulated_dy != 0.0
+    }
+
     /// `handleAccumulatedMovement` for a frame at `time` seconds: the
     /// `(xo, yo)` passed to `Entity.turn` when the pointer is grabbed and the
     /// window is active. The accumulators are cleared either way.

@@ -5,6 +5,15 @@
 `third_party/winit` is [winit](https://github.com/rust-windowing/winit) 0.30.13 with a local
 UIKit keyboard and mouse input patch. It is licensed under Apache-2.0 (`third_party/winit/LICENSE`).
 Provenance and changes are listed in `third_party/winit/HORIZON.md`.
+## Catnip / Ponder
+
+`crates/horizon-client-render/src/fluid_render.rs` translates the still-fluid face tiling and
+UV rules of Catnip's `FluidRenderHelper` from Ponder 1.0.82 for Minecraft 1.21.1
+(`net.createmod.ponder:ponder-neoforge:1.0.82+mc1.21.1`). Copyright (c) 2022 The Create Team,
+licensed under MIT (`LICENSE_Ponder` in that artifact); the full license heads the Rust file.
+The native renderer uses Horizon's own block-sprite arrays, pose and light packing. The
+development-only oracle calls the unchanged helper from the player's local artifact. No
+original classes, game shaders, textures or prepared resources are distributed here.
 
 ## wgpu-hal
 
@@ -22,6 +31,8 @@ are in that folder (`LICENSE.MIT`, `LICENSE.APACHE`).
 
 The GLSL frontend also resets the common type for each comma-separated declarator so one
 variable's array specifier does not change later variables.
+It also reads a struct member outside a constant expression through a pointer to the member,
+not out of a loaded copy of the whole struct, so a member an atomic function uses can be read.
 
 ## libmimalloc-sys and mimalloc
 
@@ -174,3 +185,77 @@ BlueMap is licensed under the MIT license:
 > LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 > THE SOFTWARE.
+
+## JOML
+
+`crates/horizon-client-render/src/camera.rs` (`joml::Mat4::rotation`, `invert_orthonormal`) and
+`crates/horizon-client-render/src/gfx/pack_uniforms.rs` (`invert_generic`, `invert_affine`, the
+formulas of `pack_projection` and `shadow_ortho`) adapt the float arithmetic of
+`Matrix4f.rotation(Quaternionfc)`, `invertOrthonormal`, `invertGenericNonThis`, `invertAffine`,
+`setPerspective` and `setOrtho` from
+[JOML](https://github.com/JOML-CI/JOML/tree/faf9eef2511242122beb6055fe3da92daed214c5) 1.10.9, the
+library vanilla 26.3 uses, so that shader packs get the same matrices to the last bit. Changes:
+ported to Rust; the pack_uniforms.rs functions drop JOML's property flags, and
+`pack_projection` works the formula in doubles. The copyright line and license notice also head
+both files.
+
+`camera.rs` also adapts `Quaternionf.rotationX`, `rotationY` and `rotationZ`,
+`Matrix4f.rotateAffine` and `Vector4f.mulAffine` (`joml::Quat::rotation_x`/`_y`/`_z`,
+`joml::Mat4::rotate_affine`, `transform_affine`), for the sky's positions shader packs read.
+Changes: ported to Rust; `rotate_affine` keeps only the affine case.
+
+```
+The MIT License
+
+Copyright (c) 2015-2026 Richard Greenlees
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+## Just Enough Items
+
+The Recipes settings icon is from [Just Enough Items 31.17.0.108](https://github.com/mezz/JustEnoughItems) by mezz and contributors. It is distributed under the MIT license in `crates/horizon-client-render/src/jei_recipes/LICENSE.txt`.
+
+## Flywheel native model directional shading
+
+The two-light diffuse expression and transformed-normal policy in
+`terrain.wgsl`'s native model entries follow Flywheel 1.0.6
+(`internal/diffuse.glsl`, `instance/transformed.vert`, `internal/common.vert`).
+No Flywheel classes, compiled shaders or original model/texture assets are bundled.
+
+Copyright (c) 2021-2024 Jozufozu
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -5,6 +5,7 @@
 use super::{Game, Screen, event_loop::EventLoopCtl};
 use horizon_client::{
     Result,
+    held::Source,
     hud::HudBatch,
     keymapping::SNEAK,
     touch::{self, Control, Out, Touches},
@@ -22,6 +23,29 @@ use winit::{
 
 /// GUI pixels a finger drags over a menu for one line of scrolling.
 const SCROLL_LINE: f32 = 12.0;
+
+/// Whether the input diagnostics may write another line for `key`: at most one per `interval`, per key. A drag
+/// sends a hundred moves a second, and the log wants the shape of the gesture, not every one.
+pub(super) fn log_due(key: &'static str, interval: std::time::Duration) -> bool {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+        time::Instant,
+    };
+    static LAST: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match last.get(key) {
+        Some(at) if now.duration_since(*at) < interval => false,
+        _ => {
+            last.insert(key, now);
+            true
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct TouchInput {
@@ -198,6 +222,20 @@ impl Game<'_> {
         self.touch.seen = true;
         self.touch.hardware.touch();
         self.last_input = Instant::now();
+        // The look bug reports have no other way to say whether the finger's events arrive at all: one line a
+        // second of the phase, and the state the look gate reads.
+        if log_due("touch", std::time::Duration::from_secs(1)) {
+            log::info!(
+                "touch {:?} at ({:.0}, {:.0}); playing={} focused={} captured={} agent_pointer={}",
+                touch.phase,
+                touch.location.x,
+                touch.location.y,
+                self.touch_playing(),
+                self.focused,
+                self.captured,
+                self.agent_pointer
+            );
+        }
         let Some(batch) = self.touch_batch() else {
             return Ok(());
         };
@@ -299,13 +337,13 @@ impl Game<'_> {
     fn touch_grab(&mut self) {
         // Only when neither holds: a grab that fails (iOS has no pointer to grab) would otherwise be retried
         // on every drag, and each try makes the mouse drop its next move (`grabMouse`'s ignoreFirstMove).
-        if self.captured || self.agent_pointer {
-            return;
+        if !self.captured && !self.agent_pointer {
+            self.capture(true);
         }
-        self.capture(true);
-        if !self.captured {
-            self.agent_pointer = true;
-        }
+        // The finger is the pointer whatever the platform says: a grab that reports itself as held while the
+        // window is (or is reported as) unfocused would otherwise swallow every drag. An agent's pointer
+        // counts in an inactive window, which is exactly what a touch screen needs.
+        self.agent_pointer = true;
     }
 
     /// The held item is used for as long as the button stays down: something eaten or drunk (its
@@ -373,7 +411,7 @@ impl Game<'_> {
                         }
                         _ => {
                             if let Some(key) = key_of(control) {
-                                self.mapped_key(key, pressed, false, key)?;
+                                self.mapped_key(key, pressed, false, key, Source::Keyboard)?;
                             }
                         }
                     }
@@ -385,6 +423,14 @@ impl Game<'_> {
                     self.touch_grab();
                     let (dx, dy) = (f64::from(dx * scale), f64::from(dy * scale));
                     // Relative motion, as an agent's `mouse-move` adds it: no pointer position to compare with.
+                    if log_due("look", std::time::Duration::from_secs(1)) {
+                        log::info!(
+                            "touch look {dx:.2}, {dy:.2}; captured={} agent_pointer={} focused={}",
+                            self.captured,
+                            self.agent_pointer,
+                            self.focused
+                        );
+                    }
                     self.mouse.add_motion(dx, dy);
                 }
                 // Pocket Edition: a tap hits the entity it is on, and uses the item or block otherwise.
@@ -437,7 +483,7 @@ impl Game<'_> {
             // The same path as a live release: a toggle button ignores it.
             Control::Custom(id) => self.touch_custom_key(event_loop, id, false),
             _ => match key_of(control) {
-                Some(key) => self.mapped_key(key, false, false, key),
+                Some(key) => self.mapped_key(key, false, false, key, Source::Keyboard),
                 None => Ok(()),
             },
         }
