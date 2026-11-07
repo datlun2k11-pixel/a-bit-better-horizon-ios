@@ -169,7 +169,7 @@ private struct ShareLogs: View {
 
     private func share() {
         let documents = GameFolder.documents
-        var files = ["logs/latest.log", "logs/launcher.log", "horizon-boot.log"]
+        var files = ["logs/latest.log", "logs/launcher.log", "logs/launcher-1.log", "horizon-boot.log"]
             .map { documents.appendingPathComponent($0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
         let crashes = documents.appendingPathComponent("crash-reports")
@@ -178,7 +178,12 @@ private struct ShareLogs: View {
             .max { $0.lastPathComponent < $1.lastPathComponent }
         if let newest { files.append(newest) }
         guard let host = gameViewController() else { return }
-        let items: [Any] = files.isEmpty ? ["Horizon has written no logs yet."] : files
+        let items: [Any]
+        if let archive = LogsArchive.write(files) {
+            items = [archive]
+        } else {
+            items = files.isEmpty ? ["Horizon has written no logs yet."] : files
+        }
         let sheet = UIActivityViewController(activityItems: items, applicationActivities: nil)
         if let popover = sheet.popoverPresentationController {
             popover.sourceView = host.view
