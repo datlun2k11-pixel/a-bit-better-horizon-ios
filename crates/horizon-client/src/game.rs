@@ -8906,12 +8906,16 @@ impl Game<'_> {
             }
             self.stop_mining();
         }
-        // The real pointer takes over from an agent's.
-        self.agent_pointer = false;
-        // Splitscreen: another player has the pointer; this one's menus leave it alone.
+        // The real pointer takes over from an agent's, but only once it actually holds the
+        // pointer: a grab the platform refuses (an iPhone scene has no `pointerLockState`)
+        // must leave a touch drag's agent pointer alone, or `idle`'s per-frame iOS grab
+        // retry wipes it between the touch and the frame that turns the view.
         if !self.keyboard_mouse {
             self.captured = false;
             self.capture_mode = None;
+            if !capture {
+                self.agent_pointer = false;
+            }
             return;
         }
         if capture && !self.captured && !cfg!(target_os = "macos") {
@@ -8943,6 +8947,9 @@ impl Game<'_> {
             }
             self.captured = capture;
             self.capture_mode = None;
+            if capture {
+                self.agent_pointer = false;
+            }
         } else if capture {
             self.mouse.set_ignore_first_move();
             // macOS warps by re-associating the mouse with the pointer,
@@ -8966,6 +8973,9 @@ impl Game<'_> {
                 None
             };
             self.captured = self.capture_mode.is_some();
+            if self.captured {
+                self.agent_pointer = false;
+            }
             // Windows already warped above, inside the clip's own position.
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             if self.captured && self.focused {
@@ -8990,6 +9000,7 @@ impl Game<'_> {
             }
             self.captured = false;
             self.capture_mode = None;
+            self.agent_pointer = false;
         }
         // MouseHandler.grabMouse and releaseMouse: the mouse position is
         // the window's centre whenever the pointer's grab state changes, so
