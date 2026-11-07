@@ -240,6 +240,7 @@ pub fn key_label(name: &str) -> String {
     match keybinds::mouse_button(name) {
         Some(MouseButton::Left) => "LMB".to_owned(),
         Some(MouseButton::Right) => "RMB".to_owned(),
+        Some(MouseButton::Middle) => "MMB".to_owned(),
         _ => keybinds::display_name(name).plain(),
     }
 }
@@ -350,8 +351,9 @@ pub fn color_name(color: Option<u32>) -> &'static str {
     }
 }
 
-/// The mouse buttons a custom button can send, by the names [`keybinds::mouse_button`] reads.
-pub const MOUSE_KEYS: [&str; 2] = ["key.mouse.left", "key.mouse.right"];
+/// The mouse buttons a custom button can send, by the names [`keybinds::mouse_button`] reads. The
+/// middle one picks the targeted block, as it does on a mouse.
+pub const MOUSE_KEYS: [&str; 3] = ["key.mouse.left", "key.mouse.right", "key.mouse.middle"];
 
 /// The control's name in `horizon-touch.txt`; the hotbar stays where the HUD puts it.
 pub fn control_name(control: Control) -> Option<&'static str> {
@@ -1808,6 +1810,13 @@ mod tests {
         assert_eq!(TouchSettings::parse(&s.serialize()), s);
         s.set_button_key(id, 0, Some("key.mouse.right".into()));
         assert_eq!(key_label("key.mouse.right"), "RMB");
+        assert_eq!(TouchSettings::parse(&s.serialize()), s);
+        s.set_button_key(id, 0, Some("key.mouse.middle".into()));
+        assert_eq!(key_label("key.mouse.middle"), "MMB");
+        assert_eq!(
+            s.button_mappings(id),
+            [CustomKey::Mouse(winit::event::MouseButton::Middle)]
+        );
         assert_eq!(TouchSettings::parse(&s.serialize()), s);
         // A name that is neither a key nor a mouse button is still refused.
         let bad = TouchSettings::parse("button:1:0.5,0.5:1:1:1::0:0:-:-:key.mouse.nope:::\n");

@@ -3574,22 +3574,32 @@ impl OptionsUi {
                         ),
                         None,
                     ),
-                    // Minecraft's two clicks: attack/destroy and use/place.
+                    // Minecraft's clicks: attack/destroy, use/place, and pick block.
                     Row::Buttons(
                         button(
                             0.0,
                             0.0,
                             150.0,
-                            Text::literal("Left Click"),
+                            keybinds::display_name(crate::touch::MOUSE_KEYS[0]),
                             Act::TouchSetKey(id, slot, crate::touch::MOUSE_KEYS[0]),
                         ),
                         Some(button(
                             0.0,
                             0.0,
                             150.0,
-                            Text::literal("Right Click"),
+                            keybinds::display_name(crate::touch::MOUSE_KEYS[1]),
                             Act::TouchSetKey(id, slot, crate::touch::MOUSE_KEYS[1]),
                         )),
+                    ),
+                    Row::Buttons(
+                        button(
+                            0.0,
+                            0.0,
+                            310.0,
+                            keybinds::display_name(crate::touch::MOUSE_KEYS[2]),
+                            Act::TouchSetKey(id, slot, crate::touch::MOUSE_KEYS[2]),
+                        ),
+                        None,
                     ),
                 ];
                 for chunk in keybinds::all_keys().chunks(2) {
@@ -7179,6 +7189,72 @@ mod tests {
             })
             .expect("the options page lists the mapping");
         assert_eq!(mapping.plain(), "Key 1: LMB");
+        // The middle click is there too, for picking the targeted block.
+        let (widgets, _, _, _) = ui.layout(&s, size.0, size.1);
+        let map = widgets
+            .iter()
+            .find(|w| {
+                matches!(
+                    &w.kind,
+                    WKind::Button {
+                        act: Act::Push(Page::TouchKey(k, slot)),
+                        ..
+                    } if *k == id && *slot == 0
+                )
+            })
+            .expect("the options page opens the key picker");
+        ui.click(
+            &mut s,
+            &atlas,
+            map.x + 2.0,
+            map.y + 2.0,
+            size,
+            [480, 480],
+            false,
+            false,
+        );
+        let (widgets, _, _, _) = ui.layout(&s, size.0, size.1);
+        let middle = widgets
+            .iter()
+            .find(|w| {
+                matches!(
+                    &w.kind,
+                    WKind::Button {
+                        act: Act::TouchSetKey(k, slot, "key.mouse.middle"),
+                        ..
+                    } if *k == id && *slot == 0
+                )
+            })
+            .expect("the picker lists the middle click");
+        ui.click(
+            &mut s,
+            &atlas,
+            middle.x + 2.0,
+            middle.y + 2.0,
+            size,
+            [480, 480],
+            false,
+            false,
+        );
+        assert_eq!(
+            s.touch.button_mappings(id),
+            vec![crate::touch::CustomKey::Mouse(
+                winit::event::MouseButton::Middle
+            )]
+        );
+        let (widgets, _, _, _) = ui.layout(&s, size.0, size.1);
+        let mapping = widgets
+            .iter()
+            .find_map(|w| match &w.kind {
+                WKind::Button {
+                    label,
+                    act: Act::Push(Page::TouchKey(k, slot)),
+                    ..
+                } if *k == id && *slot == 0 => Some(label),
+                _ => None,
+            })
+            .expect("the options page lists the mapping");
+        assert_eq!(mapping.plain(), "Key 1: MMB");
     }
 
     fn touch_slider(ui: &mut OptionsUi, s: &Settings, id: u16, field: TouchField) -> Widget {
