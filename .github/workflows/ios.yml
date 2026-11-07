@@ -108,7 +108,7 @@ jobs:
         # The one place people try the newest iOS build: every CI build (a commit on main, a pull request, or the
         # 06:00 New York schedule) replaces the .ipa on this single pre-release. Its notes always name the newest
         # commit built and uploaded here. Forks have no releases to publish to.
-        if: github.repository == 'horizon-rust/horizon'
+        if: github.repository == 'datlun2k11-pixel/a-bit-better-horizon-ios'
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
