@@ -18,11 +18,20 @@ pub(in crate::game) type PadId = usize;
 #[derive(Default)]
 pub(in crate::game) struct PadRouter {}
 impl PadRouter {
+    pub(in crate::game) fn adopt(&mut self, _: &mut Pads) {}
+    pub(in crate::game) fn hand_back(&mut self, _: &mut Pads) {}
     pub(in crate::game) fn events(&mut self) -> Vec<super::PadEvent> {
         Vec::new()
     }
+    pub(in crate::game) fn device(
+        &self,
+        _: PadId,
+    ) -> Option<horizon_client::controller_ui::Device> {
+        None
+    }
     pub(in crate::game) fn lend_output(&mut self, _: &mut Pads, _: PadId) {}
     pub(in crate::game) fn reclaim_output(&mut self, _: &mut Pads) {}
+    pub(in crate::game) fn report_status(&self, _: &mut Pads, _: Option<PadId>) {}
     pub(in crate::game) fn connected(&self, _: PadId) -> bool {
         false
     }
@@ -50,7 +59,7 @@ fn style(category: &str) -> GlyphStyle {
     } else {
         None
     };
-    GlyphStyle::of_vendor(vendor)
+    GlyphStyle::of_device(vendor, None)
 }
 
 impl Pads {
