@@ -1977,6 +1977,11 @@ fn option_widget(s: &Settings, opt: Opt, x: f32, y: f32, w: f32) -> Widget {
 /// The Extras or PvP & HUD page's rows: its items under their headers.
 fn extras_rows(page: Page) -> Vec<Result<crate::extras::Item, &'static str>> {
     match page {
+        // The mobile extras have no PvP page yet: iOS shows the page empty rather than not at
+        // all, as its extras list is the curated mobile one.
+        #[cfg(target_os = "ios")]
+        Page::Pvp => Vec::new(),
+        #[cfg(not(target_os = "ios"))]
         Page::Pvp => crate::pvp::rows()
             .into_iter()
             .map(|r| r.map(crate::extras::Item::Pvp))
@@ -3023,7 +3028,12 @@ impl OptionsUi {
                 vec![
                     Row::Buttons(
                         open("horizon.pages.open.extras", Page::Extras),
-                        Some(open("horizon.pages.open.pvp", Page::Pvp)),
+                        // No PvP & HUD page on iOS yet (`extras_rows`): don't open an empty one.
+                        if cfg!(target_os = "ios") {
+                            None
+                        } else {
+                            Some(open("horizon.pages.open.pvp", Page::Pvp))
+                        },
                     ),
                     Row::Buttons(
                         open(

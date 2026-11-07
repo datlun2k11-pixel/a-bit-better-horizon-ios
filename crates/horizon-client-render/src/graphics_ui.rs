@@ -146,12 +146,17 @@ fn h(opt: H, cost: Cost, text: &'static str) -> Setting {
         text,
     }
 }
-/// An extra's row: its description is its own language key.
+/// An extra's row: on desktop its description is its own language key; the mobile extras keep
+/// their English text instead (they have no keys yet), which `lang::get` passes through.
 fn e(item: crate::extras::Item, cost: Cost) -> Setting {
+    #[cfg(not(target_os = "ios"))]
+    let text = item.description_key();
+    #[cfg(target_os = "ios")]
+    let text = item.description();
     Setting {
         item: Item::Extra(item),
         cost,
-        text: item.description_key(),
+        text,
     }
 }
 
