@@ -134,12 +134,16 @@ final class GameOptions: ObservableObject {
 struct SettingsPage: View {
     @ObservedObject var link: GameLink
     @ObservedObject var download: GameFilesDownload
+    @ObservedObject var updates: UpdateChecker
     @State private var showingNews = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             SectionHeader(title: "Game files")
             GameFilesCard(download: download, missing: !GameFolder.hasGameFiles)
+
+            SectionHeader(title: "Updates")
+            UpdateSettings(updates: updates)
 
             SectionHeader(title: "About")
             SecondaryButton(title: "What's New", icon: "sparkles") { showingNews = true }
