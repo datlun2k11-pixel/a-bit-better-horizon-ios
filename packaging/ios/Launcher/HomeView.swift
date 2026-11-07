@@ -70,6 +70,9 @@ struct HomeView: View {
         .onChange(of: account.profile) { profile in
             if profile != nil { editingName = false; nameDraft = "" }
         }
+        .onChange(of: link.phase) { phase in
+            LauncherLog.write("game phase: \(String(describing: phase))")
+        }
         .task {
             await updates.check()
             link.uncover = onPlay
@@ -258,7 +261,7 @@ struct HomeView: View {
                     .accessibilityIdentifier("launcher-playing-as")
             }
             HStack {
-                Button { Task { await link.play() } } label: {
+                Button { LauncherLog.write("play pressed"); Task { await link.play() } } label: {
                     Label(playLabel, systemImage: "play.fill")
                         .font(.headline).frame(minWidth: 124, minHeight: 36)
                 }

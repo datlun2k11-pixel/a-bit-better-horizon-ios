@@ -24,6 +24,29 @@ use winit::{
 /// GUI pixels a finger drags over a menu for one line of scrolling.
 const SCROLL_LINE: f32 = 12.0;
 
+/// Whether the input diagnostics may write another line for `key`: at most one per `interval`, per key. A drag
+/// sends a hundred moves a second, and the log wants the shape of the gesture, not every one.
+pub(super) fn log_due(key: &'static str, interval: std::time::Duration) -> bool {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+        time::Instant,
+    };
+    static LAST: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match last.get(key) {
+        Some(at) if now.duration_since(*at) < interval => false,
+        _ => {
+            last.insert(key, now);
+            true
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct TouchInput {
     fingers: Touches,
@@ -199,6 +222,20 @@ impl Game<'_> {
         self.touch.seen = true;
         self.touch.hardware.touch();
         self.last_input = Instant::now();
+        // The look bug reports have no other way to say whether the finger's events arrive at all: one line a
+        // second of the phase, and the state the look gate reads.
+        if log_due("touch", std::time::Duration::from_secs(1)) {
+            log::info!(
+                "touch {:?} at ({:.0}, {:.0}); playing={} focused={} captured={} agent_pointer={}",
+                touch.phase,
+                touch.location.x,
+                touch.location.y,
+                self.touch_playing(),
+                self.focused,
+                self.captured,
+                self.agent_pointer
+            );
+        }
         let Some(batch) = self.touch_batch() else {
             return Ok(());
         };
@@ -386,6 +423,14 @@ impl Game<'_> {
                     self.touch_grab();
                     let (dx, dy) = (f64::from(dx * scale), f64::from(dy * scale));
                     // Relative motion, as an agent's `mouse-move` adds it: no pointer position to compare with.
+                    if log_due("look", std::time::Duration::from_secs(1)) {
+                        log::info!(
+                            "touch look {dx:.2}, {dy:.2}; captured={} agent_pointer={} focused={}",
+                            self.captured,
+                            self.agent_pointer,
+                            self.focused
+                        );
+                    }
                     self.mouse.add_motion(dx, dy);
                 }
                 // Pocket Edition: a tap hits the entity it is on, and uses the item or block otherwise.

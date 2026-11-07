@@ -8737,6 +8737,21 @@ impl Game<'_> {
         // `mouse-move`), and it is pointer input whichever way the window's focus
         // is reported: a stale "unfocused" on iOS used to eat every touch drag.
         let active = self.focused || self.agent_pointer || self.mouse.has_accumulated();
+        // The other half of the touch diagnostics: motion arrived but the gate still refuses to turn. Says
+        // which of the three inputs to `grabbed` is missing on the device that reports the bug.
+        if self.mouse.has_accumulated()
+            && !grabbed
+            && touch::log_due("look dropped", std::time::Duration::from_secs(1))
+        {
+            log::info!(
+                "look dropped: grabbed=false captured={} agent_pointer={} focused={} playing={} player={}",
+                self.captured,
+                self.agent_pointer,
+                self.focused,
+                self.screen == Screen::Playing,
+                self.player.is_some()
+            );
+        }
         if let Some((xo, yo)) = self
             .mouse
             .handle_accumulated_movement(time, active, grabbed, look)
@@ -19274,6 +19289,12 @@ impl Game<'_> {
                 WindowEvent::Focused(focused) => {
                     self.focused = focused;
                     self.focus_lost = (!focused).then(Instant::now);
+                    log::info!(
+                        "window focus: {focused} (playing={} captured={} agent_pointer={})",
+                        self.screen == Screen::Playing,
+                        self.captured,
+                        self.agent_pointer
+                    );
                     if focused {
                         self.regrab_on_refocus();
                     } else {

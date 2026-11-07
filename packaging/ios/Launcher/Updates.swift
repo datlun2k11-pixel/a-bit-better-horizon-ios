@@ -37,6 +37,7 @@ final class UpdateChecker: ObservableObject {
     @Published var enabled: Bool {
         didSet {
             UserDefaults.standard.set(enabled, forKey: Self.enabledKey)
+            LauncherLog.write("update checks \(enabled ? "on" : "off")")
             if enabled {
                 Task { await check() }
             } else {
@@ -57,6 +58,7 @@ final class UpdateChecker: ObservableObject {
             DispatchQueue.main.async {
                 guard let checker, checker.online != online else { return }
                 checker.online = online
+                LauncherLog.write("network \(online ? "back" : "gone"); update check \(online ? "resumed" : "paused")")
                 if online {
                     Task { await checker.check() }
                 } else if checker.enabled {
@@ -86,9 +88,11 @@ final class UpdateChecker: ObservableObject {
         }
         guard online else {
             state = .offline
+            LauncherLog.write("update check skipped: offline")
             return
         }
         state = .checking
+        LauncherLog.write("update check: bundle \(Self.currentVersion), asking \(Self.repository)")
         var request = URLRequest(url: Self.api)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -101,27 +105,33 @@ final class UpdateChecker: ObservableObject {
             case 403:
                 // GitHub's hourly limit for requests without an account.
                 state = .failed("GitHub asked to wait a while. Try again later.")
+                LauncherLog.write("update check failed: GitHub said 403 (rate limit)")
                 return
             case 404:
                 // The repository has no releases yet.
                 state = .upToDate
+                LauncherLog.write("update check: repository has no releases")
                 return
             default:
                 state = .failed("GitHub answered \(status).")
+                LauncherLog.write("update check failed: GitHub answered \(status)")
                 return
             }
             let mine = Self.parts(Self.currentVersion) ?? []
             guard let newest = Self.parse(data).filter({ $0.version > mine }).max(by: { $0.version < $1.version }) else {
                 state = .upToDate
+                LauncherLog.write("update check: up to date")
                 return
             }
             state = .available(newest)
+            LauncherLog.write("update check: \(newest.tag) is newer than \(Self.currentVersion)")
             if UserDefaults.standard.string(forKey: Self.announcedKey) != newest.tag {
                 UserDefaults.standard.set(newest.tag, forKey: Self.announcedKey)
                 offered = newest
             }
         } catch {
             state = online ? .failed(error.localizedDescription) : .offline
+            LauncherLog.write("update check failed: \(error.localizedDescription)")
         }
     }
 
