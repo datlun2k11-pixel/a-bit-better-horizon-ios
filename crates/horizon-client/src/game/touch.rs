@@ -300,13 +300,13 @@ impl Game<'_> {
     fn touch_grab(&mut self) {
         // Only when neither holds: a grab that fails (iOS has no pointer to grab) would otherwise be retried
         // on every drag, and each try makes the mouse drop its next move (`grabMouse`'s ignoreFirstMove).
-        if self.captured || self.agent_pointer {
-            return;
+        if !self.captured && !self.agent_pointer {
+            self.capture(true);
         }
-        self.capture(true);
-        if !self.captured {
-            self.agent_pointer = true;
-        }
+        // The finger is the pointer whatever the platform says: a grab that reports itself as held while the
+        // window is (or is reported as) unfocused would otherwise swallow every drag. An agent's pointer
+        // counts in an inactive window, which is exactly what a touch screen needs.
+        self.agent_pointer = true;
     }
 
     /// The held item is used for as long as the button stays down: something eaten or drunk (its
