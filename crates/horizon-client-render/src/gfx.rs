@@ -163,6 +163,7 @@ pub mod capture;
 pub mod compositor;
 pub(crate) mod core_lines;
 mod cull;
+mod direct;
 mod end_sky;
 pub mod entity_skin;
 mod flat;
@@ -1406,6 +1407,9 @@ pub struct Renderer {
     world_post: world_post::Post,
     /// Frame generation (Horizon setting).
     frame_gen: frame_gen::FrameGen,
+    /// Presents the newest frame from a thread of its own, so a display that
+    /// composites at its own refresh does not pace the loop (VSync off on iOS).
+    direct: Option<direct::Present>,
     /// The entities' texture atlas (`entity_group`'s), for frame generation's motion.
     entity_atlas: wgpu::TextureView,
     /// HDR output (Horizon setting): `Some` while the swapchain is HDR.
@@ -4950,6 +4954,7 @@ impl Renderer {
             layout: crate::chunk::ColumnLayout::VANILLA,
             world_post,
             frame_gen: frame_gen::FrameGen::new(),
+            direct: None,
             entity_atlas: atlas_view.clone(),
             hdr: None,
             hdr_lighting_setting: true,
@@ -5134,6 +5139,7 @@ impl Renderer {
     /// the same device (it takes `spare_surface`).
     pub fn release_surface(&mut self) {
         self.frame_gen.stop();
+        self.direct = None;
         self.queue.wait();
         *self
             .spare_surface
@@ -5151,6 +5157,8 @@ impl Renderer {
         if self.offscreen.is_some() {
             return Ok(());
         }
+        // The present thread shows on the surface this frame takes over.
+        self.direct = None;
         *self
             .spare_surface
             .get_mut()
@@ -5178,6 +5186,49 @@ impl Renderer {
     pub fn targeted(&self) -> bool {
         self.target.is_some()
     }
+    /// The frame the present thread copies to the display, when VSync off draws
+    /// for the display's own pace (`direct`); `None` draws into the swapchain.
+    ///
+    /// iOS composites only at the display's refresh and a CAMetalLayer gives its
+    /// drawables back only then, so acquiring one per frame caps the loop at the
+    /// refresh rate whatever the present mode. Offscreen, screenshots, frame
+    /// generation and HDR keep the swapchain's frames or their own.
+    fn direct_frame(&mut self) -> Option<wgpu::Texture> {
+        let wanted = cfg!(target_os = "ios")
+            && self.surface.is_some()
+            && self.offscreen.is_none()
+            && !self.targeted()
+            && self.hdr.is_none()
+            && !self.frame_gen.on
+            && self.config.usage.contains(wgpu::TextureUsages::COPY_DST)
+            && self.config.present_mode == wgpu::PresentMode::Immediate;
+        if !wanted {
+            self.direct = None;
+            return None;
+        }
+        if self
+            .direct
+            .as_ref()
+            .is_some_and(|p| !p.matches(&self.config))
+        {
+            self.direct = None;
+        }
+        if self.direct.is_none() {
+            let surface = Arc::clone(self.surface.as_ref().expect("wanted the window surface"));
+            self.direct = Some(direct::Present::start(
+                &self.device,
+                &self.queue,
+                surface,
+                &self.config,
+            ));
+        }
+        let presenter = self.direct.as_ref().expect("started above");
+        let frame = (!presenter.failed()).then(|| presenter.frame()).flatten();
+        if frame.is_none() {
+            self.direct = None;
+        }
+        frame
+    }
     /// Reattach a window after surface loss or a failed renderer replacement.
     pub fn recreate_surface(&mut self) -> Result<()> {
         self.queue.wait();
@@ -5193,6 +5244,7 @@ impl Renderer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         self.frame_gen.stop();
+        self.direct = None;
         self.surface = None;
         let surface = match spare {
             Some(surface) => surface,
@@ -6478,6 +6530,7 @@ impl Renderer {
     /// wgpu configured before, which acquisition reports as a validation error.
     fn configure_surface(&mut self) {
         self.frame_gen.stop();
+        self.direct = None;
         // The submit thread may still present to the old swapchain.
         self.queue.wait();
         if let Some(surface) = &self.surface
@@ -7665,6 +7718,10 @@ impl Renderer {
         if !fg {
             self.frame_gen.stop();
         }
+        if fg {
+            // Frame generation's own present thread owns the swapchain this frame.
+            self.direct = None;
+        }
         // Waits for the submit thread since the last frame's present (this frame's uploads).
         let queued = self.queue.take_waited();
         let acquire = Instant::now();
@@ -7683,7 +7740,8 @@ impl Renderer {
         // The present thread failed: this frame acquires as without frame generation.
         let fg = fg_frames.is_some();
         let mut fg_made = false;
-        let acquired = if fg {
+        let direct_frame = (!fg).then(|| self.direct_frame()).flatten();
+        let acquired = if fg || direct_frame.is_some() {
             None
         } else {
             self.surface.as_ref().map(|s| s.get_current_texture())
@@ -7737,7 +7795,10 @@ impl Renderer {
             (f, None) => {
                 let image = match f {
                     Some(f) => f.texture.clone(),
-                    None => self.offscreen.clone().ok_or("no offscreen target")?,
+                    None => match &direct_frame {
+                        Some(frame) => frame.clone(),
+                        None => self.offscreen.clone().ok_or("no offscreen target")?,
+                    },
                 };
                 self.readback
                     .target(
@@ -11188,6 +11249,7 @@ impl Renderer {
         if let Some(image) = surface_frame
             .as_ref()
             .map(|f| &f.texture)
+            .or(direct_frame.as_ref())
             .or(self.offscreen.as_ref())
         {
             self.readback.present(&self.device, &mut encoder, image);
@@ -11236,6 +11298,7 @@ impl Renderer {
         let (encoder, surface_frame, after) = if readback.is_none()
             && frame.pack.frame_timing.is_none()
             && fg_frames.is_none()
+            && direct_frame.is_none()
             && hdr_readback.is_none()
             && checks.is_none()
             && !first_frame
@@ -11361,6 +11424,10 @@ impl Renderer {
             }
             if reconfigure {
                 self.configure_surface();
+            }
+        } else if let Some(texture) = direct_frame {
+            if let Some(presenter) = &self.direct {
+                presenter.present(texture);
             }
         } else if let Some((real, generated)) = fg_frames {
             self.frame_gen.present(real, generated, fg_made);
