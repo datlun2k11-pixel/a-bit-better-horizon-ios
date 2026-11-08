@@ -37,10 +37,11 @@ final class LauncherLayoutTests: XCTestCase {
         app.buttons["launcher-account-button"].tap()
         let edit = app.buttons["Change Offline Name"]
         XCTAssertTrue(edit.waitForExistence(timeout: 5)); edit.tap()
-        let alert = app.alerts["Offline player name"]
-        XCTAssertTrue(alert.waitForExistence(timeout: 5))
-        alert.textFields.firstMatch.tap()
-        alert.buttons["Cancel"].tap()
+        let field = app.textFields["offline-name-field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap()
+        app.buttons["Cancel"].tap()
+        XCTAssertFalse(field.waitForExistence(timeout: 2))
     }
     func testLauncherSettingsKeepOnlyGameFilesAndAbout() {
         let app = launch(signedIn: false, optionsResponse: "error")

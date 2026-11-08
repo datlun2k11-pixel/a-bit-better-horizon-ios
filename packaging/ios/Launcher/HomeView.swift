@@ -48,17 +48,6 @@ struct HomeView: View {
             }
         }
         .sheet(isPresented: $showingAccount) { accountSheet }
-        .alert("Offline player name", isPresented: $editingName) {
-            TextField("Name", text: $nameDraft).textInputAutocapitalization(.never).autocorrectionDisabled()
-            Button("Save") {
-                guard account.profile == nil else { return }
-                nameRejected = !player.save(nameDraft.trimmingCharacters(in: .whitespaces))
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: { Text("Up to 16 characters, with no spaces.") }
-        .alert("That name can’t be used", isPresented: $nameRejected) {
-            Button("OK", role: .cancel) {}
-        } message: { Text("Use 1 to 16 characters with no spaces.") }
         .alert("Something went wrong", isPresented: Binding(
             get: { link.problem != nil }, set: { if !$0 { link.problem = nil } }
         )) { Button("OK", role: .cancel) {} } message: { Text(link.problem ?? "") }
@@ -171,7 +160,18 @@ struct HomeView: View {
     private func editName() {
         guard account.profile == nil else { return }
         nameDraft = player.name ?? ""
+        nameRejected = false
         editingName = true
+    }
+
+    private func saveName() {
+        guard account.profile == nil else { return }
+        if player.save(nameDraft.trimmingCharacters(in: .whitespaces)) {
+            editingName = false
+            nameRejected = false
+        } else {
+            nameRejected = true
+        }
     }
 
     private func destination(_ item: Destination) -> some View {
@@ -316,7 +316,30 @@ struct HomeView: View {
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                     }.padding(.vertical, 8)
-                    if account.profile == nil { Button("Change Offline Name", action: editName) }
+                    if account.profile == nil {
+                        if editingName {
+                            TextField("Name", text: $nameDraft)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .submitLabel(.done)
+                                .onSubmit(saveName)
+                                .accessibilityIdentifier("offline-name-field")
+                            HStack {
+                                Button("Save", action: saveName)
+                                Spacer()
+                                Button("Cancel") { editingName = false; nameRejected = false }
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text("Up to 16 characters, with no spaces.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            if nameRejected {
+                                Text("That name can’t be used.")
+                                    .font(.footnote).foregroundStyle(Theme.warn)
+                            }
+                        } else {
+                            Button("Change Offline Name", action: editName)
+                        }
+                    }
                 }
                 Section { AccountCard(account: account) }
             }
