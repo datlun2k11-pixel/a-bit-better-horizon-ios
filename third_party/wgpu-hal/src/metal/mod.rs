@@ -132,7 +132,9 @@ struct OsFeatures;
 impl OsFeatures {
     fn display_sync() -> bool {
         // https://developer.apple.com/documentation/quartzcore/cametallayer/displaysyncenabled
-        available!(macos = 10.13) || cfg!(target_abi = "macabi")
+        // iOS has had the property since 8.0; without it the adapter offers Fifo
+        // only, so VSync off could never present immediately on an iPhone.
+        available!(macos = 10.13, ios = 8.0) || cfg!(target_abi = "macabi")
     }
 }
 

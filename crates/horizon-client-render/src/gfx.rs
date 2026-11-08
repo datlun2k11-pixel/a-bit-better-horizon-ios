@@ -5243,8 +5243,15 @@ impl Renderer {
     }
     /// VSync on presents with Fifo, capped to the display's refresh rate in a
     /// window and in fullscreen alike; Horizon's present-mode setting applies
-    /// only with VSync off (`window::chosen_present_mode`).
-    pub fn set_present_mode(&mut self, vsync: bool, mode: crate::graphics::PresentMode) {
+    /// only with VSync off (`window::chosen_present_mode`). With VSync off and
+    /// Auto, a frame cap above `refresh_hz` presents immediately.
+    pub fn set_present_mode(
+        &mut self,
+        vsync: bool,
+        mode: crate::graphics::PresentMode,
+        fps_limit: i32,
+        refresh_hz: Option<i32>,
+    ) {
         use crate::graphics::PresentMode as P;
         use crate::window::{PresentMode, chosen_present_mode};
         let supported: Vec<PresentMode> = self
@@ -5263,7 +5270,7 @@ impl Renderer {
             P::Mailbox => Some(PresentMode::Mailbox),
             P::Immediate => Some(PresentMode::Immediate),
         };
-        let mode = match chosen_present_mode(&supported, vsync, setting) {
+        let mode = match chosen_present_mode(&supported, vsync, setting, fps_limit, refresh_hz) {
             Some(PresentMode::Mailbox) => wgpu::PresentMode::Mailbox,
             Some(PresentMode::Immediate) => wgpu::PresentMode::Immediate,
             _ => wgpu::PresentMode::Fifo,

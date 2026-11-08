@@ -544,7 +544,14 @@ impl Game<'_> {
             r.gamma = s.gamma;
             r.fullbright = s.extras.fullbright;
             r.improved_transparency = s.improved_transparency;
-            r.set_present_mode(s.vsync, s.horizon.present_mode);
+            r.set_present_mode(
+                s.vsync,
+                s.horizon.present_mode,
+                s.max_fps as i32,
+                self.window
+                    .as_deref()
+                    .and_then(horizon_client::window::refresh_hz),
+            );
             r.animated_textures = s.horizon.animated_textures;
             r.screenshot_quality = s.horizon.screenshot_quality;
             r.set_mipmap_levels(s.mipmap_levels.max(0) as u32);

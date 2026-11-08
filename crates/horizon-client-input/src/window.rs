@@ -132,14 +132,24 @@ pub fn vsync_present_mode(supported: &[PresentMode], vsync: bool) -> Option<Pres
 /// (`None` for Auto). VSync on always means Fifo, in a window and in
 /// fullscreen alike, as in vanilla; the setting chooses only while VSync is
 /// off, when the surface supports it, and otherwise vanilla's choice applies.
+///
+/// With VSync off and Auto, a frame cap above the display's refresh rate (or
+/// "Unlimited", 260, or a display that reports none) presents immediately so
+/// the GPU can run ahead of the display; a cap the display can keep up with
+/// stays on Fifo, which paces it without Immediate's tearing.
 pub fn chosen_present_mode(
     supported: &[PresentMode],
     vsync: bool,
     setting: Option<PresentMode>,
+    fps_limit: i32,
+    refresh_hz: Option<i32>,
 ) -> Option<PresentMode> {
+    // 260 is the Max Framerate option's "Unlimited".
+    let paced = vsync
+        || (fps_limit < 260 && refresh_hz.is_some_and(|hz| fps_limit <= hz));
     setting
         .filter(|m| !vsync && supported.contains(m))
-        .or_else(|| vsync_present_mode(supported, vsync))
+        .or_else(|| vsync_present_mode(supported, paced))
 }
 
 /// `FramerateLimiter.limitDisplayFPS` with an injectable clock so the sleep
@@ -536,6 +546,16 @@ pub fn monitor_video_modes(monitor: &winit::monitor::MonitorHandle) -> Vec<Video
         .video_modes()
         .map(|m| VideoMode::from_winit(&m))
         .collect()
+}
+
+/// The refresh rate in hertz of the window's monitor, when it reports one.
+pub fn refresh_hz(window: &winit::window::Window) -> Option<i32> {
+    let monitor = window
+        .current_monitor()
+        .or_else(|| window.primary_monitor())?;
+    monitor
+        .refresh_rate_millihertz()
+        .map(|millihertz| millihertz.div_ceil(1000).min(i32::MAX as u32) as i32)
 }
 
 /// The video modes of the window's monitor, listed once per monitor. Listing them takes tens of
@@ -959,18 +979,59 @@ mod tests {
         use PresentMode::*;
         let all = [Mailbox, Fifo, Immediate];
         for setting in [None, Some(Fifo), Some(Mailbox), Some(Immediate)] {
-            assert_eq!(chosen_present_mode(&all, true, setting), Some(Fifo));
+            assert_eq!(
+                chosen_present_mode(&all, true, setting, 260, Some(60)),
+                Some(Fifo)
+            );
         }
-        assert_eq!(chosen_present_mode(&all, false, None), Some(Immediate));
         assert_eq!(
-            chosen_present_mode(&all, false, Some(Mailbox)),
+            chosen_present_mode(&all, false, None, 260, Some(60)),
+            Some(Immediate)
+        );
+        assert_eq!(
+            chosen_present_mode(&all, false, Some(Mailbox), 260, Some(60)),
             Some(Mailbox)
         );
-        assert_eq!(chosen_present_mode(&all, false, Some(Fifo)), Some(Fifo));
+        assert_eq!(
+            chosen_present_mode(&all, false, Some(Fifo), 260, Some(60)),
+            Some(Fifo)
+        );
         // Metal has no Mailbox: vanilla's choice instead.
         assert_eq!(
-            chosen_present_mode(&[Fifo, Immediate], false, Some(Mailbox)),
+            chosen_present_mode(&[Fifo, Immediate], false, Some(Mailbox), 260, Some(60)),
             Some(Immediate)
+        );
+    }
+    #[test]
+    fn a_cap_the_display_can_keep_up_with_stays_paced() {
+        use PresentMode::*;
+        let all = [Mailbox, Fifo, Immediate];
+        assert_eq!(
+            chosen_present_mode(&all, false, None, 60, Some(60)),
+            Some(Fifo)
+        );
+        assert_eq!(
+            chosen_present_mode(&all, false, None, 120, Some(120)),
+            Some(Fifo)
+        );
+        assert_eq!(
+            chosen_present_mode(&all, false, None, 120, Some(60)),
+            Some(Immediate)
+        );
+        // 260 is the Max Framerate option's "Unlimited"; a display that reports
+        // no rate leaves the cap with nothing to compare against.
+        assert_eq!(
+            chosen_present_mode(&all, false, None, 260, Some(120)),
+            Some(Immediate)
+        );
+        assert_eq!(
+            chosen_present_mode(&all, false, None, 120, None),
+            Some(Immediate)
+        );
+        // An explicit mode still wins over the cap.
+        assert_eq!(
+            chosen_present_mode(&all, false, Some(Fifo), 260, Some(60)),
+            Some(Fifo)
         );
     }
 
