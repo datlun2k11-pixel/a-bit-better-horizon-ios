@@ -36,6 +36,20 @@ fn launcher_visibility(window: Option<&winit::window::Window>, visible: bool) {
     let _ = window;
 }
 
+/// The archive a phone is unpacking, as the launcher's loading screen draws it (`import::status`).
+fn import_state() -> Value {
+    match horizon_client::import::status() {
+        Some(status) => json!({
+            "label": status.label,
+            "files": status.files,
+            "total_files": status.total_files,
+            "bytes": status.bytes,
+            "error": status.error,
+        }),
+        None => Value::Null,
+    }
+}
+
 /// What came back for a launcher request so far: a control answer, an import's result, or a mod
 /// install's.
 enum Waiting {
@@ -188,6 +202,7 @@ impl Game<'_> {
                         "screen": self.screen_name(),
                         "player": self.options.player_name(),
                         "version": horizon_core::version::VERSION_ID,
+                        "import": import_state(),
                     });
                     request.answer(&state.to_string());
                 }
@@ -391,16 +406,22 @@ impl Loading {
                 }
 
                 "launcher-start" => {
+                    // Play: take the folder an archive dropped into `Documents` produced, if it is in.
+                    self.adopt_imported_resources();
                     horizon_ios_launcher::start();
                     request.answer(r#"{"ok":true}"#);
                 }
                 "launcher-state" => {
                     let state = if horizon_ios_launcher::waiting() {
-                        json!({ "phase": "waiting" })
+                        json!({ "phase": "waiting", "import": import_state() })
                     } else if self.importing() {
-                        json!({ "phase": "needs_files", "reason": self.import_reason() })
+                        json!({ "phase": "needs_files", "reason": self.import_reason(), "import": import_state() })
                     } else {
-                        json!({ "phase": "loading", "progress": self.progress.fraction() })
+                        json!({
+                            "phase": "loading",
+                            "progress": self.progress.fraction(),
+                            "import": import_state(),
+                        })
                     };
                     request.answer(&state.to_string());
                 }

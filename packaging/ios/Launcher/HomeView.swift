@@ -42,6 +42,11 @@ struct HomeView: View {
         }
         .background(Theme.background.ignoresSafeArea())
         .tint(Theme.accent)
+        .overlay {
+            if let progress = link.importing {
+                ImportingOverlay(progress: progress) { link.dismissImport() }
+            }
+        }
         .sheet(isPresented: $showingAccount) { accountSheet }
         .alert("Offline player name", isPresented: $editingName) {
             TextField("Name", text: $nameDraft).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -268,7 +273,7 @@ struct HomeView: View {
                 .controlSize(.large)
                 .launcherPrimaryButton()
                 .tint(Theme.accent)
-                .disabled(needsFiles || link.launching != nil)
+                .disabled(needsFiles || link.importing != nil || link.launching != nil)
                 .accessibilityIdentifier("launcher-play-button")
                 if link.launching != nil {
                     Button("Cancel") { link.cancelLaunch() }.foregroundStyle(.white).frame(minHeight: 44)
@@ -289,7 +294,11 @@ struct HomeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 28))
     }
 
-    private var playLabel: String { link.launching ?? (needsFiles ? "Game files needed" : "Play") }
+    private var playLabel: String {
+        if let launching = link.launching { return launching }
+        if link.importing != nil { return "Preparing files" }
+        return needsFiles ? "Game files needed" : "Play"
+    }
     private var needsFiles: Bool {
         if case .needsFiles = link.phase { return true }
         return link.phase == .waiting && !GameFolder.hasGameFiles

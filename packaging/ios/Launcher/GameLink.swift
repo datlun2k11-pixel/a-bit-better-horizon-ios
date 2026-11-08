@@ -65,6 +65,30 @@ struct ServerStatus: Equatable {
     var failed: String?
 }
 
+/// An archive the game is unpacking (`import::status`): the zip a player dropped into the game's folder,
+/// or one downloaded from a link. The launcher draws it over everything while it runs.
+struct ImportProgress: Equatable {
+    var label = ""
+    var files = 0
+    var totalFiles = 0
+    var bytes: Int64 = 0
+    /// Why the archive could not be installed; the game keeps it until the next import starts.
+    var error: String?
+
+    init?(_ json: [String: Any]?) {
+        guard let json else { return nil }
+        label = json["label"] as? String ?? ""
+        files = (json["files"] as? NSNumber)?.intValue ?? 0
+        totalFiles = (json["total_files"] as? NSNumber)?.intValue ?? 0
+        bytes = (json["bytes"] as? NSNumber)?.int64Value ?? 0
+        error = json["error"] as? String
+    }
+
+    var fraction: Double {
+        totalFiles > 0 ? min(1, Double(files) / Double(totalFiles)) : 0
+    }
+}
+
 /// The game under the launcher: whether it is starting, waiting for files or at its title, and what its
 /// title screen would list. Polled while the launcher is up; everything it does goes through `Bridge`.
 @MainActor
@@ -95,6 +119,10 @@ final class GameLink: ObservableObject {
     @Published private(set) var launching: String?
     /// The last thing that went wrong, for an alert.
     @Published var problem: String?
+    /// An archive the game is unpacking right now, or the last one that failed.
+    @Published private(set) var importing: ImportProgress?
+    /// The failed import the player put away: the game keeps saying it until the next one starts.
+    private var dismissedImport: String?
 
     /// Uncover the game (Present.swift dismisses the launcher).
     var uncover: () -> Void = {}
@@ -109,7 +137,9 @@ final class GameLink: ObservableObject {
     func watch() async {
         while !Task.isCancelled {
             await refresh()
-            let pause: UInt64 = ready || phase == .waiting ? 3_000_000_000 : 400_000_000
+            let pause: UInt64 = importing != nil
+                ? 250_000_000
+                : (ready || phase == .waiting ? 3_000_000_000 : 400_000_000)
             try? await Task.sleep(nanoseconds: pause)
         }
     }
@@ -130,12 +160,36 @@ final class GameLink: ObservableObject {
         if let version = state["version"] as? String {
             self.version = version
         }
+        applyImport(state["import"] as? [String: Any])
         if phase == .title, was != .title {
             if let action = queued {
                 queued = nil
                 await run(action)
             }
         }
+    }
+
+    /// Take what the game says it is unpacking. A failure the player already put away stays away until
+    /// the next import starts (or succeeds).
+    private func applyImport(_ json: [String: Any]?) {
+        guard let progress = ImportProgress(json) else {
+            importing = nil
+            dismissedImport = nil
+            return
+        }
+        if progress.error == nil {
+            dismissedImport = nil
+        } else if progress.error == dismissedImport {
+            importing = nil
+            return
+        }
+        importing = progress
+    }
+
+    /// Put away the loading screen: the import is done, or its failure has been read.
+    func dismissImport() {
+        dismissedImport = importing?.error
+        importing = nil
     }
 
     /// Read the worlds and servers again.

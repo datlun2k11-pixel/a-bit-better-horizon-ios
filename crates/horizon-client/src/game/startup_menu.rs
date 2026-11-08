@@ -366,6 +366,10 @@ pub(super) fn spawn_loader(
         .name("resource-loader".into())
         .spawn(move || {
             let mut pack_error = None;
+            // On a phone the folders were resolved at launch, before the archive a player dropped
+            // into `Documents` was unpacked: wait for that and take the folder it produced.
+            crate::import::wait_for_boot_import();
+            let vanilla_root = crate::import::imported_resources(&vanilla_root);
             let root = packs::startup_root(&vanilla_root, &settings.resource_packs, &[])
                 .unwrap_or_else(|error| {
                     pack_error = Some(error.to_string());

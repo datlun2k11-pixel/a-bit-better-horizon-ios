@@ -233,6 +233,15 @@ impl Loading {
         self.import.as_ref().map(|import| import.reason.as_str())
     }
 
+    /// Take the game files a launch-time import put in place (`import::boot`): the options and the folder
+    /// were resolved before that worker ran, so the ones this run started with may be the fallback.
+    pub(super) fn adopt_imported_resources(&mut self) {
+        self.vanilla_root = horizon_client::import::imported_resources(&self.vanilla_root);
+        if let Some(options) = self.options.as_mut() {
+            options.resources = self.vanilla_root.clone();
+        }
+    }
+
     /// Start the loader again on the files that arrived, as if the first attempt had found them.
     fn load_the_files_that_arrived(&mut self, home: std::path::PathBuf) -> Result<()> {
         self.loaded = None;
@@ -245,6 +254,7 @@ impl Loading {
         {
             options.resources = root;
         }
+        self.vanilla_root = horizon_client::import::imported_resources(&self.vanilla_root);
         let (receiver, handle) = startup_menu::spawn_loader(
             &options,
             &self.settings,

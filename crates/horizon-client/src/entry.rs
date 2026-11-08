@@ -87,19 +87,13 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         crash::install(home.clone(), side);
         boot_stage("crash handler");
         // What a phone does with its files before the game looks for them, once the log can say so.
+        // On a worker: unpacking an archive takes long enough that the iOS watchdog would kill a
+        // launch that did it here, before the window even exists. The launcher shows its progress,
+        // and the resource loader waits for it.
         #[cfg(any(target_os = "ios", target_os = "android"))]
         {
-            // A swap that a flat battery or a crash left half done is finished, or the old tree put back,
-            // before anything reads the folder it was working on.
-            match crate::import::recover(&documents) {
-                Ok(Some(path)) => log::info!("Horizon: finished the import at {}", path.display()),
-                Ok(None) => {}
-                Err(error) => log::error!("Horizon: could not finish the last import: {error}"),
-            }
-            // The cable's door: an archive dragged into `Documents` is installed here, so the launch it was
-            // dragged for is the one that finds it. `scan` says what it took and what it left alone.
-            crate::import::scan(&documents);
-            boot_stage("import done");
+            crate::import::boot(&documents);
+            boot_stage("import started");
         }
     }
     let renderers = crate::mod_api::mods()

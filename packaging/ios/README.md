@@ -185,15 +185,18 @@ back with the new reason and asks again on a new port with new digits, so a bad 
 rather than a dead end.
 
 **By cable, with no network involved.** Copy the same `.zip` into the app's `Documents` folder -- Finder's
-*Files* tab, or iTunes' *File Sharing*, or any manager that gets there -- and launch. `main.rs` unpacks what it
-finds there before the game looks for its resources, then deletes the archive.
+*Files* tab, or iTunes' *File Sharing*, or any manager that gets there -- and launch. The game unpacks what it
+finds there on a worker while the launcher draws its progress (the launcher's *Preparing game files* screen,
+fed by `launcher-state`'s `import`), then deletes the archive. Unpacking on the launch thread is what iOS's
+watchdog kills before a window appears; `import::boot` is that worker, and the resource loader waits for it.
 
 Both doors route by the archive's root, so one file format carries three things: `horizon-resources.json` is
 the game files, `level.dat` is a world (into `Documents/saves`, never over one that exists), `pack.mcmeta` is a
 resource pack, which stays a `.zip` because the game reads those where they are. An archive that will not
 unpack is renamed `<name>.zip.failed` rather than retried every launch, and an unpacking that a flat battery
 interrupts is finished, or its old tree put back, on the next start -- `import::recover`, before anything reads
-the folder it was working on.
+the folder it was working on. A tree cut short is never published: the unpacker writes
+`resources.unpacking.done` last, and `recover` only promotes a scratch tree that carries it.
 
 What is measured of this, on Linux rather than on a phone: a game started with no files stayed open, refused a
 wrong code with `403` and wrote nothing, took a real archive posted to the address it logged, unpacked it into

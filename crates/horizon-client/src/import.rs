@@ -20,6 +20,10 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::{
+        Condvar, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use zip::{CompressionMethod, ZipArchive, write::SimpleFileOptions, write::ZipWriter};
 
@@ -32,6 +36,132 @@ use crate::Result;
 const MAX_PACKED: u64 = 2 << 30;
 const MAX_UNPACKED: u64 = 4 << 30;
 const MAX_ENTRIES: usize = 50_000;
+
+/// Written beside `resources.unpacking` once every entry is out, so a start that finds a tree the
+/// watchdog or a flat battery interrupted never mistakes it for one [`publish`] can finish.
+const SCRATCH_DONE: &str = "resources.unpacking.done";
+
+/// What an import is doing, for a phone's launcher to draw (packaging/ios/Launcher). One archive at
+/// a time is unpacked on a phone, and the launcher asks for this while it is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportStatus {
+    /// The archive's file name, as the person who sent it named it.
+    pub label: String,
+    pub files: usize,
+    pub total_files: usize,
+    pub bytes: u64,
+    /// Why the archive could not be installed. It stays until the next import starts.
+    pub error: Option<String>,
+}
+
+static STATUS: Mutex<Option<ImportStatus>> = Mutex::new(None);
+
+/// The archive being unpacked now, or the last one that failed. `None` when nothing is happening.
+pub fn status() -> Option<ImportStatus> {
+    STATUS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+fn set_status(status: Option<ImportStatus>) {
+    *STATUS.lock().unwrap_or_else(PoisonError::into_inner) = status;
+}
+
+/// Count one more file out, for the launcher's progress bar.
+fn report_progress(files: usize, bytes: u64) {
+    let mut status = STATUS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(status) = status.as_mut() {
+        status.files = files;
+        status.bytes = bytes;
+    }
+}
+
+/// Whether the archives that came in through `Documents` are still being installed.
+static BOOT_STARTED: AtomicBool = AtomicBool::new(false);
+static BOOT_DONE: (Mutex<bool>, Condvar) = (Mutex::new(true), Condvar::new());
+
+pub fn boot_importing() -> bool {
+    BOOT_STARTED.load(Ordering::Relaxed)
+        && !*BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Install what a phone's `Documents` holds, on a worker: a prepared tree is hundreds of megabytes and
+/// thousands of files, and unpacking it on the thread that runs the app is what iOS's watchdog kills
+/// (`0x8badf00d`, a black launch screen and a relaunch) before a window ever appears.
+///
+/// Called once, before the event loop; [`wait_for_boot_import`] is how the loader hears it is over.
+pub fn boot(home: &Path) {
+    if !cfg!(any(target_os = "ios", target_os = "android")) || BOOT_STARTED.swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    *BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    let home = home.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("horizon-import-boot".into())
+        .spawn(move || {
+            // Also on a panic or an early return: the loader must never wait on a thread that is gone.
+            let _finished = FinishBoot;
+            // A swap that a flat battery or a crash left half done is finished, or the old tree put
+            // back, before anything reads the folder it was working on.
+            match recover(&home) {
+                Ok(Some(path)) => log::info!("Horizon: finished the import at {}", path.display()),
+                Ok(None) => {}
+                Err(error) => log::error!("Horizon: could not finish the last import: {error}"),
+            }
+            // The cable's door: an archive dragged into `Documents` is installed here, so the launch
+            // it was dragged for is the one that finds it.
+            scan(&home);
+        });
+    if let Err(error) = spawned {
+        log::error!("Horizon: could not start the import worker: {error}");
+        finish_boot();
+    }
+}
+
+struct FinishBoot;
+
+impl Drop for FinishBoot {
+    fn drop(&mut self) {
+        finish_boot();
+    }
+}
+
+fn finish_boot() {
+    *BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    BOOT_DONE.1.notify_all();
+}
+
+/// Wait until [`boot`]'s worker is done (at once when there is nothing to do, as on a desktop).
+pub fn wait_for_boot_import() {
+    if !BOOT_STARTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut done = BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner);
+    while !*done {
+        done = BOOT_DONE.1.wait(done).unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// The game files a phone has imported, when they are there: `fallback` everywhere else. The
+/// loader resolves the folder before a dropped archive is unpacked (it starts at launch, the loader
+/// on Play), so it asks this again once [`wait_for_boot_import`] says the import is over.
+pub fn imported_resources(fallback: &Path) -> PathBuf {
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        let home = std::env::current_dir().unwrap_or_default();
+        let sibling = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("resources")));
+        if let Some(sibling) = sibling
+            && let Some(root) = resources_root(&sibling, Some(&home))
+        {
+            return root;
+        }
+    }
+    fallback.to_owned()
+}
 
 /// What an archive holds, named for the file that says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +338,8 @@ pub struct Pack {
     /// Every entry above the root the game reads, including the trailing `/`: `""`, `"Horizon/"`, or
     /// `"horizon-client/26.3/"` for somebody who compressed one folder too many.
     prefix: String,
+    /// The files [`unpack`](Self::unpack) will write, for the progress a phone's launcher draws.
+    total_files: usize,
     pub kind: Kind,
 }
 
@@ -271,18 +403,20 @@ impl Pack {
                 .filter(|last| !last.is_empty())
                 .unwrap_or(&stem),
         );
+        let total_files = names.len();
         Ok(Self {
             archive,
             path: path.to_owned(),
             item,
             prefix,
+            total_files,
             kind,
         })
     }
 
     /// Read every entry out into `into`, which is created here. Anything that goes wrong removes
     /// `into` again: the game must never see a half tree.
-    fn unpack(&mut self, into: &Path) -> Result<(usize, u64)> {
+    fn unpack(&mut self, into: &Path, progress: &mut dyn FnMut(usize, u64)) -> Result<(usize, u64)> {
         fs::create_dir_all(into)?;
         let mut files = 0;
         let mut written = 0u64;
@@ -318,6 +452,7 @@ impl Pack {
             }
             written += copied;
             files += 1;
+            progress(files, written);
         }
         Ok((files, written))
     }
@@ -325,7 +460,44 @@ impl Pack {
     /// Put the archive where the game reads it, under `home` (`Documents` on a phone), and consume
     /// it: a phone does not have 589 MB to spend twice, and what arrives is a copy of something that
     /// is still on the computer that sent it.
-    pub fn install(mut self, home: &Path) -> Result<Installed> {
+    pub fn install(self, home: &Path) -> Result<Installed> {
+        let label = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.item.clone());
+        let total_files = self.total_files;
+        set_status(Some(ImportStatus {
+            label,
+            files: 0,
+            total_files,
+            bytes: 0,
+            error: None,
+        }));
+        let result = self.install_now(home);
+        let mut status = STATUS.lock().unwrap_or_else(PoisonError::into_inner);
+        match &result {
+            Ok(_) => *status = None,
+            // Kept for the launcher to show: a phone's player can read the screen, not the log.
+            Err(error) => {
+                if let Some(status) = status.as_mut() {
+                    status.error = Some(error.to_string());
+                } else {
+                    *status = Some(ImportStatus {
+                        label: String::new(),
+                        files: 0,
+                        total_files: 0,
+                        bytes: 0,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+        drop(status);
+        result
+    }
+
+    fn install_now(mut self, home: &Path) -> Result<Installed> {
         let archive = self.path.clone();
         let folder = Path::new(self.kind.folder());
         let (path, files, bytes) = match self.kind {
@@ -340,16 +512,22 @@ impl Pack {
             // A world is never written over: what would be overwritten is the player's own.
             Kind::World => {
                 let dest = unique(&home.join(folder).join(&self.item));
-                let (files, bytes) = self.unpack(&dest)?;
+                let (files, bytes) = self.unpack(&dest, &mut report_progress)?;
                 fs::remove_file(&archive)?;
                 (dest, files, bytes)
             }
             Kind::Resources => {
                 let scratch = home.join("resources.unpacking");
+                let marker = home.join(SCRATCH_DONE);
                 let _ = fs::remove_dir_all(&scratch);
-                let (files, bytes) = self.unpack(&scratch)?;
+                let _ = fs::remove_file(&marker);
+                let (files, bytes) = self.unpack(&scratch, &mut report_progress)?;
+                // The marker is what tells a later start that the tree is whole: an unpacking the
+                // watchdog killed is never published as game files.
+                fs::write(&marker, b"")?;
                 let dest = home.join(folder);
                 publish(&scratch, &dest)?;
+                let _ = fs::remove_file(&marker);
                 fs::remove_file(&archive)?;
                 (dest, files, bytes)
             }
@@ -390,18 +568,27 @@ fn publish(scratch: &Path, dest: &Path) -> Result<()> {
 /// Called at startup, before the game looks for its resources.
 pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
     let scratch = home.join("resources.unpacking");
+    let marker = home.join(SCRATCH_DONE);
     let dest = home.join(Kind::Resources.folder());
     let previous = home.join("resources.previous");
-    if scratch.is_dir() && !dest.exists() {
+    // Only a tree the unpacker finished (the marker it wrote last) is whole: anything else was
+    // cut short, and publishing it would hand the game a resources folder with files missing.
+    if marker.is_file() && scratch.is_dir() && !dest.exists() {
+        let _ = fs::remove_file(&marker);
         fs::rename(&scratch, &dest)?;
+        let _ = fs::remove_dir_all(&previous);
         return Ok(Some(dest));
     }
     if !dest.exists() && previous.is_dir() {
+        // The swap never got past putting the old tree aside: put it back.
         fs::rename(&previous, &dest)?;
+        let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_file(&marker);
         return Ok(Some(dest));
     }
     // Both landed: the new tree is in place, so what is left over is scratch and the old copy.
     let _ = fs::remove_dir_all(&scratch);
+    let _ = fs::remove_file(&marker);
     let _ = fs::remove_dir_all(&previous);
     Ok(None)
 }
@@ -753,8 +940,26 @@ mod tests {
             "{}",
         )
         .unwrap();
+        fs::write(home.join(SCRATCH_DONE), "").unwrap();
         assert_eq!(recover(&home).unwrap(), Some(home.join("resources")));
         assert!(home.join("resources/horizon-resources.json").is_file());
+        assert!(!home.join(SCRATCH_DONE).exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_scratch_tree_cut_short_is_not_published() {
+        // The unpacker writes the marker last: without it the tree is missing files.
+        let home = temp_home("partial-scratch");
+        fs::create_dir_all(home.join("resources.unpacking")).unwrap();
+        fs::write(
+            home.join("resources.unpacking/horizon-resources.json"),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(recover(&home).unwrap(), None);
+        assert!(!home.join("resources").exists());
+        assert!(!home.join("resources.unpacking").exists());
         fs::remove_dir_all(home).unwrap();
     }
 
