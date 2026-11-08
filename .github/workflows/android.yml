@@ -7,17 +7,9 @@ name: android
 # ANDROID_KEYSTORE_PASSWORD, so every build updates the installed app. Without them each run signs with a new
 # throwaway key, and installing it means uninstalling the last one first, which deletes the app's files.
 on:
-  push:
-    branches: [main]
+  # Off the push and pull-request paths on purpose: an Android run that fails turned every commit red and
+  # mailed it out even when the iOS build passed. Build it by hand from the Actions tab when it is wanted.
   workflow_dispatch:
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      - 'third_party/**'
-      - 'packaging/android/**'
-      - '.github/workflows/android.yml'
 permissions:
   contents: read
 concurrency:
