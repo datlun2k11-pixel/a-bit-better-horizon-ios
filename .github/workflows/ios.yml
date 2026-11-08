@@ -128,14 +128,15 @@ jobs:
             echo "Download \`Horizon-game-unsigned.ipa\` below and install it with your developer tooling (AltStore,"
             echo "Sideloadly, Xcode, …): the .ipa is unsigned, so it must be re-signed for your own device."
           } > notes.md
-          # Replace the asset in place: delete any old .ipa, then upload/create the release. `--target main` keeps
-          # the release pinned to main even when a pull request's build publishes it.
-          gh release delete-asset ios-nightly Horizon-game-unsigned.ipa --yes 2>/dev/null || true
+          # Recreate the release rather than edit it. GitHub's Releases page orders everything below the
+          # one "Latest" release by each release's created_at, and no API call can change that date: a
+          # release edited in place keeps its original date and sinks below every newer release. Deleted
+          # and created again, it is the newest release object, so the nightly stays at the top of the list.
+          # A prerelease can never take the "Latest" slot itself. `--target main` keeps the recreated tag
+          # pointing at main even when a pull request's build publishes it. The tag page is briefly gone
+          # between the two commands; the tag name, and so the release URL people bookmark, never changes.
+          gh release delete ios-nightly --yes --cleanup-tag 2>/dev/null || true
           gh release create ios-nightly --prerelease --latest=false --target main \
             --title "iOS Nightly · $date · ${COMMIT:0:7}" \
             --notes-file notes.md \
-            Horizon-game-unsigned.ipa 2>/dev/null \
-            || gh release upload ios-nightly Horizon-game-unsigned.ipa --clobber \
-            || { gh release edit ios-nightly --title "iOS Nightly · $date · ${COMMIT:0:7}"; \
-                 gh release upload ios-nightly Horizon-game-unsigned.ipa --clobber; }
-          gh release edit ios-nightly --notes-file notes.md
+            Horizon-game-unsigned.ipa
