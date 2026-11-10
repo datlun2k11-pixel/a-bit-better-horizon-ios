@@ -45,7 +45,7 @@ declare_class!(
             // A full-screen launcher stole first responder; restore gameplay keyboard focus, unless the system
             // holds it (a phone call's call bar, a forwarded banner).
             if let Some(view) = self.view() {
-                let responder: bool = unsafe { msg_send![view, isFirstResponder] };
+                let responder: bool = unsafe { msg_send![&view, isFirstResponder] };
                 if !responder {
                     unsafe { view.becomeFirstResponder() };
                 }
