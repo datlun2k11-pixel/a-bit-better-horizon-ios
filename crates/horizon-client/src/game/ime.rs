@@ -104,6 +104,7 @@ impl Game<'_> {
 
     /// Text the input method committed (`WindowEvent::Ime(Commit)`).
     pub(super) fn ime_commit(&mut self, text: &str) {
+        log::info!("Horizon: the input method committed {text:?}");
         preedit::set_preedit(None);
         // Dialogs have their own fields; the other topmost prompts take no text.
         if self.prompt_open() && !self.dialog_open() {

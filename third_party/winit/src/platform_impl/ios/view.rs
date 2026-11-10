@@ -1,6 +1,7 @@
 #![allow(clippy::unnecessary_cast)]
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::{c_char, CString};
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
@@ -337,7 +338,18 @@ declare_class!(
         fn resign_first_responder(&self) -> bool {
             self.release_hardware_keys();
             self.set_mouse_captured(false);
-            unsafe { msg_send![super(self), resignFirstResponder] }
+            let resigned: bool = unsafe { msg_send![super(self), resignFirstResponder] };
+            self.log_responder("resign", resigned);
+            resigned
+        }
+
+        // Typed keys reach `insertText:` only while this view is the responder. Logging both ends says whether
+        // a field that shows no text ever got it, and whether the system took the keyboard back.
+        #[method(becomeFirstResponder)]
+        fn become_first_responder(&self) -> bool {
+            let taken: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
+            self.log_responder("become", taken);
+            taken
         }
 
         #[method(pressesBegan:withEvent:)]
@@ -407,6 +419,19 @@ declare_class!(
         }
     }
 );
+
+/// The device console (`os_log`): the game's own log has no winit messages on a phone, and a build that
+/// types nothing into a field needs the keyboard's side of the story beside the game's.
+fn log_to_console(message: &str) {
+    extern "C" {
+        fn NSLog(format: *const c_char, ...);
+    }
+    let line = CString::new(message).unwrap_or_default();
+    // SAFETY: the format is `%s` and nothing else, and the string is NUL-terminated and outlives the call.
+    unsafe {
+        NSLog(c"%s".as_ptr(), line.as_ptr());
+    }
+}
 
 impl WinitView {
     pub(crate) fn new(
@@ -654,11 +679,35 @@ impl WinitView {
     }
 
     pub(crate) fn set_ime_allowed(&self, allowed: bool) {
-        self.ivars().ime_allowed.set(allowed);
-        unsafe {
-            self.reloadInputViews();
-            self.becomeFirstResponder();
+        let was = self.ivars().ime_allowed.replace(allowed);
+        if was != allowed {
+            log_to_console(&format!("the game asked for the keyboard: {allowed}"));
         }
+        if !allowed {
+            unsafe { self.reloadInputViews() };
+            return;
+        }
+        // A window that lost first responder to the system (a phone call, Siri, a notification) before the
+        // keyboard was asked for would otherwise get UIKit's input view and nothing that types into it.
+        let responder: bool = unsafe { msg_send![self, isFirstResponder] };
+        if !responder {
+            unsafe {
+                self.becomeFirstResponder();
+            }
+        }
+        unsafe { self.reloadInputViews() };
+    }
+
+    /// A `resign` that failed is this view saying it was never the responder, which UIKit asks of every
+    /// ancestor: logging it would repeat on every screen change.
+    fn log_responder(&self, what: &str, result: bool) {
+        if what == "resign" && !result {
+            return;
+        }
+        let input = self.ivars().ime_allowed.get();
+        log_to_console(&format!(
+            "the game view {what} first responder: {result}, keyboard allowed: {input}"
+        ));
     }
 
     fn emit_hardware_key(&self, event: KeyEvent) {
@@ -751,6 +800,11 @@ impl WinitView {
     }
 
     fn handle_insert_text(&self, text: &NSString) {
+        log_to_console(&format!(
+            "the keyboard typed {:?} (keyboard allowed: {})",
+            text.to_string(),
+            self.ivars().ime_allowed.get()
+        ));
         let window = self.window().unwrap();
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::new().unwrap();
@@ -792,6 +846,7 @@ impl WinitView {
     }
 
     fn handle_delete_backward(&self) {
+        log_to_console("the keyboard deleted a character");
         let window = self.window().unwrap();
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::new().unwrap();

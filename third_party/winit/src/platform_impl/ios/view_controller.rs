@@ -42,8 +42,14 @@ declare_class!(
         #[method(viewDidAppear:)]
         fn view_did_appear(&self, animated: bool) {
             let _: () = unsafe { msg_send![super(self), viewDidAppear: animated] };
-            // A full-screen launcher stole first responder; restore gameplay keyboard focus.
-            if let Some(view) = self.view() { unsafe { view.becomeFirstResponder(); } }
+            // A full-screen launcher stole first responder; restore gameplay keyboard focus, unless the system
+            // holds it (a phone call's call bar, a forwarded banner).
+            if let Some(view) = self.view() {
+                let responder: bool = unsafe { msg_send![view, isFirstResponder] };
+                if !responder {
+                    unsafe { view.becomeFirstResponder() };
+                }
+            }
         }
 
         #[method(shouldAutorotate)]

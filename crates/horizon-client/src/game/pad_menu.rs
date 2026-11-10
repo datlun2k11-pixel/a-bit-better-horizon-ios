@@ -2176,6 +2176,7 @@ impl Game<'_> {
         self.pad.menu.osk = None;
         self.pad.menu.system_keyboard = true;
         self.pad.menu.system_keyboard_hidden = false;
+        log::info!("Horizon: the keyboard button asked for the system keyboard");
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
             window.set_ime_allowed(true);
@@ -2190,6 +2191,7 @@ impl Game<'_> {
         }
         self.pad.menu.system_keyboard = false;
         self.pad.menu.system_keyboard_hidden = true;
+        log::info!("Horizon: the system keyboard was put away");
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
@@ -2230,6 +2232,7 @@ impl Game<'_> {
             && !self.pad.menu.system_keyboard_hidden;
         if want != self.pad.menu.system_keyboard {
             self.pad.menu.system_keyboard = want;
+            log::info!("Horizon: system keyboard {want} (a text field focused: {focused})");
             if let Some(window) = &self.window {
                 window.set_ime_allowed(want);
             }
