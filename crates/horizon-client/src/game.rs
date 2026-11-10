@@ -23388,6 +23388,15 @@ impl Loading {
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
         }
+        // A phone's GPU memory is the app's own (unified), and Jetsam counts it: the world's
+        // textures went in beside the loading screen's, and the world load behind that then
+        // ran a 3 GB device out. The loading screen's renderer goes before the world's is
+        // built and loaded, and is rebuilt below if that fails (the reason needs a screen).
+        #[cfg(target_os = "ios")]
+        {
+            drop(self.renderer.take());
+            horizon_threads::release_free_memory();
+        }
         let renderer_at = Instant::now();
         let renderer = match startup::time("renderer.world", || {
             build_renderer(
@@ -23410,6 +23419,22 @@ impl Loading {
             Ok(renderer) => renderer,
             // The screen that says why (a phone's import screen) draws on the loading renderer.
             Err(e) => {
+                // On a phone it was given up before this build; put it back, so the failure
+                // is reported on a screen.
+                #[cfg(target_os = "ios")]
+                if self.renderer.is_none()
+                    && let Ok(restored) = loading_renderer(
+                        window.clone(),
+                        options.offscreen,
+                        Some(&gui.atlas),
+                        Some(&gui.panorama),
+                        None,
+                        self.settings.horizon.api,
+                    )
+                {
+                    horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
+                    self.renderer = Some(restored);
+                }
                 if let Some(renderer) = &mut self.renderer {
                     let _ = renderer.recreate_surface();
                 }
@@ -23433,7 +23458,7 @@ impl Loading {
         let res: &'static Arc<Resources> = Box::leak(Box::new(loaded.resources));
         let game_at = Instant::now();
         let game_step = startup::step("handoff.start_game");
-        let Some(mut game) = start_game(
+        let started = start_game(
             &res,
             loaded.pack,
             gui,
@@ -23446,9 +23471,19 @@ impl Loading {
             Some(self.settings.clone()),
             loaded.game_cpu,
             loaded.entity_models,
-        )?
-        else {
-            return Ok(None);
+        );
+        let mut game = match started {
+            Ok(Some(game)) => game,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                // The loading screen's renderer went before this build (iOS): the world's is
+                // the one there is now, and the reason a load failed still needs a screen.
+                #[cfg(target_os = "ios")]
+                {
+                    self.renderer = Some(renderer);
+                }
+                return Err(e);
+            }
         };
         drop(game_step);
         let game_ms = game_at.elapsed().as_millis();
