@@ -338,18 +338,7 @@ declare_class!(
         fn resign_first_responder(&self) -> bool {
             self.release_hardware_keys();
             self.set_mouse_captured(false);
-            let resigned: bool = unsafe { msg_send![super(self), resignFirstResponder] };
-            self.log_responder("resign", resigned);
-            resigned
-        }
-
-        // Typed keys reach `insertText:` only while this view is the responder. Logging both ends says whether
-        // a field that shows no text ever got it, and whether the system took the keyboard back.
-        #[method(becomeFirstResponder)]
-        fn become_first_responder(&self) -> bool {
-            let taken: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
-            self.log_responder("become", taken);
-            taken
+            unsafe { msg_send![super(self), resignFirstResponder] }
         }
 
         #[method(pressesBegan:withEvent:)]
@@ -683,31 +672,10 @@ impl WinitView {
         if was != allowed {
             log_to_console(&format!("the game asked for the keyboard: {allowed}"));
         }
-        if !allowed {
-            unsafe { self.reloadInputViews() };
-            return;
+        unsafe {
+            self.reloadInputViews();
+            self.becomeFirstResponder();
         }
-        // A window that lost first responder to the system (a phone call, Siri, a notification) before the
-        // keyboard was asked for would otherwise get UIKit's input view and nothing that types into it.
-        let responder: bool = unsafe { msg_send![self, isFirstResponder] };
-        if !responder {
-            unsafe {
-                self.becomeFirstResponder();
-            }
-        }
-        unsafe { self.reloadInputViews() };
-    }
-
-    /// A `resign` that failed is this view saying it was never the responder, which UIKit asks of every
-    /// ancestor: logging it would repeat on every screen change.
-    fn log_responder(&self, what: &str, result: bool) {
-        if what == "resign" && !result {
-            return;
-        }
-        let input = self.ivars().ime_allowed.get();
-        log_to_console(&format!(
-            "the game view {what} first responder: {result}, keyboard allowed: {input}"
-        ));
     }
 
     fn emit_hardware_key(&self, event: KeyEvent) {
