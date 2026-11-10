@@ -83,6 +83,13 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         );
         // The log's first line names the build, so a bug report that carries the log says which one it was.
         log::info!("Horizon {}", crash::version());
+        // winit's side of the keyboard (what asked for it, what was typed) has no log of its own
+        // on a phone: it goes to the console, which a bug report's zip does not carry. This puts it
+        // in `latest.log` beside the game's own lines.
+        #[cfg(target_os = "ios")]
+        winit::platform::ios::set_log_hook(Some(|line| {
+            log::info!(target: "horizon_winit", "{line}")
+        }));
         boot_stage("log open");
         crash::install(home.clone(), side);
         boot_stage("crash handler");

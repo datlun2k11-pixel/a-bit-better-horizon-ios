@@ -412,6 +412,14 @@ declare_class!(
 /// The device console (`os_log`): the game's own log has no winit messages on a phone, and a build that
 /// types nothing into a field needs the keyboard's side of the story beside the game's.
 fn log_to_console(message: &str) {
+    // The game's log, when it asked for these (`set_log_hook`): a phone's console is not in
+    // the zip a player shares, its `logs/latest.log` is.
+    if let Some(hook) = *LOG_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        hook(message);
+    }
     extern "C" {
         fn NSLog(format: *const c_char, ...);
     }
@@ -420,6 +428,16 @@ fn log_to_console(message: &str) {
     unsafe {
         NSLog(c"%s".as_ptr(), line.as_ptr());
     }
+}
+
+/// Where [`log_to_console`]'s messages go besides the console.
+static LOG_HOOK: std::sync::Mutex<Option<fn(&str)>> = std::sync::Mutex::new(None);
+
+/// Sends [`log_to_console`]'s messages to `hook` (the game's log) as well.
+pub(crate) fn set_log_hook(hook: Option<fn(&str)>) {
+    *LOG_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
 }
 
 impl WinitView {

@@ -433,3 +433,12 @@ pub enum StatusBarStyle {
     LightContent,
     DarkContent,
 }
+
+/// Sends winit's own messages about this app (what the keyboard typed, and what asked for it)
+/// to `hook`, beside the device console they always go to.
+///
+/// winit has no logger of its own on iOS, and the console is where those lines end up; a game
+/// that keeps a log file of its own wants them in it, next to its own side of the story.
+pub fn set_log_hook(hook: Option<fn(&str)>) {
+    crate::platform_impl::set_log_hook(hook);
+}

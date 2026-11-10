@@ -350,6 +350,19 @@ impl Game<'_> {
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
         }
+        // A phone's GPU memory is the app's own (unified), and Jetsam counts it: holding the
+        // old textures and world meshes while the new pack's upload doubled the footprint at
+        // a reload, and an HD pack with a world behind it ran the phone out (the device lost
+        // with "Out of memory" at the first texture upload). So the old renderer goes before
+        // the new one exists; the device this builds is Metal's, which takes a new one on the
+        // same window, where a replaced Vulkan device could cost the swapchain.
+        let previous = if cfg!(target_os = "ios") {
+            drop(self.renderer.take());
+            horizon_threads::release_free_memory();
+            None
+        } else {
+            self.renderer.as_ref()
+        };
         let renderer = match self
             .window
             .clone()
@@ -359,7 +372,7 @@ impl Game<'_> {
                     self.options.offscreen,
                     &pack,
                     &gui,
-                    self.renderer.as_ref(),
+                    previous,
                     Some(textures),
                     self.settings.horizon.api,
                     self.settings.horizon.translucent_batching,
@@ -375,6 +388,16 @@ impl Game<'_> {
         {
             Ok(renderer) => renderer,
             Err(error) => {
+                // The phone gave its old renderer up before this build: give it one on the
+                // packs the screen was drawing, so the failure is still reported on a screen.
+                if cfg!(target_os = "ios") && self.renderer.is_none() {
+                    if let Some(window) = self.window.clone() {
+                        if let Ok(restored) = self.new_renderer(window) {
+                            self.renderer = Some(restored);
+                            self.apply_ui_settings();
+                        }
+                    }
+                }
                 if let Some(renderer) = &mut self.renderer {
                     renderer.recreate_surface().map_err(|restore| {
                         format!(
