@@ -357,6 +357,7 @@ impl Opt {
             Opt::TouchStick => "horizon.options.touch_movement",
             Opt::TouchStickScale => "horizon.options.touch_stick_size",
             Opt::TouchStickOpacity => "horizon.options.touch_stick_opacity",
+            Opt::TouchPointer => "horizon.options.touch_pointer",
             Opt::ModelPart(i) => [
                 "options.modelPart.cape",
                 "options.modelPart.jacket",
@@ -759,6 +760,11 @@ impl Opt {
             }),
             Opt::TouchStickScale => percent(c, s.touch.stick_scale),
             Opt::TouchStickOpacity => percent(c, s.touch.stick_opacity),
+            Opt::TouchPointer => tr(if s.touch.pointer == crate::touch::PointerMode::Cursor {
+                "horizon.options.touch_pointer.cursor"
+            } else {
+                "horizon.options.touch_pointer.direct"
+            }),
             _ => generic(c, self.value_text(s)),
         }
     }
@@ -1252,6 +1258,12 @@ impl Opt {
                 s.touch.movement = match s.touch.movement {
                     crate::touch::Movement::DPad => crate::touch::Movement::Stick,
                     crate::touch::Movement::Stick => crate::touch::Movement::DPad,
+                };
+            }
+            Opt::TouchPointer => {
+                s.touch.pointer = match s.touch.pointer {
+                    crate::touch::PointerMode::Direct => crate::touch::PointerMode::Cursor,
+                    crate::touch::PointerMode::Cursor => crate::touch::PointerMode::Direct,
                 };
             }
             _ => {}
@@ -3377,6 +3389,7 @@ impl OptionsUi {
                         None,
                     ),
                     Row::Big(Opt::TouchStick),
+                    Row::Big(Opt::TouchPointer),
                 ];
                 // The stick is the one button still sized here; every other button has its own options
                 // (in Edit Layout, hold it for a moment).

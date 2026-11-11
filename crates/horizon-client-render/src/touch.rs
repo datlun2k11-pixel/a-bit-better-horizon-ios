@@ -48,6 +48,16 @@ impl Control {
     }
 }
 
+/// What a finger does over a menu: act where it touches, or move a pointer that a tap clicks with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PointerMode {
+    /// The touch point is the mouse pointer: a tap clicks what is under the finger.
+    #[default]
+    Direct,
+    /// The finger moves a pointer that stays where it was left, and a tap clicks under it.
+    Cursor,
+}
+
 /// How the left thumb moves the player.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Movement {
@@ -436,6 +446,8 @@ pub struct TouchSettings {
     pub stick_scale: f32,
     /// The stick's own opacity, `MIN_OPACITY`..=1.0, multiplied by the overlay's.
     pub stick_opacity: f32,
+    /// How a finger acts over a menu.
+    pub pointer: PointerMode,
 }
 
 impl Default for TouchSettings {
@@ -451,6 +463,7 @@ impl Default for TouchSettings {
             movement: Movement::DPad,
             stick_scale: 1.0,
             stick_opacity: 1.0,
+            pointer: PointerMode::Direct,
         }
     }
 }
@@ -587,6 +600,12 @@ impl TouchSettings {
                         s.movement = Movement::Stick;
                     }
                 }
+                // `pointer:cursor`; direct touch is the default and has no line.
+                "pointer" => {
+                    if value == "cursor" {
+                        s.pointer = PointerMode::Cursor;
+                    }
+                }
                 // `stick:<scale>:<opacity>`, as `serialize` writes it.
                 "stick" => {
                     if let Some((scale, opacity)) = value.split_once(':') {
@@ -686,6 +705,9 @@ impl TouchSettings {
         text.push_str(&format!("opacity:{}\nscale:{}\n", self.opacity, self.scale));
         if self.movement == Movement::Stick {
             text.push_str("movement:stick\n");
+        }
+        if self.pointer == PointerMode::Cursor {
+            text.push_str("pointer:cursor\n");
         }
         if self.stick_scale != 1.0 || self.stick_opacity != 1.0 {
             text.push_str(&format!(

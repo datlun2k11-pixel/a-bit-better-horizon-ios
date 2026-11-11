@@ -988,6 +988,8 @@ pub enum Opt {
     /// The analog stick's own size and opacity.
     TouchStickScale,
     TouchStickOpacity,
+    /// Direct touch, or a pointer the finger moves over a menu.
+    TouchPointer,
     PadGameplayGuide,
     /// The radial menu's opener held or pressed once (`PadSettings::radial_mode`).
     PadRadialMode,

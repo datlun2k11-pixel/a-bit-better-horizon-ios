@@ -6391,6 +6391,7 @@ impl Game<'_> {
         if show_hud {
             self.draw_pad_guide(&mut batch, guide_from);
         }
+        self.draw_touch_cursor(&mut batch);
         batch
     }
     fn draw_inventory(&mut self, batch: &mut HudBatch) {

@@ -6,7 +6,7 @@ use super::{Game, Screen, event_loop::EventLoopCtl};
 use horizon_client::{
     Result,
     held::Source,
-    hud::HudBatch,
+    hud::{HudAtlas, HudBatch},
     keymapping::SNEAK,
     touch::{self, Control, Out, Touches},
     touch_draw,
@@ -56,6 +56,9 @@ pub(super) struct TouchInput {
     hardware: super::input_mode::InputMode,
     /// The finger that is the pointer over a menu.
     menu: Option<MenuFinger>,
+    /// Where the menu pointer was left in cursor mode (`touch::PointerMode::Cursor`), in GUI pixels: the
+    /// finger moves it, a tap clicks under it, and it stays there between taps like a mouse.
+    cursor: Option<(f32, f32)>,
     /// Clicks to release once a tick has passed: vanilla samples buttons once a tick, so a tap released in
     /// the same frame would be lost (the pad holds its short presses back the same way).
     late: Vec<(MouseButton, u64)>,
@@ -145,12 +148,26 @@ struct MenuFinger {
     id: u64,
     /// Where the scrolling last caught up with the finger (GUI pixels).
     scrolled: (f32, f32),
+    /// Where the finger was last seen: in cursor mode it moves the pointer by its own movement.
+    from: (f32, f32),
     /// Loop iterations since it went down.
     frames: u8,
     pressed: bool,
+    /// A cursor-mode gesture: it aims the pointer while it moves and clicks under it when it lifts.
+    tap: bool,
+    /// The gesture scrolled a list: it aimed, so it must not also click.
+    wheeled: bool,
     lifted: bool,
     /// It went down on the close button, which already acted: the rest of it is ignored.
     closed: bool,
+}
+
+/// A menu pointer kept on the screen: a finger can drag past an edge without losing it.
+fn clamp_point(point: (f32, f32), batch: Option<HudBatch>) -> (f32, f32) {
+    match batch {
+        Some(b) => (point.0.clamp(0.0, b.width), point.1.clamp(0.0, b.height)),
+        None => point,
+    }
 }
 
 /// The key a button stands for: the vanilla default of its mapping.
@@ -682,20 +699,28 @@ impl Game<'_> {
         phase: TouchPhase,
         at: (f32, f32),
     ) {
+        let cursor_mode = self.settings.touch.pointer == touch::PointerMode::Cursor;
         match phase {
             TouchPhase::Started => {
                 if self.touch.menu.is_some() {
                     return;
                 }
+                // In cursor mode the finger moves the pointer a mouse would, and the tap acts under it;
+                // the first touch starts it where the finger is, like direct touch.
+                let pointer = if cursor_mode {
+                    clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch())
+                } else {
+                    at
+                };
                 let on_close = self.touch_close_shown()
                     && self
                         .touch_batch()
-                        .is_some_and(|b| touch::hit_rect(touch::close_rect(b.width, b.height), at));
+                        .is_some_and(|b| touch::hit_rect(touch::close_rect(b.width, b.height), pointer));
                 let on_keyboard = !on_close
                     && self.touch_shown()
                     && self.field_focused()
                     && self.touch_batch().is_some_and(|b| {
-                        touch::hit_rect(touch::keyboard_rect(b.width, b.height), at)
+                        touch::hit_rect(touch::keyboard_rect(b.width, b.height), pointer)
                     });
                 if on_close {
                     // What Escape does where the finger is (the pad's B).
@@ -709,7 +734,7 @@ impl Game<'_> {
                     // it would on any phone (and one on the field brings it back after the button hid it);
                     // the tap still does what it was on.
                     match self.focused_field_rect() {
-                        Some(rect) if touch::hit_rect(rect, self.screen_point(at)) => {
+                        Some(rect) if touch::hit_rect(rect, self.screen_point(pointer)) => {
                             if self.system_keyboard_hidden() {
                                 self.show_system_keyboard();
                             }
@@ -717,13 +742,21 @@ impl Game<'_> {
                         Some(_) if self.system_keyboard_up() => self.hide_system_keyboard(),
                         _ => {}
                     }
-                    self.touch_pointer(event_loop, at);
+                    self.touch_pointer(event_loop, pointer);
+                    if cursor_mode {
+                        // Where the pointer now is, a finger aims rather than acts: the click comes when it
+                        // lifts, under the pointer (Ended), as a mouse's button would.
+                        self.touch.cursor = Some(pointer);
+                    }
                 }
                 self.touch.menu = Some(MenuFinger {
                     id,
                     scrolled: at,
+                    from: at,
                     frames: 0,
                     pressed: false,
+                    tap: cursor_mode && !(on_close || on_keyboard),
+                    wheeled: false,
                     lifted: false,
                     closed: on_close || on_keyboard,
                 });
@@ -734,25 +767,60 @@ impl Game<'_> {
                     return;
                 };
                 let last = finger.scrolled;
-                self.touch_pointer(event_loop, at);
+                let pointer = if cursor_mode {
+                    let was = clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch());
+                    clamp_point(
+                        (
+                            was.0 + at.0 - finger.from.0,
+                            was.1 + at.1 - finger.from.1,
+                        ),
+                        self.touch_batch(),
+                    )
+                } else {
+                    at
+                };
                 // A drag scrolls lists as a wheel would, the content following the finger. Not in an
                 // inventory, where a drag carries the item it pressed on.
                 let lines = ((at.1 - last.1) / SCROLL_LINE).trunc();
                 let scrolls = self.screen != Screen::Inventory;
                 if let Some(f) = self.touch.menu.as_mut() {
                     f.scrolled = (at.0, last.1 + lines * SCROLL_LINE);
+                    f.from = at;
+                    f.wheeled |= lines != 0.0;
                 }
+                if cursor_mode {
+                    self.touch.cursor = Some(pointer);
+                }
+                self.touch_pointer(event_loop, pointer);
                 if scrolls && lines != 0.0 {
                     self.touch_wheel(event_loop, lines);
                 }
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
-                let Some(finger) = self.touch.menu.as_mut().filter(|f| f.id == id) else {
+                let click = phase == TouchPhase::Ended;
+                let Some(finger) = self.touch.menu.as_ref().filter(|f| f.id == id) else {
                     return;
                 };
-                finger.lifted = true;
-                if !finger.closed {
-                    self.touch_pointer(event_loop, at);
+                let (closed, tap, pointer) = (
+                    finger.closed,
+                    finger.tap && !finger.wheeled,
+                    if cursor_mode {
+                        self.touch.cursor.unwrap_or(at)
+                    } else {
+                        at
+                    },
+                );
+                if let Some(f) = self.touch.menu.as_mut() {
+                    f.lifted = true;
+                }
+                if !closed {
+                    self.touch_pointer(event_loop, pointer);
+                    if tap && click {
+                        // The click under the pointer: pressed now, let go once the game has drawn a frame
+                        // with it there, so a screen finds the widget it is on.
+                        self.touch_button(event_loop, true);
+                        self.touch.late.push((MouseButton::Left, self.ticks));
+                    }
                 }
             }
         }
@@ -776,6 +844,11 @@ impl Game<'_> {
         };
         finger.frames = finger.frames.saturating_add(1);
         if finger.closed {
+            if finger.lifted {
+                self.touch.menu = None;
+            }
+        } else if finger.tap {
+            // A cursor-mode gesture clicked on lifting (`touch_menu`); nothing waits on a frame here.
             if finger.lifted {
                 self.touch.menu = None;
             }
@@ -899,6 +972,58 @@ impl Game<'_> {
                 self.settings.touch.style(control).opacity,
             );
         }
+    }
+
+    /// The menu pointer in cursor mode: a mouse arrow whose tip is where a tap clicks. iOS has no
+    /// visible cursor, so the game draws the one a mouse would bring.
+    pub(super) fn draw_touch_cursor(&self, batch: &mut HudBatch) {
+        if self.settings.touch.pointer != touch::PointerMode::Cursor
+            || self.touch_playing()
+            || self.touch_on_phone()
+        {
+            return;
+        }
+        let Some(at) = self.touch.cursor else {
+            return;
+        };
+        let atlas = &self.gui.atlas;
+        // A classic arrow: the head's triangle and the tail hanging from it, scaled about the tip.
+        let head = [[0.0, 0.0], [0.0, 15.2], [11.6, 11.1]];
+        let tail = [[4.5, 12.2], [7.0, 18.0], [9.3, 16.9], [6.8, 11.2]];
+        // A solid black arrow, as the classic cursor sprite is: it needs a light edge to stay visible.
+        for grow in [1.6, 0.0] {
+            let color = if grow > 0.0 { u32::MAX } else { 0xFF000000 };
+            fill_poly(batch, atlas, at, &head, grow, color);
+            fill_poly(batch, atlas, at, &tail, grow, color);
+        }
+    }
+}
+
+/// One convex shape filled, its corners `grow` pixels further from their centre: the outline behind the
+/// arrow, drawn just larger than it.
+fn fill_poly(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    at: (f32, f32),
+    shape: &[[f32; 2]],
+    grow: f32,
+    color: u32,
+) {
+    let n = shape.len() as f32;
+    let c = shape
+        .iter()
+        .fold([0.0, 0.0], |c, p| [c[0] + p[0] / n, c[1] + p[1] / n]);
+    let grown: Vec<[f32; 2]> = shape
+        .iter()
+        .map(|p| {
+            let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+            let length = (dx * dx + dy * dy).sqrt();
+            let k = if length > 0.0 { 1.0 + grow / length } else { 1.0 };
+            [at.0 + c[0] + dx * k, at.1 + c[1] + dy * k]
+        })
+        .collect();
+    for i in 1..grown.len() - 1 {
+        batch.fill_quad(atlas, [grown[0], grown[i], grown[i + 1], grown[i + 1]], color);
     }
 }
 

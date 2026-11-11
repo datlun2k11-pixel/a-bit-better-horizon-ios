@@ -26,18 +26,18 @@ Validation covers production Rust layout and finger dispatch tests, isolated Swi
 
 ## Cursor, mouse buttons and joystick
 
-App Settings → Touch controls offers **Mouse cursor** (default) or **Direct touch** for menus, and **D-pad** or **Joystick** for movement. In cursor mode, drag the empty menu surface to move a visible relative pointer. With **Tap and hold gestures** enabled (the default), a short tap left-clicks a menu, and a long press holds the left mouse button. Independent left/right mouse buttons hold until release, allowing one finger to move the pointer while another drags a slot or holds a mouse button. Quick clicks wait for the pointer’s rendered frame; screen transitions, cancellation, reloads and keyboard takeover discard stale presses. Direct touch retains absolute menu navigation.
+Menu input is chosen in the game's own screen, Options → Controls → Touch Controls → **Menu Input**, as **Direct touch** (default) or **Mouse cursor**. Direct touch acts where the finger is. Mouse cursor draws a mouse arrow the game owns (iOS shows none): a drag moves the pointer over the menu without clicking, and lifting the finger clicks under it, so aiming and clicking are separate gestures. The pointer stays where it was left between taps, is clamped to the view, and a wheel-like drag still scrolls lists. A quick click is let go once the game has drawn a frame with the pointer there, so a screen finds the widget it is on; screen transitions, cancellation and reloads discard stale presses.
 
 In a world, one primary finger turns the camera; the explicit left/right buttons provide held attack/use. With gestures enabled, a short surface tap uses/right-clicks and a 400 ms long press attacks/mines until release. Two-finger menu gestures scroll or open/close the keyboard. Hotbar gestures select a slot on tap, swap the offhand on double tap, and send Drop while held. The optional joystick generates physical WASD inputs through the in-game bindings, including diagonals and a centre dead zone. Mouse buttons and joystick have independent movable positions in the full-screen editor; the joystick replaces the directional pad while keeping sneak separate. Old saved layouts retain their positions and visibility. The native bridge continues to accept older 20-float readers while new readers receive all 26 position values.
 
 The source-backed adapter matches the tested Pojav iOS input boundary: eight direction sectors, four W/A/S/D states per sector change, a 35% travel dead zone with retained direction until release, and relative cursor scaling/clamping. In menu cursor mode, the optional joystick drives the cursor with frame-time scaled acceleration. It does not import Pojav JSON control maps or claim compatibility with every Pojav setting. Exact-axis behavior and the scope of the comparison are recorded in [input parity and provenance](pojav-input-parity.md).
 
-Mouse and hotbar gestures can be disabled independently in the app’s touch settings. Both menu modes use the same visible key/mouse buttons; direct mode positions the pointer at the finger, while cursor mode accumulates relative movement. The native gesture/callback comparison, actual simulator checks and release-validation limits are documented in [input parity](pojav-input-parity.md).
+Both menu modes use the same visible key/mouse buttons; direct mode positions the pointer at the finger, while cursor mode moves it by the finger's own movement. The native gesture/callback comparison, actual simulator checks and release-validation limits are documented in [input parity](pojav-input-parity.md).
 
 
 ## Amethyst-style controls (mobile port)
 
-The native launcher editor remains the layout editor. The world overlay now uses
+The game's own editor (Options → Controls → Touch Controls) is the layout editor. The world overlay now uses
 rounded translucent labels and a circular joystick, with Amethyst default positions.
 Movement remains selectable between directional buttons and joystick. The More drawer
 contains perspective, chat, debug, and player list; Runtime Menu opens the pause menu.
@@ -54,4 +54,4 @@ The joystick retains the current adapter's Amethyst direction and centre-retenti
 behavior. Forward lock starts only when the finger lifts over its target while moving
 forward; touch cancellation and leaving gameplay release it. Menu cursor placement,
 frozen click context, and keyboard/mouse ownership remain handled by the current adapter.
-The older checkout's standalone in-game editor is deliberately not copied into this build.
+The launcher's separate touch settings screen was removed: the same layout, opacity and menu-input choices live in the in-game editor.
