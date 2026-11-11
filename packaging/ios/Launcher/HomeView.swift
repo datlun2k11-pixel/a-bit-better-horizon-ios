@@ -70,6 +70,7 @@ struct HomeView: View {
         .task {
             await updates.check()
             link.uncover = onPlay
+            link.prepareSession = { try await account.handOver() }
             await link.watch()
         }
     }
