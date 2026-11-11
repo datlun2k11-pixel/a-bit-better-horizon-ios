@@ -14,6 +14,7 @@ pub(super) struct PackImage {
     /// Last frame's contents, for a pass that samples and stores the image (`copied`).
     pub(super) copy: Option<wgpu::TextureView>,
     pub(super) copied: bool,
+    pub(super) storage: bool,
     /// The contents before a compute pass that reads them so (`snapshot`), apart from `copy`,
     /// which a later pass may still sample.
     pub(super) before: Option<wgpu::TextureView>,
@@ -54,6 +55,7 @@ pub(super) fn images(defs: Vec<CustomImage>, packed_float: bool) -> Vec<PackImag
             view: None,
             copy: None,
             copied: false,
+            storage: true,
             before: None,
             snapshotted: false,
             made_for: [0; 2],
@@ -82,6 +84,9 @@ pub(super) fn format(f: Format, packed_float: bool) -> wgpu::TextureFormat {
         _ => rgba,
     };
     match (f.kind, f.bits) {
+        (Kind::Unorm, 10) => T::Rgb10a2Unorm,
+        (Kind::Uint, 10) => T::Rgb10a2Uint,
+        (Kind::Snorm, 16) => pick(T::R16Snorm, T::Rg16Snorm, T::Rgba16Snorm),
         (Kind::Int, 8) => pick(T::R8Sint, T::Rg8Sint, T::Rgba8Sint),
         (Kind::Int, 16) => pick(T::R16Sint, T::Rg16Sint, T::Rgba16Sint),
         (Kind::Int, _) => pick(T::R32Sint, T::Rg32Sint, T::Rgba32Sint),
@@ -142,10 +147,17 @@ pub(super) fn resize_images(
         if image.view.is_some() && (!relative || image.made_for == size) {
             continue;
         }
-        made = true;
         // A relative image larger than the render size stops at the device's limit.
         let [width, height, depth] = image.def.extent(size);
         let [width, height] = [width.min(largest), height.min(largest)];
+        if image.view.as_ref().is_some_and(|view| {
+            let extent = view.texture().size();
+            [extent.width, extent.height, extent.depth_or_array_layers] == [width, height, depth]
+        }) {
+            image.made_for = size;
+            continue;
+        }
+        made = true;
         let make = |usage| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -165,7 +177,8 @@ pub(super) fn resize_images(
                 .create_view(&Default::default())
         };
         // Atomics on a texture need it made for them (Metal ignores them otherwise).
-        let atomic = device.features().contains(wgpu::Features::TEXTURE_ATOMIC)
+        let atomic = image.storage
+            && device.features().contains(wgpu::Features::TEXTURE_ATOMIC)
             && matches!(
                 image.format,
                 wgpu::TextureFormat::R32Sint | wgpu::TextureFormat::R32Uint
@@ -176,8 +189,11 @@ pub(super) fn resize_images(
             wgpu::TextureUsages::empty()
         };
         image.view = Some(make(
-            wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_DST
+            (if image.storage {
+                wgpu::TextureUsages::STORAGE_BINDING
+            } else {
+                wgpu::TextureUsages::empty()
+            }) | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC
                 | atomic,
         ));

@@ -562,9 +562,48 @@ mod tests {
         }
     }
 
+    const POSITION_ULPS: u32 = 4;
+    fn position_ulps(a: f32, b: f32) -> Option<u32> {
+        if !a.is_finite() || !b.is_finite() {
+            return None;
+        }
+        if a == b {
+            return Some(0);
+        } // +0 and -0 locate the same point.
+        let ordered = |f: f32| {
+            let bits = f.to_bits();
+            if bits >> 31 != 0 {
+                !bits
+            } else {
+                bits | 0x8000_0000
+            }
+        };
+        Some(ordered(a).abs_diff(ordered(b)))
+    }
+    #[test]
+    fn position_roundoff_bound_rejects_larger_errors_and_nonfinite_values() {
+        let a = 1.0f32;
+        assert_eq!(position_ulps(0.0, -0.0), Some(0));
+        assert_eq!(
+            position_ulps(a, f32::from_bits(a.to_bits() + POSITION_ULPS)),
+            Some(POSITION_ULPS)
+        );
+        assert!(
+            position_ulps(a, f32::from_bits(a.to_bits() + POSITION_ULPS + 1)).unwrap()
+                > POSITION_ULPS
+        );
+        assert!(
+            position_ulps(-a, -f32::from_bits(a.to_bits() + POSITION_ULPS + 1)).unwrap()
+                > POSITION_ULPS
+        );
+        assert_eq!(position_ulps(f32::NAN, f32::NAN), None);
+        assert_eq!(position_ulps(f32::INFINITY, f32::INFINITY), None);
+    }
+
     /// Two draws of a two-part model with turned, scaled parts, a scrolled
-    /// texture and the armour glint, and an item's: the shader writes what
-    /// `expand` does, to the bit, after the vertices before them.
+    /// texture and the armour and item glints: packed attributes and UVs match `expand`
+    /// bit-for-bit; positions allow only FP32 arithmetic roundoff. Metal contracts
+    /// multiply/adds here (observed one ULP), whereas the CPU uses separate operations.
     #[test]
     fn the_shader_writes_what_the_cpu_reference_computes() {
         let Some((device, queue)) = device() else {
@@ -724,20 +763,46 @@ mod tests {
         let data = read.slice(..).get_mapped_range().unwrap();
         assert_eq!(&data[..sentinel.len()], &sentinel[..]);
         let got: &[Vertex] = bytemuck::cast_slice(&data[sentinel.len()..]);
+        let mut worst = 0;
         for (i, (got, want)) in got.iter().zip(&expected).enumerate() {
+            for (&actual, &expected) in got.pos.iter().zip(&want.pos) {
+                let ulps = position_ulps(actual, expected).expect("finite vertex position");
+                worst = worst.max(ulps);
+                assert!(
+                    ulps <= POSITION_ULPS,
+                    "vertex {i}: {actual} vs {expected} differs {ulps} ULP"
+                );
+            }
+            let exact = Vertex {
+                pos: want.pos,
+                ..*got
+            };
             assert_eq!(
-                bytemuck::bytes_of(got),
+                bytemuck::bytes_of(&exact),
                 bytemuck::bytes_of(want),
-                "vertex {i}: {got:?} != {want:?}"
+                "vertex {i}: non-position attributes {got:?} != {want:?}"
             );
         }
+        eprintln!(
+            "GPU entity positions: worst difference {worst} ULP; all other vertex bytes exact"
+        );
         let silhouettes = &got[(outline_base - before) as usize..];
         assert_eq!(silhouettes.len(), outline.len());
         for (i, (got, want)) in silhouettes.iter().zip(&outline).enumerate() {
+            for (&a, &b) in got.pos.iter().zip(&want.pos) {
+                assert!(
+                    position_ulps(a, b).is_some_and(|n| n <= POSITION_ULPS),
+                    "silhouette {i} position"
+                );
+            }
+            let exact = Vertex {
+                pos: want.pos,
+                ..*got
+            };
             assert_eq!(
-                bytemuck::bytes_of(got),
+                bytemuck::bytes_of(&exact),
                 bytemuck::bytes_of(want),
-                "silhouette {i}: {got:?} != {want:?}"
+                "silhouette {i} attributes"
             );
         }
         // A silhouette is its draw's vertex with the colour and no normal
@@ -800,11 +865,24 @@ mod tests {
             let first = start * 44;
             let last = first + expected.len() * 44;
             assert!(data[..first].iter().all(|b| *b == 0xab), "prefix {i}");
-            assert_eq!(
-                &data[first..last],
-                bytemuck::cast_slice::<_, u8>(expected),
-                "output {i}"
-            );
+            let actual: &[Vertex] = bytemuck::cast_slice(&data[first..last]);
+            for (got, want) in actual.iter().zip(expected) {
+                for (&a, &b) in got.pos.iter().zip(&want.pos) {
+                    assert!(
+                        position_ulps(a, b).is_some_and(|n| n <= POSITION_ULPS),
+                        "output {i} position"
+                    );
+                }
+                let exact = Vertex {
+                    pos: want.pos,
+                    ..*got
+                };
+                assert_eq!(
+                    bytemuck::bytes_of(&exact),
+                    bytemuck::bytes_of(want),
+                    "output {i} attributes"
+                );
+            }
             assert!(data[last..].iter().all(|b| *b == 0xab), "suffix {i}");
         }
     }

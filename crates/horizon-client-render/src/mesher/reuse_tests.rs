@@ -181,6 +181,7 @@ fn a_shader_pack_lights_the_faces_itself() {
             blend_radius: 0,
             smooth_lighting: false,
             cutout_leaves: true,
+            opaque_ice: false,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
         };
@@ -237,6 +238,7 @@ fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
             blend_radius: 0,
             smooth_lighting: false,
             cutout_leaves: true,
+            opaque_ice: false,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
         };
@@ -255,7 +257,7 @@ fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
 
 #[test]
 #[ignore = "requires prepared 26.3 resources (HORIZON_MESH_TEST_RESOURCES or .local/horizon-client/26.3)"]
-fn separate_ao_passes_ao_in_alpha_without_darkening_rgb() {
+fn separate_ao_preserves_native_vertices_and_carries_exact_sidecar_lighting() {
     let root = std::env::var_os("HORIZON_MESH_TEST_RESOURCES")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -289,16 +291,23 @@ fn separate_ao_passes_ao_in_alpha_without_darkening_rgb() {
         blend_radius: 0,
         smooth_lighting: true,
         cutout_leaves: true,
+        opaque_ice: false,
         translucent_layers: &[],
         leaf_culling: LeafCullingMode::Off,
     };
     let mesh = mesher.mesh(&region, 0);
     assert!(!mesh.solid.is_empty());
-    for v in &mesh.solid {
-        // RGB components should be pure un-darkened white (0xFFFFFF) because shader_pack_lighting is on.
-        assert_eq!(v.color & 0x00FF_FFFF, 0x00FF_FFFF);
-        // Alpha holds the AO factor, which must be non-zero.
-        assert!(v.color >> 24 > 0);
+    mesher.separate_ao = false;
+    let ordinary = mesher.mesh(&region, 0);
+    assert_eq!(
+        bytemuck::cast_slice::<_, u8>(&mesh.solid),
+        bytemuck::cast_slice::<_, u8>(&ordinary.solid)
+    );
+    assert!(mesh.states_match());
+    for state in &mesh.solid_states {
+        let light = state.lighting.expect("source lighting for shader policy");
+        assert_eq!(light.tint, 0xffff_ffff);
+        assert!(light.no_directional.iter().all(|color| color >> 24 > 0));
     }
 }
 
@@ -364,6 +373,7 @@ fn reused_mesh_matches_fresh_geometry_across_sections_and_resource_reload() {
             blend_radius: 2,
             smooth_lighting: reload == 0,
             cutout_leaves: reload == 0,
+            opaque_ice: false,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
         };
@@ -513,6 +523,7 @@ fn a_shader_pack_s_still_water_top_starts_at_its_south_west_corner() {
             blend_radius: 0,
             smooth_lighting: true,
             cutout_leaves: true,
+            opaque_ice: false,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
         };

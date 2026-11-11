@@ -4,6 +4,7 @@
 //! extra is off.
 use super::{Dim, Game, Screen, native_hooks::NativeMinimap};
 use horizon_client::{
+    actions::Action,
     extras::{Corner, Cps, FpsCounter, Zoom, fov_target, turn_scale},
     extras_hud::{self, Corners, Keystrokes},
     hud::{HudBatch, MINIMAP_SPRITE},
@@ -11,6 +12,7 @@ use horizon_client::{
     minimap::{self, Layer, Minimap, View},
     multiplayer,
     reconnect::{Retry, Tracker},
+    sprint::Keys,
     title::Mode,
 };
 use std::time::Duration;
@@ -105,11 +107,18 @@ impl Game<'_> {
         let now = self.extras_now();
         self.extras.fps.record(now, elapsed.as_secs_f32() * 1000.0);
         self.native_frame(elapsed);
+        self.pvp_frame();
+        self.recipes_received_now();
     }
     /// The server this game connected to last.
     pub(super) fn server_address(&self) -> Option<&str> {
         self.extras.reconnect.address()
     }
+    /// The last server was selected through LAN discovery, not inferred from its address.
+    pub(super) fn server_is_lan(&self) -> bool {
+        self.extras.reconnect.lan()
+    }
+
     /// Auto-reconnect: a connection to `address` as `name` starts.
     pub(super) fn extras_connecting(&mut self, address: &str, name: &str, lan: bool) {
         self.extras.reconnect.connecting(address, name, lan);
@@ -319,29 +328,45 @@ impl Game<'_> {
                 let [l, r] = &mut self.extras.cps;
                 (l.per_second(now), r.per_second(now))
             });
-            let held = |k| self.keys.contains(&k);
+            let input = self.native_keystroke_inputs();
             let label = |name| keybinds::display_name(self.settings.keys.get(name)).plain();
             let k = Keystrokes {
                 moves: [
-                    (held(KeyCode::KeyW), label("key.forward")),
-                    (held(KeyCode::KeyA), label("key.left")),
-                    (held(KeyCode::KeyS), label("key.back")),
-                    (held(KeyCode::KeyD), label("key.right")),
+                    (input.forward, label("key.forward")),
+                    (input.left, label("key.left")),
+                    (input.backward, label("key.back")),
+                    (input.right, label("key.right")),
                 ],
-                jump: held(KeyCode::Space),
+                jump: input.jump,
                 attack: self.extras.mouse[0],
                 use_: self.extras.mouse[1],
                 cps,
             };
             extras_hud::draw_keystrokes(batch, &self.gui.atlas, &mut corners, keys_corner, &k);
         }
+        self.draw_pvp_hud(batch, &mut corners);
         self.native_hud(batch, &mut corners);
     }
+    /// The overlay names mappings, not their physical default keys. Include
+    /// the stick flags exactly as normal player input does (including opposing
+    /// held keys); an eight-direction approximation would lose shallow diagonals.
+    fn native_keystroke_inputs(&self) -> Keys {
+        Keys {
+            forward: self.keys.held(Action::Forward),
+            backward: self.keys.held(Action::Back),
+            left: self.keys.held(Action::Left),
+            right: self.keys.held(Action::Right),
+            jump: self.keys.held(Action::Jump),
+            ..Keys::default()
+        }
+        .with_stick(self.pad_move())
+    }
+
     /// The height the status effect icons take at the top right
     /// (`Hud.extractEffects`: beneficial at y 1, harmful at y 26).
     fn effect_rows_height(&self) -> f32 {
         let effects = &self.potions.effects.list;
-        if effects.is_empty() || self.screen != Screen::Playing {
+        if effects.is_empty() || self.screen != Screen::Playing || self.pvp_effects_shown() {
             return 0.0;
         }
         let harmful = effects.iter().any(|e| {

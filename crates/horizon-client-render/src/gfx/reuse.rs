@@ -121,7 +121,7 @@ impl On<'_> {
     ) -> wgpu::ShaderModule {
         let key = format!("{descriptor:?}");
         self.reuse.shaders.get(key, self.generation, || {
-            self.device.create_shader_module(descriptor)
+            super::shader_module(self.device, descriptor)
         })
     }
     pub fn create_bind_group_layout(
@@ -148,7 +148,7 @@ impl On<'_> {
     ) -> wgpu::RenderPipeline {
         let key = format!("{descriptor:?}");
         self.reuse.render.get(key, self.generation, || {
-            self.device.create_render_pipeline(descriptor)
+            super::render_pipeline(self.device, descriptor)
         })
     }
 }

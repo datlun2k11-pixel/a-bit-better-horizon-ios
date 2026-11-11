@@ -1,6 +1,8 @@
-//! 1.8.9's melee rules, for the worlds Horizon serves with legacy combat on (the PvP page's
-//! "1.8 combat in worlds you host", off by default). 26.3 stays the rule everywhere else:
-//! a client never uses these, so a vanilla server sees the same game.
+//! Legacy-inspired melee rules for worlds Horizon serves with the explicit combat-rules option
+//! enabled (off by default). The formulas below cover legacy weapons and combat mechanics;
+//! modern items and entities retain the hybrid behavior documented at each helper. This mode
+//! keeps the current protocol and world implementation. 26.3 stays the rule everywhere else:
+//! a client never uses these hosted-world formulas, so a vanilla server sees the same game.
 //!
 //! What 1.8.9 did, read from its client jar (MCP names):
 //! - `EntityPlayer.attackTargetEntityWithCurrentItem`: the attack damage attribute, a

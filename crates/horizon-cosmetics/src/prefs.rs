@@ -19,7 +19,7 @@ pub const FILE: &str = "horizon-extras.txt";
 pub const OTHERS: &str = "cosmeticsOthers";
 /// Hide other players' trails and auras: `true` or `false` (the default).
 pub const HIDE_FX: &str = "cosmeticsHideFx";
-/// The line before trails and auras existed ("show them", off): dropped when the file is saved.
+/// The previous positive-sense switch: invert an explicit choice, then drop it on save.
 const OLD_AURAS: &str = "cosmeticsAuras";
 /// Show my cosmetics: `true` (the default) or `false`.
 pub const MINE: &str = "cosmeticsMine";
@@ -102,14 +102,25 @@ impl Prefs {
     /// The switches in an extras file's `text`; a missing or unknown line keeps its default.
     pub fn parse(text: &str) -> Self {
         let mut prefs = Self::default();
+        let mut legacy_auras = None;
+        let mut hide_fx = None;
+        let flag = |value: &str| match value.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
         for (key, value) in text.lines().filter_map(|l| l.split_once(':')) {
             match key.trim() {
                 OTHERS => prefs.others = Others::parse(value).or(prefs.others),
-                HIDE_FX => prefs.hide_fx = value.trim() == "true",
+                HIDE_FX => hide_fx = flag(value).or(hide_fx),
+                OLD_AURAS => legacy_auras = flag(value).or(legacy_auras),
                 MINE => prefs.mine = value.trim() != "false",
                 _ => {}
             }
         }
+        prefs.hide_fx = hide_fx
+            .or_else(|| legacy_auras.map(|shown| !shown))
+            .unwrap_or(false);
         prefs
     }
 
@@ -306,5 +317,24 @@ mod tests {
         );
         assert_eq!(confirmed(&home, &alex), Some(false));
         let _ = fs::remove_dir_all(&home);
+    }
+}
+#[test]
+fn legacy_effect_choice_is_inverted_and_current_key_wins_in_either_order() {
+    for (text, hidden) in [
+        ("", false),
+        ("cosmeticsAuras:true\n", false),
+        ("cosmeticsAuras:false\n", true),
+        ("cosmeticsAuras:false\ncosmeticsHideFx:false\n", false),
+        ("cosmeticsHideFx:false\ncosmeticsAuras:false\n", false),
+        ("cosmeticsAuras:true\ncosmeticsHideFx:true\n", true),
+        ("cosmeticsHideFx:true\ncosmeticsAuras:true\n", true),
+        ("cosmeticsAuras:false\ncosmeticsHideFx:invalid\n", true),
+    ] {
+        let prefs = Prefs::parse(text);
+        assert_eq!(prefs.hide_fx, hidden, "{text}");
+        let saved = prefs.write_into(text);
+        assert!(!saved.contains("cosmeticsAuras:"));
+        assert_eq!(Prefs::parse(&saved), prefs);
     }
 }

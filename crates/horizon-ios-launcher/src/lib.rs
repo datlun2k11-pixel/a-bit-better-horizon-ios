@@ -84,43 +84,201 @@ pub fn take() -> Vec<Request> {
         .collect()
 }
 
-/// Whether the game may start loading: not until the player starts it from the launcher (Play, a world, a
-/// server), so opening the app costs nothing but the launcher. Open from the first where no launcher is bundled.
-static STARTED: (Mutex<Option<bool>>, std::sync::Condvar) =
-    (Mutex::new(None), std::sync::Condvar::new());
+/// The result of canceling one owned launcher start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelDecision {
+    /// The matching start must finish draining before its cancel is acknowledged.
+    Accepted,
+    /// Another start owns the engine, or this attempt has already been cleared.
+    Stale,
+    /// This start has already uncovered the game and cannot be canceled by an old task.
+    Committed,
+}
 
-/// Wait for the player to start the game from the launcher; at once in a build or bundle without one. The
-/// resource loader's thread waits here, so the window and the launcher come up while nothing loads. True when
-/// it waited, so the options may have changed meanwhile (the launcher's Settings and Packs).
+/// Logical ownership is kept beside the loader's start gate, so a delayed
+/// cancellation cannot reset a newer attempt or let a new attempt bypass drain.
+struct StartState {
+    started: Option<bool>,
+    owner: Option<String>,
+    canceling: Option<String>,
+    committed: bool,
+}
+
+impl StartState {
+    const fn new() -> Self {
+        Self {
+            started: None,
+            owner: None,
+            canceling: None,
+            committed: false,
+        }
+    }
+
+    fn start_owned(&mut self, owner: Option<&str>) -> bool {
+        if self.canceling.is_some() {
+            return false;
+        }
+        if self.started != Some(true) {
+            self.committed = false;
+        }
+        if let Some(owner) = owner {
+            self.owner = Some(owner.to_owned());
+        }
+        // A legacy fallback must not erase an owned start's identity. Likewise,
+        // starting an already visible engine does not make it cancelable again.
+        self.started = Some(true);
+        true
+    }
+
+    fn request_cancel(&mut self, owner: &str) -> CancelDecision {
+        if self.owner.as_deref() != Some(owner) {
+            return CancelDecision::Stale;
+        }
+        if self.committed {
+            return CancelDecision::Committed;
+        }
+        self.canceling = self.owner.clone();
+        // Keep the old loader's gate open until it has actually drained. Closing
+        // it now could leave an awakened worker asleep again during shutdown.
+        CancelDecision::Accepted
+    }
+
+    fn commit_start(&mut self) -> bool {
+        if self.started != Some(true) || self.canceling.is_some() {
+            return false;
+        }
+        self.committed = true;
+        true
+    }
+
+    fn commit_start_owned(&mut self, owner: &str) -> bool {
+        self.owner.as_deref() == Some(owner) && self.commit_start()
+    }
+
+    fn complete_cancel(&mut self, owner: &str, default_open: bool) -> bool {
+        if self.owner.as_deref() != Some(owner) || self.canceling.as_deref() != Some(owner) {
+            return false;
+        }
+        self.reset(default_open);
+        true
+    }
+
+    fn reset(&mut self, default_open: bool) {
+        *self = Self {
+            started: Some(default_open),
+            ..Self::new()
+        };
+    }
+}
+
+/// Whether the game may start loading: not until the player starts it from the launcher.
+static STARTED: (Mutex<StartState>, std::sync::Condvar) =
+    (Mutex::new(StartState::new()), std::sync::Condvar::new());
+
+/// Wait for the player to start the game from the launcher; at once in a build or bundle without one.
+/// True when it waited, so options changed meanwhile must be read again.
 pub fn wait_for_start() -> bool {
     let (started, signal) = &STARTED;
-    let mut started = started.lock().unwrap_or_else(PoisonError::into_inner);
-    let open = *started.get_or_insert_with(|| !bundled());
+    let mut state = started.lock().unwrap_or_else(PoisonError::into_inner);
+    let open = *state.started.get_or_insert_with(|| !bundled());
     if open {
         return false;
     }
-    while *started != Some(true) {
-        started = signal.wait(started).unwrap_or_else(PoisonError::into_inner);
+    while state.started != Some(true) {
+        state = signal.wait(state).unwrap_or_else(PoisonError::into_inner);
     }
     true
 }
 
-/// Let the game start loading (the launcher's `launcher-start`, or a launcher that could not be shown).
+/// Let the game load without an owned launcher attempt (legacy/fallback callers).
 pub fn start() {
-    let (started, signal) = &STARTED;
-    *started.lock().unwrap_or_else(PoisonError::into_inner) = Some(true);
-    signal.notify_all();
+    let _ = start_owned(None);
 }
 
-/// Return to the launcher-only state after the engine has shut down.
+/// Begin or acknowledge an owned attempt. Reject every start while a previous
+/// cancellation is still draining. IDs are opaque strings supplied by the launcher.
+pub fn start_owned(owner: Option<&str>) -> bool {
+    let (started, signal) = &STARTED;
+    let accepted = started
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .start_owned(owner);
+    if accepted {
+        signal.notify_all();
+    }
+    accepted
+}
+
+/// Request cancellation only of the current, still-covered start.
+pub fn request_cancel(owner: &str) -> CancelDecision {
+    STARTED
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .request_cancel(owner)
+}
+
+pub fn cancellation_requested() -> bool {
+    STARTED
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .canceling
+        .is_some()
+}
+
+/// The attempt whose physical engine/loader teardown must complete before acknowledgment.
+pub fn cancellation_owner() -> Option<String> {
+    STARTED
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .canceling
+        .clone()
+}
+
+/// Commit the current start when the launcher actually uncovers the game.
+pub fn commit_start() -> bool {
+    STARTED
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .commit_start()
+}
+
+/// Commit only the current matching attempt before the launcher uncovers the
+/// game. This is the atomic decision point between canceling and entering play.
+pub fn commit_start_owned(owner: &str) -> bool {
+    STARTED
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .commit_start_owned(owner)
+}
+
+/// Complete only the matching cancellation, after its workers have drained.
+/// A stale completion cannot reset a newer start.
+pub fn complete_cancel(owner: &str) -> bool {
+    STARTED
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .complete_cancel(owner, !bundled())
+}
+
+/// Return to launcher-only state after the engine has shut down normally.
 pub fn reset() {
-    *STARTED.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(!bundled());
+    STARTED
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .reset(!bundled());
 }
 
 /// Whether the game is still waiting to be started.
 pub fn waiting() -> bool {
-    let started = STARTED.0.lock().unwrap_or_else(PoisonError::into_inner);
-    started.is_none_or(|open| !open) && bundled()
+    let state = STARTED.0.lock().unwrap_or_else(PoisonError::into_inner);
+    state.started.is_none_or(|open| !open) && bundled()
 }
 
 /// Whether this bundle carries the launcher, which holds the game until it is started.
@@ -166,14 +324,68 @@ pub fn present_download() -> bool {
     false
 }
 
-/// Show `path` in the system's file browser: the Files app on a phone. False on a desktop, or when the
-/// bundle has no launcher framework, and the caller opens it with the desktop's file manager instead.
-pub fn open_folder(path: &std::path::Path) -> bool {
+/// Snapshot ABI shared with TouchControls.swift: thirteen normalized button centres,
+/// NaN for built-in placement. Flags: hide paint=1, cursor=2, joystick=4,
+/// disable mouse gestures=8, disable hotbar gestures=16.
+/// An older/missing launcher keeps the original layout and visibility.
+pub fn touch_preferences() -> ([f32; 100], u32) {
+    let positions = [f32::NAN; 100];
     #[cfg(target_os = "ios")]
-    return ios::call_with_path(ios::OPEN_FOLDER, path);
+    let (positions, hidden) = {
+        let mut positions = positions;
+        let hidden = ios::touch_preferences(&mut positions);
+        (positions, hidden)
+    };
+    #[cfg(not(target_os = "ios"))]
+    let hidden = 0;
+    (positions, hidden)
+}
+
+/// A UIKit-recognized gesture, delivered on the same main thread as the frame.
+/// Kinds: cancel=0, tap=1, long press=2, double hotbar tap=3, scroll=4,
+/// two-finger keyboard hold=5. Phases use UIKit's stable recognizer states.
+#[derive(Clone, Copy, Debug)]
+pub struct TouchGesture {
+    pub kind: u8,
+    pub phase: u8,
+    pub point: (f64, f64),
+    pub slot: i8,
+    pub age: f64,
+    pub context: u64,
+    pub modifiers: u32,
+    pub touch: u64,
+}
+
+pub fn touch_gestures(screen: u64, flags: u32, size: (f64, f64), scale: f64) -> Vec<TouchGesture> {
+    #[cfg(target_os = "ios")]
+    return ios::touch_gestures(screen, flags, size, scale);
     #[cfg(not(target_os = "ios"))]
     {
-        let _ = path;
+        let _ = (screen, flags, size, scale);
+        Vec::new()
+    }
+}
+
+/// Opaque ids remain unique across restarted games and secondary scenes.
+pub fn next_touch_context() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_touch_context(context: u64) {
+    #[cfg(target_os = "ios")]
+    ios::set_touch_context(context);
+    #[cfg(not(target_os = "ios"))]
+    let _ = context;
+}
+/// Whether this bundle contains the native recognizer bridge. Older launcher
+/// frameworks keep the engine's existing direct-touch fallback.
+pub fn native_gestures_available() -> bool {
+    #[cfg(target_os = "ios")]
+    {
+        ios::gesture_poll().is_some()
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
         false
     }
 }
@@ -186,8 +398,6 @@ mod ios {
     const SYMBOL: &CStr = c"horizon_launcher_present";
     /// `horizon_download_present` in packaging/ios/Launcher/DownloadView.swift.
     pub const DOWNLOAD: &CStr = c"horizon_download_present";
-    /// `horizon_open_folder` in packaging/ios/Launcher/Mods.swift.
-    pub const OPEN_FOLDER: &CStr = c"horizon_open_folder";
 
     /// How the launcher hears back: its context, and the answer as NUL-terminated UTF-8 JSON that lives
     /// only for the call.
@@ -224,60 +434,148 @@ mod ios {
             .then(|| CString::new(framework.into_os_string().into_encoded_bytes()).ok())?
     }
 
+    pub fn touch_preferences(positions: &mut [f32; 100]) -> u32 {
+        // Resolve once, retaining the framework handle for the process lifetime.
+        // No disk reads or dlopen calls in subsequent input/render frames.
+        type Snapshot = extern "C" fn(*mut f32, u32) -> u32;
+        static SNAPSHOT: std::sync::OnceLock<Option<Snapshot>> = std::sync::OnceLock::new();
+        let snapshot = SNAPSHOT.get_or_init(|| {
+            let path = framework()?;
+            // SAFETY: this bundled Swift C export accepts up to 26 writable
+            // floats and a capacity (older readers request 20), keeps no pointer and uses a locked snapshot.
+            unsafe {
+                let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW);
+                if handle.is_null() {
+                    return None;
+                }
+                let mut symbol = libc::dlsym(handle, c"horizon_touch_snapshot_v2".as_ptr());
+                if symbol.is_null() {
+                    symbol = libc::dlsym(handle, c"horizon_touch_preferences_v1".as_ptr());
+                }
+                if symbol.is_null() {
+                    return None;
+                }
+                Some(std::mem::transmute::<*mut c_void, Snapshot>(symbol))
+            }
+        });
+        snapshot.map_or(0, |call| call(positions.as_mut_ptr(), 100))
+    }
+
+    type Poll = extern "C" fn(u64, u32, f64, f64, f64, *mut f64, u32) -> u32;
+    pub fn gesture_poll() -> Option<&'static Poll> {
+        static POLL: std::sync::OnceLock<Option<Poll>> = std::sync::OnceLock::new();
+        POLL.get_or_init(|| {
+            let path = framework()?;
+            // SAFETY: a bundled C export; all pointers live for this call only.
+            // The framework handle is retained for the entire process.
+            unsafe {
+                let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW);
+                if handle.is_null() {
+                    return None;
+                }
+                let symbol = libc::dlsym(handle, c"horizon_touch_gestures_v2".as_ptr());
+                if symbol.is_null() {
+                    return None;
+                }
+                Some(std::mem::transmute::<*mut c_void, Poll>(symbol))
+            }
+        })
+        .as_ref()
+    }
+    pub fn set_touch_context(context: u64) {
+        type Set = extern "C" fn(u64);
+        static SET: std::sync::OnceLock<Option<Set>> = std::sync::OnceLock::new();
+        let set = SET.get_or_init(|| {
+            let path = framework()?;
+            // SAFETY: a bundled C export taking only an opaque integer id.
+            unsafe {
+                let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW);
+                if handle.is_null() {
+                    return None;
+                }
+                let symbol = libc::dlsym(handle, c"horizon_touch_set_context_v1".as_ptr());
+                if symbol.is_null() {
+                    return None;
+                }
+                Some(std::mem::transmute::<*mut c_void, Set>(symbol))
+            }
+        });
+        if let Some(set) = set {
+            set(context);
+        }
+    }
+    pub fn touch_gestures(
+        screen: u64,
+        flags: u32,
+        size: (f64, f64),
+        scale: f64,
+    ) -> Vec<super::TouchGesture> {
+        let Some(poll) = gesture_poll() else {
+            return Vec::new();
+        };
+        let mut buffer = [0.0; 11 * 64];
+        let count = poll(
+            screen,
+            flags,
+            size.0,
+            size.1,
+            scale,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+        .min(64);
+        buffer
+            .chunks_exact(11)
+            .take(count as usize)
+            .filter_map(|v| {
+                if !v.iter().all(|x| x.is_finite())
+                    || !(0.0..=6.0).contains(&v[0])
+                    || !(0.0..=5.0).contains(&v[1])
+                    || !(-1.0..=8.0).contains(&v[4])
+                    || v[5] < 0.0
+                {
+                    return None;
+                }
+                Some(super::TouchGesture {
+                    kind: v[0] as u8,
+                    phase: v[1] as u8,
+                    point: (v[2], v[3]),
+                    slot: v[4] as i8,
+                    age: v[5],
+                    context: ((v[7] as u64) << 32) | (v[6] as u64),
+                    modifiers: v[8] as u32,
+                    touch: ((v[10] as u64) << 32) | (v[9] as u64),
+                })
+            })
+            .collect()
+    }
+
     pub fn present() -> bool {
         call(SYMBOL)
     }
 
     /// Call `symbol` in the launcher framework with the bridge; false when there is no framework or symbol.
     pub fn call(symbol_name: &CStr) -> bool {
-        let Some(symbol) = symbol(symbol_name) else {
-            return false;
-        };
-        // SAFETY: the launcher's `@_cdecl` function takes the bridge's C function pointer and returns a
-        // Bool; it is called on the main thread (the game's window event), where UIKit has to be touched.
-        unsafe {
-            let present: extern "C" fn(Submit) -> bool = std::mem::transmute(symbol);
-            present(submit)
-        }
-    }
-
-    /// Call `symbol` in the launcher framework with a NUL-terminated path; false when there is no
-    /// framework, no symbol, or the path has a NUL in it.
-    pub fn call_with_path(symbol_name: &CStr, path: &std::path::Path) -> bool {
-        let Ok(path) = CString::new(path.as_os_str().as_encoded_bytes()) else {
-            return false;
-        };
-        let Some(symbol) = symbol(symbol_name) else {
-            return false;
-        };
-        // SAFETY: the launcher's `@_cdecl` function takes a NUL-terminated UTF-8 path and returns a Bool,
-        // on the main thread, where UIKit has to be touched; the path outlives the call.
-        unsafe {
-            let open: extern "C" fn(*const c_char) -> bool = std::mem::transmute(symbol);
-            open(path.as_ptr())
-        }
-    }
-
-    /// Load the launcher framework and find `symbol_name` in it.
-    fn symbol(symbol_name: &CStr) -> Option<*mut c_void> {
         let Some(path) = framework() else {
             log::info!("Horizon: no launcher framework in this bundle");
-            return None;
+            return false;
         };
-        // SAFETY: dlopen and dlsym on a framework Xcode built and signed into this bundle; the handle
-        // stays loaded for the process, as the launcher does.
+        // SAFETY: dlopen and dlsym on a framework Xcode built and signed into this bundle; the symbol is a
+        // `@_cdecl` Swift function taking the bridge's C function pointer and returning a Bool, called on
+        // the main thread (the game's window event), which is where UIKit has to be touched.
         unsafe {
             let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW);
             if handle.is_null() {
                 log::warn!("Horizon: the launcher framework did not load");
-                return None;
+                return false;
             }
             let symbol = libc::dlsym(handle, symbol_name.as_ptr());
             if symbol.is_null() {
                 log::warn!("Horizon: the launcher framework has no {symbol_name:?}");
-                return None;
+                return false;
             }
-            Some(symbol)
+            let present: extern "C" fn(Submit) -> bool = std::mem::transmute(symbol);
+            present(submit)
         }
     }
 }
@@ -291,6 +589,123 @@ mod tests {
     fn a_desktop_never_waits_to_be_started() {
         assert!(!waiting());
         assert!(!wait_for_start());
+    }
+
+    #[test]
+    fn owned_cancel_is_idempotent_and_blocks_new_starts_until_matching_completion() {
+        let mut state = StartState::new();
+        assert!(state.start_owned(Some("attempt A")));
+        assert!(state.start_owned(Some("attempt A")));
+        assert_eq!(state.request_cancel("attempt A"), CancelDecision::Accepted);
+        assert_eq!(state.request_cancel("attempt A"), CancelDecision::Accepted);
+        assert_eq!(state.canceling.as_deref(), Some("attempt A"));
+        // Do not close the old worker's gate while shutdown is still draining.
+        assert_eq!(state.started, Some(true));
+        assert!(!state.start_owned(Some("attempt B")));
+        assert!(!state.start_owned(None));
+        assert!(!state.commit_start());
+        assert!(!state.complete_cancel("attempt B", false));
+        assert_eq!(state.canceling.as_deref(), Some("attempt A"));
+        assert!(state.complete_cancel("attempt A", false));
+        assert_eq!(state.started, Some(false));
+        assert!(state.owner.is_none() && state.canceling.is_none());
+        assert!(!state.complete_cancel("attempt A", false));
+        assert!(state.start_owned(Some("attempt B")));
+        assert_eq!(state.request_cancel("attempt A"), CancelDecision::Stale);
+        assert!(!state.complete_cancel("attempt A", false));
+        assert_eq!(state.owner.as_deref(), Some("attempt B"));
+        assert_eq!(state.started, Some(true));
+    }
+
+    #[test]
+    fn replacing_an_uncommitted_start_does_not_let_its_old_task_cancel_the_new_one() {
+        let mut state = StartState::new();
+        assert!(state.start_owned(Some("old")));
+        assert!(state.start_owned(Some("new")));
+        assert_eq!(state.request_cancel("old"), CancelDecision::Stale);
+        assert!(!state.complete_cancel("old", false));
+        assert!(state.canceling.is_none());
+        assert_eq!(state.request_cancel("new"), CancelDecision::Accepted);
+        assert!(state.complete_cancel("new", false));
+    }
+
+    #[test]
+    fn owned_commit_requires_the_current_attempt_and_loses_to_an_accepted_cancel() {
+        let mut state = StartState::new();
+        assert!(!state.commit_start_owned("A"));
+        assert!(state.start_owned(Some("A")));
+        assert!(!state.commit_start_owned("wrong"));
+        assert!(!state.committed);
+        assert!(state.commit_start_owned("A"));
+        assert!(state.commit_start_owned("A"));
+        assert_eq!(state.request_cancel("A"), CancelDecision::Committed);
+        assert!(state.start_owned(Some("B")));
+        assert!(!state.commit_start_owned("A"));
+        assert!(state.commit_start_owned("B"));
+        assert_eq!(state.request_cancel("A"), CancelDecision::Stale);
+        assert_eq!(state.request_cancel("B"), CancelDecision::Committed);
+
+        state.reset(false);
+        assert!(state.start_owned(Some("A")));
+        assert_eq!(state.request_cancel("A"), CancelDecision::Accepted);
+        assert!(!state.commit_start_owned("A"));
+        assert!(!state.committed);
+        assert_eq!(state.canceling.as_deref(), Some("A"));
+        assert!(state.complete_cancel("A", false));
+        assert!(state.start_owned(Some("B")));
+        assert!(!state.commit_start_owned("A"));
+        assert!(state.commit_start_owned("B"));
+    }
+
+    #[test]
+    fn a_visible_engine_stays_committed_until_normal_reset() {
+        let mut state = StartState::new();
+        assert!(!state.commit_start());
+        assert!(state.start_owned(Some("first")));
+        assert!(state.commit_start());
+        assert!(state.start_owned(Some("first")));
+        assert_eq!(state.request_cancel("first"), CancelDecision::Committed);
+        // A new task asking to use an already visible engine cannot make that
+        // engine cancelable again, nor can the first task stop its replacement.
+        assert!(state.start_owned(Some("second")));
+        assert_eq!(state.request_cancel("first"), CancelDecision::Stale);
+        assert_eq!(state.request_cancel("second"), CancelDecision::Committed);
+        assert!(!state.complete_cancel("second", false));
+        state.reset(false);
+        assert!(state.owner.is_none() && state.canceling.is_none());
+        assert!(!state.committed);
+        assert!(state.start_owned(Some("third")));
+        assert_eq!(state.request_cancel("second"), CancelDecision::Stale);
+        assert_eq!(state.request_cancel("third"), CancelDecision::Accepted);
+    }
+
+    #[test]
+    fn legacy_start_preserves_owned_identity_and_reset_keeps_the_platform_default() {
+        let mut state = StartState::new();
+        assert!(state.start_owned(None));
+        assert_eq!(state.request_cancel("unknown"), CancelDecision::Stale);
+        assert!(state.start_owned(Some("owned")));
+        assert!(state.start_owned(None));
+        assert_eq!(state.owner.as_deref(), Some("owned"));
+        assert_eq!(state.request_cancel("owned"), CancelDecision::Accepted);
+        assert!(state.complete_cancel("owned", true));
+        assert_eq!(state.started, Some(true));
+        assert!(state.owner.is_none() && state.canceling.is_none());
+        assert!(!state.committed);
+    }
+
+    #[test]
+    fn normal_reset_clears_pending_ownership_after_engine_shutdown() {
+        let mut state = StartState::new();
+        assert!(state.start_owned(Some("old")));
+        assert_eq!(state.request_cancel("old"), CancelDecision::Accepted);
+        state.reset(false);
+        assert_eq!(state.started, Some(false));
+        assert_eq!(state.request_cancel("old"), CancelDecision::Stale);
+        assert!(!state.complete_cancel("old", false));
+        assert!(state.start_owned(Some("new")));
+        assert!(state.commit_start());
+        assert_eq!(state.request_cancel("old"), CancelDecision::Stale);
     }
 
     #[test]

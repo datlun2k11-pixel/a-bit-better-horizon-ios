@@ -18,6 +18,11 @@ fn pack() -> Post {
         .unwrap();
         zip.write_all(source.as_bytes()).unwrap();
     };
+    // This fixture only supplies terrain casters.
+    add(
+        "shaders.properties",
+        "shadowEntities=false\nshadowBlockEntities=false\n",
+    );
     // The terrain's positions are already in clip space.
     add(
         "shadow.vsh",
@@ -46,6 +51,9 @@ fn pack() -> Post {
         terrain: Some(horizon_shaders::GbuffersInputs {
             item_id_declared: false,
             far_depth: false,
+            paged_maps: false,
+            water_mask: false,
+            water_patches: false,
             declarations: "layout(location=0)in vec3 fixture_position;\n".into(),
             body: "hz_Vertex=vec4(fixture_position,1.0);hz_Color=vec4(1.0);\
                    hz_MultiTexCoord0=vec4(0.0);hz_MultiTexCoord1=vec4(240.0);\
@@ -53,6 +61,7 @@ fn pack() -> Post {
                 .into(),
             attributes: vec![],
             after: String::new(),
+            terrain_lighting: None,
             alpha_test: None,
         }),
         ..Default::default()
@@ -107,8 +116,12 @@ fn shadow_pass_draws_terrain_back_faces() {
             usage: wgpu::BufferUsages::VERTEX,
         });
     let size = [8, 8];
+    let terrain_group = unused_terrain_group(&post, &gpu.device);
     let pixels = gpu.render_with_terrain(&mut post, size, &mut |rp, list, _, _| {
         if list == TerrainList::ShadowSolid {
+            if let Some(group) = &terrain_group {
+                rp.set_bind_group(3, group, &[]);
+            }
             rp.set_vertex_buffer(0, vertices.slice(..));
             rp.draw(0..12, 0..1);
         }

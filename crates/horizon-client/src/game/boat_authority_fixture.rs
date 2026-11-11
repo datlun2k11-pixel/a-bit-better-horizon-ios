@@ -65,7 +65,7 @@ impl Game<'_> {
             self.boats.push(boat);
             if let Some(attack) = case.attack {
                 let mut player =
-                    horizon_client::motion::PlayerMotion::new(self.motion, Vec3::ZERO)?;
+                    horizon_client::motion::PlayerMotion::new(&self.motion, Vec3::ZERO)?;
                 player.velocity = Vec3::new(
                     attack.player_velocity[0],
                     attack.player_velocity[1],
@@ -113,7 +113,10 @@ impl Game<'_> {
                         let boat = self.tick_boat(self.boats[0].clone(), true);
                         self.boats[0] = boat;
                     }
-                    self.tick_remote_boat_bubbles();
+                    // The fixture has no remote session/ordered passenger map;
+                    // use its explicit native ownership input, as the ordinary
+                    // ownership cases below do, to avoid a second paddle tick.
+                    self.tick_remote_boat_bubbles_for(step.owned.then_some(1));
                     let boat = &self.boats[0];
                     let rowing = [0.0, 0.25, 0.5, 1.0].map(|a| {
                         [0, 1].map(|side| format!("{:08x}", boat.rowing_time(side, a).to_bits()))
@@ -133,7 +136,7 @@ impl Game<'_> {
                     let boat = self.tick_boat(boat, true);
                     self.boats.push(boat);
                 }
-                self.tick_remote_boat_bubbles();
+                self.tick_remote_boat_bubbles_for(owned.then_some(1));
                 let boat = &self.boats[0];
                 steps.push(json!({
                     "owned": owned,

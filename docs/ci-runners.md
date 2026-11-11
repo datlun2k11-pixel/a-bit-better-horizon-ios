@@ -1,5 +1,7 @@
 # CI runners
 
+> This is a shared infrastructure reference; this mobile fork’s active iOS build is [.github/workflows/ios.yml](../.github/workflows/ios.yml). Commands below target the mobile repository, but the described upstream self-hosted machines are not provided by the fork.
+
 GitHub gives the organisation 20 hosted jobs at a time, shared by every pull request, every push to main and the
 bots. On 2026-11-03 that pool had 283–351 jobs waiting (median wait 43–55 minutes) for jobs that work 1–18
 minutes, and the bots' two small runners had 327–371 waiting. Since then (the maintainer's decision: "use everything
@@ -15,6 +17,9 @@ we have to the max") every job that can runs on our own machines, and GitHub's p
 
 The desktop's runners are declared in the maintainer's NixOS configuration (his private fleet repository,
 `nixos/ludodesktop/horizon-runner.nix`), not installed from here; playhorizon's by `tools/ci/checks-runners.sh`.
+Every persistent checkout (the desktop's `/var/lib/gha/<runner>/horizon`, playhorizon's, the Mac mini's) is kept small by
+[`tools/ci/git-slim.sh`](../tools/ci/git-slim.sh) before a job or while the runner is idle; the desktop runs its own copy
+from a `ACTIONS_RUNNER_HOOK_JOB_STARTED` hook in the NixOS configuration.
 
 ## What stays on GitHub, and why
 
@@ -46,8 +51,8 @@ for):
 | `off` | GitHub's | GitHub's: everything back, in one switch |
 
 ```sh
-gh variable set SELF_HOSTED_CI --body light --repo horizon-rust/horizon   # or all, off
-gh variable delete SELF_HOSTED_CI --repo horizon-rust/horizon             # the default
+gh variable set SELF_HOSTED_CI --body light --repo heyskylo/horizon-ios   # or all, off
+gh variable delete SELF_HOSTED_CI --repo heyskylo/horizon-ios             # the default
 ```
 
 Set `light` when the desktop is paused (the maintainer uses it), `off` when playhorizon is down or moves: the bots
@@ -72,14 +77,7 @@ A fork's pull request is code nobody here wrote. It may run on the checks runner
 
 ## On playhorizon
 
-Installed by `tools/ci/checks-runners.sh` (run it there; it reads the registration token on stdin, so the token never
-touches the disk or the screen):
-
-```sh
-gh api -X POST repos/horizon-rust/horizon/actions/runners/registration-token --jq .token |
-  ssh ludovic@playhorizon 'bash ~/horizon-install/checks-runners.sh install'
-ssh ludovic@playhorizon 'bash ~/horizon-install/checks-runners.sh status'
-```
+The details below describe upstream’s existing machines. For this fork, register any self-hosted runner through **heyskylo/horizon-ios → Settings → Actions → Runners**, using a machine controlled by the fork’s maintainers. Do not send the fork’s runner-registration token to upstream infrastructure.
 
 - Each runner is a systemd user service (`horizon-runner-ci-<n>`, `horizon-runner-light-<n>`) in
   `~/.actions-runners/horizon-{ci,light}-<n>`, with its own work folder and `HOME`. `LIGHT_RUNNERS` (default 12) and
@@ -88,9 +86,11 @@ ssh ludovic@playhorizon 'bash ~/horizon-install/checks-runners.sh status'
   the machine, `linux-runner.sh`). The checks runners have their own `horizon-ci-checks.slice` (memory ≤ 16 GB).
   CPUs 0–3 stay for `tools/remote.sh` runs, benchmarks and the servers.
 - `job-started.sh`, before every job: refuses a fork's pull request; empties a cargo build folder over 40 GB
-  (`MAX_TARGET_GB`); drops a checkout's `.git` over 2 GB (`MAX_GIT_GB`), which the checkout then clones again; removes the
-  runner's diagnostic logs older than a day. Every
-  job's fetch adds a pack and nothing repacks them: on 2026-11-03 each light runner's checkout held 6822 packs, 50 GB.
+  (`MAX_TARGET_GB`); collects a checkout's `.git` over 1.5 GB with `git-slim.sh` (`git gc --prune=now`, installed beside
+  the hook; it also folds many packs and removes the `tmp_pack_*` of cut-short fetches) and drops one still over 4 GB
+  (`MAX_GIT_GB`), which the checkout then clones again; removes the runner's diagnostic logs older than a day.
+  actions/checkout turns gc off in a persistent checkout and every job's fetch adds a pack: on 2026-11-03 each light
+  runner's checkout held 6822 packs, 50 GB; on 2026-11-09 the desktop's checks runners held 1051 packs (111 GB in one).
 - The checks runners share one cargo home (`~/.actions-runners/ci-shared/cargo`: registry and git sources). Each has
   its own rustup home and its own build folder (`CARGO_TARGET_DIR`, outside the checkout). `CARGO_BUILD_JOBS=4`.
 - Python is the host's 3.13 (`ci-shared/bin/python3`); the apt packages the jobs need are installed by the script, so
@@ -110,3 +110,12 @@ ssh desktop 'sudo -n rm -f /var/lib/gha-control/pause && sudo -n systemctl start
 ```
 
 With the desktop paused, set `SELF_HOSTED_CI=light`, or `checks` waits for it.
+
+## When our runners are offline
+
+`.github/workflows/runner-watch.yml` runs every 30 minutes on GitHub's runners (never ours) and calls
+`tools/ci/runner_watch.py`. When a job has waited over 2 hours for a self-hosted runner, in a pool where no job is
+running at all (offline, not just busy), it opens one issue, "CI: self-hosted runners are not taking jobs", listing
+each pool, what stops and what to do, and keeps its text current; it closes the issue once nothing waits. It needs
+only the workflow token (`actions: read`, `issues: write`). What the Team and the council do meanwhile:
+[operations.md](operations.md#self-hosted-runners-are-offline).

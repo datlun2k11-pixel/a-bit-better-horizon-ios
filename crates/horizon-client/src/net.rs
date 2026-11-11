@@ -7,10 +7,8 @@
 //! (crate::auth): the login joins the server through the session service and
 //! encrypts the connection (ClientHandshakePacketListenerImpl.handleHello).
 use crate::auth::AuthSession;
-use crate::studio::{Metadata, RecorderStatus, StudioRecorder};
 use horizon_protocol::{
     PROTOCOL_VERSION,
-    buf::Reader,
     connection::{ConnReader, ConnWriter, Connection, Counters, ShutdownHandle},
     crypto::{generate_secret, offline_uuid, server_hash},
     packets::{Empty, configuration as cfg, handshake, login, play},
@@ -32,11 +30,48 @@ use std::{
     time::Duration,
 };
 
+use horizon_hooks::tunnel;
+
 /// `CommonListenerCookie.serverCookies`: cookies the server asked the client
 /// to store (`ClientboundStoreCookiePacket`), answered to
 /// `ClientboundCookieRequestPacket`. A `transfer` carries them to the next
 /// connection (`TransferState`), so a proxy's backend switch keeps them.
 pub type Cookies = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+/// A recording of the session's packets: the tap a replay recorder plugs into. Replay recording is a
+/// platform feature (docs/layers.md, "Controllers, splitscreen, replays and UI pages"); the engine only
+/// hands it the packets: the network thread what it receives, the game thread what the client makes for
+/// the recording itself (its own movement, pose and swings).
+pub trait PacketRecorder: Send {
+    /// Whether it still takes packets (false once stopped or failed).
+    fn is_active(&self) -> bool;
+    /// A play packet the network thread received, decoded, with its id and payload as they came.
+    /// The recorder decides what it keeps.
+    fn received(&self, packet: &play::Clientbound, id: i32, payload: &[u8]);
+    /// A packet the client made for the recording, encoded, stamped now.
+    fn record_packet(&self, id: i32, payload: &[u8]);
+    fn status(&self) -> RecorderStatus;
+    fn request_stop(&self);
+    fn poll_finish(&self) -> Option<std::io::Result<PathBuf>>;
+    fn work_handle(&self) -> Option<crate::studio::recorder::WorkHandle>;
+    /// Finishes the recording; the file it wrote.
+    fn stop(self: Box<Self>) -> std::io::Result<PathBuf>;
+}
+
+/// Where a recording stands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecorderStatus {
+    pub active: bool,
+    pub finishing: bool,
+    pub path: PathBuf,
+    pub elapsed: Duration,
+    pub packet_count: u64,
+    pub bytes_written: u64,
+    pub error: Option<String>,
+}
+
+/// The session's recorder, shared with its network thread.
+type RecorderSlot = Arc<Mutex<Option<Box<dyn PacketRecorder>>>>;
 
 /// What the network thread reports to the game.
 pub enum Event {
@@ -142,10 +177,39 @@ pub struct Session {
     debug: bool,
     /// The far terrain requests waiting for the server (`lod_net`).
     far: Arc<crate::lod_net::Inbox>,
-    /// Active packet recorder for Studio replay recordings.
-    pub recorder: Arc<Mutex<Option<StudioRecorder>>>,
+    /// The recording running, if any.
+    recorder: RecorderSlot,
+    /// This connection's number, new for each one ([`Session::serial`]).
+    serial: u64,
+}
+/// The next [`Session::serial`].
+static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_serial() -> u64 {
+    NEXT_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
 impl Session {
+    /// A number of its own for each connection, never 0: entity ids are per connection, so what
+    /// is kept by id goes when it changes (`horizon_hooks::players::PlayerModels::connection`).
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+    /// The negotiated wire release, once the connection has been established.
+    pub fn server_version(&self) -> horizon_protocol::adapter::ServerVersion {
+        self.writer.lock().unwrap().as_ref().map_or(
+            horizon_protocol::adapter::ServerVersion::Current,
+            ConnWriter::server_version,
+        )
+    }
+
+    /// Secure-chat enforcement synchronized later than login on older servers.
+    pub fn legacy_secure_chat_enforcement(&self) -> Option<bool> {
+        self.writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(ConnWriter::legacy_secure_chat_enforcement)
+    }
+
     /// Start connecting in the background, as `auth`'s account when there is one.
     pub fn connect(
         address: &str,
@@ -195,10 +259,14 @@ impl Session {
             false,
         )
     }
-    /// Join an integrated server through memory (`Connection.connectToLocalServer`).
+    /// Join an integrated server through memory (`Connection.connectToLocalServer`). The
+    /// hello still names the signed-in account (`Minecraft.handleClientLogin`'s
+    /// `ServerboundHelloPacket(getUser().getName(), getUser().getProfileId())`), so the
+    /// world's `players/data/<uuid>.dat` and `singleplayer_uuid` are the account's.
     pub fn connect_local(
         pipe: horizon_protocol::connection::Pipe,
         name: &str,
+        auth: Option<Arc<AuthSession>>,
         info: cfg::ClientInformation,
         lang: Arc<Language>,
         resources: PathBuf,
@@ -206,7 +274,7 @@ impl Session {
         Self::start(
             "local",
             name,
-            None,
+            auth,
             info,
             lang,
             Some(pipe),
@@ -214,6 +282,25 @@ impl Session {
             resources,
             false,
         )
+    }
+    /// A lightweight session for studio replay playback without background network IO.
+    pub fn replay(name: &str) -> Self {
+        let (_send, events) = channel();
+        Self {
+            events,
+            writer: Arc::new(Mutex::new(None)),
+            configuring: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            cancellation: Arc::new(Cancellation::default()),
+            address: "studio-replay".to_owned(),
+            name: name.to_owned(),
+            counters: Arc::new(Mutex::new(None)),
+            cookies: Default::default(),
+            debug: false,
+            far: Arc::new(crate::lod_net::Inbox::default()),
+            recorder: Arc::new(Mutex::new(None)),
+            serial: next_serial(),
+        }
     }
     fn start(
         address: &str,
@@ -247,6 +334,7 @@ impl Session {
         let thread = std::thread::Builder::new()
             .name("horizon-net".into())
             .spawn(move || {
+                horizon_threads::favour_current();
                 let result = run(
                     local,
                     &address_owned,
@@ -268,6 +356,9 @@ impl Session {
                 );
                 thread_cancellation.cancel();
                 thread_far.cancel();
+                if let Some(recorder) = thread_recorder.lock().unwrap().as_ref() {
+                    recorder.request_stop();
+                }
                 let from_server = result.is_ok();
                 let why = result.unwrap_or_else(|e| e);
                 if let Some(w) = thread_writer.lock().unwrap().take() {
@@ -294,21 +385,52 @@ impl Session {
             debug,
             far,
             recorder,
+            serial: next_serial(),
         }
     }
     /// Everything received since the last poll.
     pub fn poll(&self) -> Vec<Event> {
         self.events.try_iter().collect()
     }
-    /// Start recording network packets to `.mcpr` format at `path`.
-    pub fn start_recording(
+    /// Starts recording into `recorder`. `initialize` runs first, while the network thread
+    /// can't record, so what it writes (a snapshot of the world) comes before any live packet.
+    pub fn start_recording<R: PacketRecorder + 'static>(
         &self,
-        path: impl Into<PathBuf>,
-        metadata: Metadata,
+        recorder: R,
+        initialize: impl FnOnce(&R),
     ) -> std::io::Result<()> {
-        let rec = StudioRecorder::start(path.into(), metadata)?;
-        *self.recorder.lock().unwrap() = Some(rec);
+        let mut slot = self.recorder.lock().unwrap();
+        if slot.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "previous recording has not finished",
+            ));
+        }
+        initialize(&recorder);
+        *slot = Some(Box::new(recorder));
         Ok(())
+    }
+    /// Retain a recorder worker until it has finished after a session ends.
+    pub fn recording_work(&self) -> Option<crate::studio::recorder::WorkHandle> {
+        self.recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|rec| rec.work_handle())
+    }
+    /// Ask the writer to finish without waiting for disk IO on the game thread.
+    pub fn request_recording_stop(&self) -> Option<PathBuf> {
+        let recorder = self.recorder.lock().unwrap();
+        let rec = recorder.as_ref()?;
+        rec.request_stop();
+        Some(rec.status().path)
+    }
+    /// Report a requested stop only after the archive has actually been finalized.
+    pub fn poll_recording_stop(&self) -> Option<std::io::Result<PathBuf>> {
+        let mut recorder = self.recorder.lock().unwrap();
+        let result = recorder.as_ref()?.poll_finish()?;
+        recorder.take();
+        Some(result)
     }
     /// Stop recording and finalize the `.mcpr` archive.
     pub fn stop_recording(&self) -> Option<std::io::Result<PathBuf>> {
@@ -326,6 +448,18 @@ impl Session {
     /// Status of the active recording, if any.
     pub fn recorder_status(&self) -> Option<RecorderStatus> {
         self.recorder.lock().unwrap().as_ref().map(|r| r.status())
+    }
+    /// Record an encoded Clientbound packet into the active recording session at current elapsed time.
+    pub fn record_clientbound(&self, packet: &horizon_protocol::packets::play::Clientbound) {
+        if self.is_recording() {
+            let encoded = packet.encode();
+            let mut reader = horizon_protocol::buf::Reader::new(&encoded);
+            if let Ok(id) = reader.varint()
+                && let Some(rec) = self.recorder.lock().unwrap().as_ref()
+            {
+                rec.record_packet(id, reader.rest());
+            }
+        }
     }
     /// Send a play packet; silently dropped once the connection is gone,
     /// and while the server has the connection back in configuration (a
@@ -437,6 +571,13 @@ impl Session {
         // The close-only handle wakes login/play I/O; if connect is still in
         // flight, attach closes its socket before it can send a handshake.
         self.cancellation.cancel();
+        if let Ok(recorder) = self.recorder.try_lock()
+            && let Some(rec) = recorder.as_ref()
+        {
+            rec.request_stop();
+        }
+        // If the recorder is being used by the network thread, that thread
+        // requests its stop as it exits; never wait for its lock here.
         // Release the idle writer too, but never wait behind an in-flight send.
         if let Ok(mut writer) = self.writer.try_lock() {
             writer.take();
@@ -456,31 +597,52 @@ impl Drop for Session {
 }
 
 /// An address of the form `friend:K7QM-3XPD` joins a friend's world through
-/// its invite code (horizon-friends): the session goes through a tunnel the
-/// client reaches on a loopback port, so everything after is a plain join.
-pub const FRIEND: &str = horizon_friends::ADDRESS_PREFIX;
+/// its invite code (Play with Friends, through a hook's [`tunnel::Resolver`]):
+/// the session goes through a tunnel the client reaches on a loopback port, so
+/// everything after is a plain join.
+pub const FRIEND: &str = tunnel::PREFIX;
+
+/// Whether `code` is an invite code; with `full`, only a full one (a short
+/// relay code could also be a host name). Without a resolver nothing is one.
+pub fn is_invite(code: &str, full: bool) -> bool {
+    horizon_hooks::engine::tunnel().is_some_and(|r| r.is_code(code, full))
+}
+
+/// Whether an invite code can be joined: a resolver is registered (horizon-official registers
+/// horizon-friends'). The title screen's Friends icon, which opens Join a Friend, is inactive
+/// without one, as the pause menu's is without a page to share from.
+pub fn joins_friends() -> bool {
+    #[cfg(test)]
+    if JOINS_FRIENDS_IN_TEST.get() {
+        return true;
+    }
+    horizon_hooks::engine::tunnel().is_some()
+}
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-in for a registered resolver: the registry is the process's and sealed.
+    pub(crate) static JOINS_FRIENDS_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// An address as players and logs see it: a friend's invite code stays
 /// out of it (its secret is in there).
 pub fn shown_address(address: &str) -> String {
     match address.strip_prefix(FRIEND) {
-        Some(code) => match horizon_friends::invite::parse(code) {
-            Some(horizon_friends::invite::Parsed::Short(c)) => {
-                format!("Friend's world ({}-****)", c.nameplate)
-            }
-            _ => "Friend's world".to_owned(),
+        Some(code) => match horizon_hooks::engine::tunnel().and_then(|r| r.nameplate(code)) {
+            Some(nameplate) => format!("Friend's world ({nameplate}-****)"),
+            None => "Friend's world".to_owned(),
         },
         None => address.to_owned(),
     }
 }
 
 /// The relay the player set (`friendsRelay` in horizon.txt, beside
-/// options.txt), else `HORIZON_RELAY_URL`. None by default.
+/// options.txt), else the resolver's (`HORIZON_RELAY_URL`). None by default.
 pub fn friends_relay_setting() -> Option<String> {
     let dir = std::env::current_dir().ok()?;
     crate::ui_theme::preference(&dir, "friendsRelay")
         .filter(|r| !r.is_empty())
-        .or_else(horizon_friends::relay_url)
+        .or_else(|| horizon_hooks::engine::tunnel().and_then(|r| r.relay_from_env()))
 }
 /// Remember the relay typed on Join a friend (empty forgets it).
 pub fn save_friends_relay(relay: &str) {
@@ -490,33 +652,36 @@ pub fn save_friends_relay(relay: &str) {
 }
 
 /// Reach the friend's world from the code (directly, or through a relay)
-/// and open the tunnel: the loopback address to connect to.
-fn join_friend(code: &str, lang: &Language, send: &Sender<Event>) -> Result<(String, u16), Reason> {
-    use horizon_friends::{
-        PathMode,
-        guest::{self, GuestConfig},
+/// and open the tunnel: the loopback address to connect to, and the token to send on it first.
+/// Without a resolver (a build without Play with Friends) the address is refused, never retried.
+fn join_friend(
+    code: &str,
+    lang: &Language,
+    send: &Sender<Event>,
+) -> Result<(String, u16, Vec<u8>), Reason> {
+    let Some(resolver) = horizon_hooks::engine::tunnel() else {
+        return Err(Reason::keyed_arg(
+            "horizon.multiplayer.invalid_address",
+            lang,
+            &shown_address(&format!("{FRIEND}{code}")),
+        ));
     };
-    status(send, &tr(lang, "horizon.multiplayer.finding_friend"));
-    let tunnel = guest::join(&GuestConfig {
-        code: code.to_owned(),
-        relay: friends_relay_setting(),
-        protocol: PROTOCOL_VERSION,
-        game: horizon_protocol::GAME_VERSION.to_owned(),
-        path: PathMode::from_env(),
-    })
-    .map_err(|e| Reason::plain(e.to_string()))?;
-    status(
-        send,
-        &if tunnel.direct {
-            tr(lang, "horizon.multiplayer.connected_friend_direct")
-        } else {
-            tr(lang, "horizon.multiplayer.connected_friend_relay")
-        },
-    );
-    let (port, _) = tunnel
-        .serve_loopback()
-        .map_err(|e| Reason::plain(e.to_string()))?;
-    Ok(("127.0.0.1".to_owned(), port))
+    let mut progress = |p: tunnel::Progress| {
+        let key = match p {
+            tunnel::Progress::Finding => "horizon.multiplayer.finding_friend",
+            tunnel::Progress::Connected { direct: true } => {
+                "horizon.multiplayer.connected_friend_direct"
+            }
+            tunnel::Progress::Connected { direct: false } => {
+                "horizon.multiplayer.connected_friend_relay"
+            }
+        };
+        status(send, &tr(lang, key));
+    };
+    let opened = resolver
+        .open(code, friends_relay_setting(), &mut progress)
+        .map_err(Reason::plain)?;
+    Ok(("127.0.0.1".to_owned(), opened.port, opened.token))
 }
 
 fn status(send: &Sender<Event>, text: &str) {
@@ -693,12 +858,12 @@ fn run(
     cancellation: &Cancellation,
     resources: &Path,
     lan: bool,
-    recorder: &Arc<Mutex<Option<StudioRecorder>>>,
+    recorder: &RecorderSlot,
 ) -> Result<Reason, Reason> {
     let (host, port, mut c) = if let Some(pipe) = local {
         (address.to_owned(), 0, Connection::local(pipe))
     } else {
-        let (host, port) = match address.strip_prefix(FRIEND) {
+        let (host, port, token) = match address.strip_prefix(FRIEND) {
             Some(code) => join_friend(code, lang, send)?,
             None => {
                 let Some(target) = parse_address(address) else {
@@ -712,15 +877,24 @@ fn run(
                 };
                 status(send, &tr(lang, "connect.connecting"));
                 log_connecting(&target.0, target.1);
-                target
+                (target.0, target.1, Vec::new())
             }
         };
+        // Probe before opening the login socket: otherwise cancellation cannot
+        // close that socket until the optional status request times out.
+        let version = (!address.starts_with(FRIEND))
+            .then(|| older_server(address))
+            .flatten();
         let (mut c, host, port) =
             connect_tcp(&host, port, address.starts_with(FRIEND), READ_TIMEOUT)
                 .map_err(Reason::plain)?;
-        if !address.starts_with(FRIEND)
-            && let Some(version) = older_server(address)
-        {
+        // The tunnel's port takes only the client that sends its token first.
+        if !token.is_empty() {
+            c.writer
+                .write_raw(&token)
+                .map_err(|e| Reason::plain(e.to_string()))?;
+        }
+        if let Some(version) = version {
             log::info!("Joining {address} as a {} server", version.name());
             c.adapt(version);
         }
@@ -889,7 +1063,7 @@ fn receive_play(
     cookies: &Cookies,
     far: &crate::lod_net::Inbox,
     resources: &Path,
-    recorder: &Arc<Mutex<Option<StudioRecorder>>>,
+    recorder: &RecorderSlot,
 ) -> Result<Reason, Reason> {
     loop {
         let (id, payload) = reader
@@ -908,14 +1082,10 @@ fn receive_play(
                 continue;
             }
         };
-        // Only while a recording runs: the filter copies what it keeps, and re-encodes
-        // AddEntity with a fresh UUID.
         if let Some(rec) = recorder.lock().unwrap().as_ref()
             && rec.is_active()
-            && let Some((recorded_id, recorded_payload)) =
-                studio_recording_packet(&packet, id, &payload)
         {
-            rec.record_packet(recorded_id, &recorded_payload);
+            rec.received(&packet, id, &payload);
         }
         let reply = |p: play::Serverbound| {
             if let Some(w) = shared_writer.lock().unwrap().as_mut() {
@@ -989,52 +1159,6 @@ fn receive_play(
     }
 }
 
-/// Return the packet bytes safe to persist in a Studio recording.
-///
-/// Unknown packets fail closed so a newly added protocol packet cannot bypass
-/// the privacy policy. `AddEntity` retains its entity id and state, but gets a
-/// fresh UUID so the recording cannot link that entity to an account UUID.
-fn studio_recording_packet<'a>(
-    packet: &play::Clientbound,
-    packet_id: i32,
-    payload: &'a [u8],
-) -> Option<(i32, std::borrow::Cow<'a, [u8]>)> {
-    use play::Clientbound as P;
-    use std::borrow::Cow;
-    match packet {
-        P::AddEntity(entity) => {
-            let mut anonymous = entity.clone();
-            anonymous.uuid = u128::from_be_bytes(generate_secret().ok()?);
-            let encoded = P::AddEntity(anonymous).encode();
-            let mut reader = Reader::new(&encoded);
-            let id = reader.varint().ok()?;
-            Some((id, Cow::Owned(reader.rest().to_vec())))
-        }
-        P::CookieRequest(_)
-        | P::CustomChatCompletions(_)
-        | P::CustomPayload(_)
-        | P::DeleteChat(_)
-        | P::Disconnect(_)
-        | P::DisguisedChat(_)
-        | P::PlayerChat(_)
-        | P::PlayerCombatKill(_)
-        | P::PlayerInfoRemove(_)
-        | P::PlayerInfoUpdate(_)
-        | P::ResetScore(_)
-        | P::ResourcePackPush(_)
-        | P::ServerLinks(_)
-        | P::SetPlayerTeam(_)
-        | P::SetScore(_)
-        | P::StoreCookie(_)
-        | P::SystemChat(_)
-        | P::TabList(_)
-        | P::TrackedWaypoint(_)
-        | P::Transfer(_)
-        | P::Unknown(..) => None,
-        _ => Some((packet_id, Cow::Borrowed(payload))),
-    }
-}
-
 /// The configuration phase: registries, tags and known packs until the
 /// server finishes it (ClientConfigurationPacketListenerImpl).
 fn configure(
@@ -1048,6 +1172,7 @@ fn configure(
 ) -> Result<Dynamic, Reason> {
     let mut registries = Dynamic::default();
     let mut content_verified = false;
+    let mut known_core = None;
     let reply = |p: cfg::Serverbound| -> Result<(), Reason> {
         match writer.lock().unwrap().as_mut() {
             Some(w) => w
@@ -1105,15 +1230,17 @@ fn configure(
             }
             cfg::Clientbound::Ping(p) => reply(cfg::Serverbound::Pong(p))?,
             cfg::Clientbound::SelectKnownPacks(p) => {
+                let (packs, core) = select_known_packs(p.packs, resources);
+                known_core = core;
                 reply(cfg::Serverbound::SelectKnownPacks(cfg::SelectKnownPacks {
-                    packs: select_known_packs(p.packs),
+                    packs,
                 }))?
             }
             cfg::Clientbound::UpdateEnabledFeatures(p) => {
                 let _ = send.send(Event::Features(p.features));
             }
             cfg::Clientbound::RegistryData(mut r) => {
-                fill_known_entries(&mut r, resources);
+                fill_known_entries(&mut r, known_core.as_ref()).map_err(Reason::plain)?;
                 registries.add(r);
             }
             cfg::Clientbound::UpdateTags(t) => registries.add_tags(&t),
@@ -1169,48 +1296,146 @@ fn configure(
     }
 }
 
-/// `KnownPacksManager.trySelectingPacks`: the packs of the server's list the
-/// client has too. Horizon carries vanilla's core pack (the prepared
-/// resources' `data/`), so it names that one when the server offers it, and
-/// the server leaves that pack's entries' data out (`fill_known_entries`).
-fn select_known_packs(offered: Vec<cfg::KnownPack>) -> Vec<cfg::KnownPack> {
-    let (namespace, id, version) = crate::lan::data::CORE_PACK;
-    offered
-        .into_iter()
-        .filter(|p| p.namespace == namespace && p.id == id && p.version == version)
-        .collect()
+/// A verified snapshot of the prepared core registry data. Server-supplied
+/// identifiers only index this map; they never become filesystem paths.
+struct KnownCore(std::collections::HashMap<(String, String), Tag>);
+
+impl KnownCore {
+    fn load(resources: &Path) -> Option<Self> {
+        let root = std::fs::canonicalize(resources).ok()?;
+        let mut budget = 64 * 1024 * 1024;
+        let manifest = known_json(&root, Path::new("horizon-resources.json"), &mut budget)?;
+        if manifest.get("minecraft")?.as_str()? != horizon_protocol::GAME_VERSION {
+            return None;
+        }
+        let catalog = known_json(&root, Path::new("command-registries.json"), &mut budget)?;
+        let catalog = catalog.get("by_registry")?.as_object()?;
+        let mut entries = std::collections::HashMap::new();
+        for &registry in crate::lan::data::SYNCHRONIZED {
+            let registry_path = core_identifier_path(registry)?;
+            let ids = catalog.get(registry)?.get("ids")?.as_array()?;
+            for id in ids {
+                let id = id.as_str()?;
+                let entry_path = core_identifier_path(id)?;
+                let relative = Path::new("data/minecraft")
+                    .join(registry_path)
+                    .join(format!("{entry_path}.json"));
+                let json = known_json(&root, &relative, &mut budget)?;
+                if !json.is_object() && !json.is_array() {
+                    return None;
+                }
+                let data = crate::lan::data::json_to_nbt(&json);
+                if entries
+                    .insert((registry.to_owned(), id.to_owned()), data)
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        // Empty/partial prepared trees must not advertise a pack they cannot supply.
+        if entries.is_empty() {
+            return None;
+        }
+        Some(Self(entries))
+    }
 }
 
-/// `RegistryDataCollector`: an entry of a pack both sides know comes without
-/// its data, which the client reads from its own copy of the pack
-/// (`data/<namespace>/<registry path>/<path>.json`, `Registries.elementsDirPath`).
-fn fill_known_entries(r: &mut cfg::RegistryData, resources: &Path) {
-    let (registry_ns, registry_path) = r
-        .registry
-        .split_once(':')
-        .unwrap_or(("minecraft", r.registry.as_str()));
-    let dir = if registry_ns == "minecraft" {
-        registry_path.to_owned()
-    } else {
-        format!("{registry_ns}/{registry_path}")
-    };
-    for entry in r.entries.iter_mut().filter(|e| e.data.is_none()) {
-        let (ns, path) = entry
-            .id
-            .split_once(':')
-            .unwrap_or(("minecraft", entry.id.as_str()));
-        let file = resources
-            .join("data")
-            .join(ns)
-            .join(&dir)
-            .join(format!("{path}.json"));
-        let json = std::fs::read(&file)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-        if let Some(json) = json {
-            entry.data = Some(crate::lan::data::json_to_nbt(&json));
-        }
+fn valid_resource_segment(s: &str, allow_slash: bool) -> bool {
+    !s.is_empty()
+        && !s.starts_with('/')
+        && !s.ends_with('/')
+        && !s.contains("//")
+        && s.split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'_' | b'-' | b'.')
+                || (allow_slash && b == b'/')
+        })
+}
+
+/// ResourceLocation's allowed characters alone do not make a safe path:
+/// it permits dots and slashes, but file conversion rejects empty, . and .. components.
+fn core_identifier_path(id: &str) -> Option<&str> {
+    let path = id.strip_prefix("minecraft:")?;
+    if !valid_resource_segment(path, true) {
+        return None;
     }
+    (!path.is_empty()
+        && path.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+        }))
+    .then_some(path)
+}
+
+/// Canonical containment is checked before opening, including symlink targets.
+/// Both a per-file cap and aggregate budget bound the pre-negotiation snapshot.
+fn known_json(root: &Path, relative: &Path, budget: &mut usize) -> Option<serde_json::Value> {
+    use std::io::Read;
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let path = std::fs::canonicalize(root.join(relative)).ok()?;
+    if !path.starts_with(root) {
+        return None;
+    }
+    let metadata = std::fs::metadata(&path).ok()?;
+    let limit = (*budget).min(16 * 1024 * 1024);
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > limit {
+        return None;
+    }
+    *budget -= bytes.len();
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Only acknowledge the exact core pack after verifying all locally expected
+/// registry entries. Otherwise the server sends their full data, as before.
+fn select_known_packs(
+    offered: Vec<cfg::KnownPack>,
+    resources: &Path,
+) -> (Vec<cfg::KnownPack>, Option<KnownCore>) {
+    let (namespace, id, version) = crate::lan::data::CORE_PACK;
+    let selected: Vec<_> = offered
+        .into_iter()
+        .filter(|p| p.namespace == namespace && p.id == id && p.version == version)
+        .collect();
+    if selected.is_empty() {
+        return (Vec::new(), None);
+    }
+    match KnownCore::load(resources) {
+        Some(core) => (selected, Some(core)),
+        None => (Vec::new(), None),
+    }
+}
+
+/// Omitted data is legal only for an entry in the pack actually selected in
+/// this configuration phase. Preserve complete server-supplied data unchanged.
+fn fill_known_entries(r: &mut cfg::RegistryData, core: Option<&KnownCore>) -> Result<(), String> {
+    for entry in r.entries.iter_mut().filter(|e| e.data.is_none()) {
+        let data = core
+            .and_then(|core| core.0.get(&(r.registry.clone(), entry.id.clone())))
+            .ok_or_else(|| {
+                "Server omitted registry data not supplied by a selected known pack".to_owned()
+            })?;
+        entry.data = Some(data.clone());
+    }
+    Ok(())
 }
 
 fn receive_brand(payload: &cfg::CustomPayload, send: &Sender<Event>) {
@@ -1428,8 +1653,42 @@ mod tests {
         }
     }
 
+    fn known_fixture() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hz-known-core-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("horizon-resources.json"),
+            serde_json::json!({"minecraft": horizon_protocol::GAME_VERSION}).to_string(),
+        )
+        .unwrap();
+        let mut catalog = serde_json::Map::new();
+        for &registry in crate::lan::data::SYNCHRONIZED {
+            catalog.insert(
+                registry.into(),
+                serde_json::json!({"ids": ["minecraft:fixture"]}),
+            );
+            let dir = root
+                .join("data/minecraft")
+                .join(core_identifier_path(registry).unwrap());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("fixture.json"), br#"{"fixture":1}"#).unwrap();
+        }
+        std::fs::write(
+            root.join("command-registries.json"),
+            serde_json::json!({"by_registry": catalog}).to_string(),
+        )
+        .unwrap();
+        root
+    }
+
     #[test]
-    fn the_client_knows_vanilla_core_pack_of_its_own_version_only() {
+    fn the_client_knows_only_the_exact_complete_core_pack() {
+        let root = known_fixture();
         let core = pack("minecraft", "core", horizon_protocol::GAME_VERSION);
         let offered = vec![
             core.clone(),
@@ -1440,57 +1699,132 @@ mod tests {
             ),
             pack("example", "server_pack", "1"),
         ];
-        assert_eq!(select_known_packs(offered), vec![core]);
-        assert_eq!(
-            select_known_packs(vec![pack("minecraft", "core", "1.21.11")]),
-            vec![]
+        let (selected, snapshot) = select_known_packs(offered, &root);
+        assert_eq!(selected, vec![core]);
+        assert!(snapshot.is_some());
+        assert!(
+            select_known_packs(vec![pack("minecraft", "core", "1.21.11")], &root)
+                .0
+                .is_empty()
         );
-        assert_eq!(select_known_packs(vec![]), vec![]);
+        std::fs::remove_file(root.join("data/minecraft/damage_type/fixture.json")).unwrap();
+        assert!(
+            select_known_packs(
+                vec![pack("minecraft", "core", horizon_protocol::GAME_VERSION)],
+                &root
+            )
+            .0
+            .is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_known_entry_takes_its_data_from_the_clients_pack() {
-        let root = std::env::temp_dir().join(format!("hz-known-entries-{}", std::process::id()));
-        let dir = root.join("data/minecraft/damage_type");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("in_fire.json"),
-            br#"{"message_id": "inFire", "exhaustion": 0.1, "scaling": "when_caused_by_living_non_player"}"#,
-        )
-        .unwrap();
-        let sent = Tag::compound(vec![(
-            "message_id",
-            Tag::String(JavaString::from("custom")),
-        )]);
-        let mut r = cfg::RegistryData {
-            registry: "minecraft:damage_type".into(),
-            entries: vec![
-                cfg::RegistryEntry {
-                    id: "minecraft:in_fire".into(),
-                    data: None,
-                },
-                cfg::RegistryEntry {
-                    id: "minecraft:custom".into(),
-                    data: Some(sent.clone()),
-                },
-                cfg::RegistryEntry {
-                    id: "minecraft:missing".into(),
-                    data: None,
-                },
-            ],
-        };
-        fill_known_entries(&mut r, &root);
-        std::fs::remove_dir_all(&root).unwrap();
-        let Some(Tag::Compound(filled)) = &r.entries[0].data else {
-            panic!("in_fire was not filled: {:?}", r.entries[0].data);
-        };
-        assert_eq!(
-            filled.get(&JavaString::from("message_id")),
-            Some(&Tag::String(JavaString::from("inFire")))
+    fn selected_snapshot_hydrates_only_known_core_entries_without_more_disk_reads() {
+        let root = known_fixture();
+        let (_, core) = select_known_packs(
+            vec![pack("minecraft", "core", horizon_protocol::GAME_VERSION)],
+            &root,
         );
-        // Data the server sent stays; an entry the client has no file for stays empty.
-        assert_eq!(r.entries[1].data, Some(sent));
-        assert_eq!(r.entries[2].data, None);
+        std::fs::remove_dir_all(root).unwrap();
+        let mut packet = cfg::RegistryData {
+            registry: "minecraft:damage_type".into(),
+            entries: vec![cfg::RegistryEntry {
+                id: "minecraft:fixture".into(),
+                data: None,
+            }],
+        };
+        assert!(fill_known_entries(&mut packet, None).is_err());
+        fill_known_entries(&mut packet, core.as_ref()).unwrap();
+        assert!(packet.entries[0].data.is_some());
+        let sent = packet.entries[0].data.clone();
+        fill_known_entries(&mut packet, None).unwrap();
+        assert_eq!(packet.entries[0].data, sent);
+        for id in [
+            "example:fixture",
+            "minecraft:missing",
+            "minecraft:../../outside",
+            "minecraft:/outside",
+        ] {
+            packet.entries[0] = cfg::RegistryEntry {
+                id: id.into(),
+                data: None,
+            };
+            assert!(fill_known_entries(&mut packet, core.as_ref()).is_err());
+            assert!(packet.entries[0].data.is_none());
+        }
+    }
+
+    #[test]
+    fn registry_paths_reject_traversal_absolute_and_invalid_identifiers() {
+        for id in [
+            "minecraft:../outside",
+            "minecraft:a/../b",
+            "minecraft:./a",
+            "minecraft:/tmp/a",
+            "minecraft:a//b",
+            "minecraft:a\\b",
+            "../minecraft:fixture",
+            "example:fixture",
+        ] {
+            assert!(core_identifier_path(id).is_none(), "{id}");
+        }
+        assert_eq!(
+            core_identifier_path("minecraft:worldgen/biome"),
+            Some("worldgen/biome")
+        );
+        assert_eq!(
+            core_identifier_path("minecraft:valid.name"),
+            Some("valid.name")
+        );
+    }
+
+    #[test]
+    fn decoded_server_identifiers_cannot_escape_the_selected_core_snapshot() {
+        let root = known_fixture();
+        let core = KnownCore::load(&root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        for (registry, id) in [
+            ("minecraft:damage_type", "minecraft:/tmp/outside"),
+            ("minecraft:../../outside", "minecraft:fixture"),
+            ("minecraft:damage_type", "example:fixture"),
+        ] {
+            let wire = cfg::Clientbound::RegistryData(cfg::RegistryData {
+                registry: registry.into(),
+                entries: vec![cfg::RegistryEntry {
+                    id: id.into(),
+                    data: None,
+                }],
+            })
+            .encode();
+            let mut input = horizon_protocol::buf::Reader::new(&wire);
+            let kind = input.varint().unwrap();
+            let cfg::Clientbound::RegistryData(mut decoded) =
+                cfg::Clientbound::decode(kind, input.rest()).unwrap()
+            else {
+                panic!("wrong packet")
+            };
+            assert!(fill_known_entries(&mut decoded, Some(&core)).is_err());
+            assert!(decoded.entries[0].data.is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_core_rejects_outside_symlink_targets_and_oversized_json() {
+        let root = known_fixture();
+        let outside = root.with_extension("outside.json");
+        std::fs::write(&outside, br#"{"outside":true}"#).unwrap();
+        let entry = root.join("data/minecraft/damage_type/fixture.json");
+        std::fs::remove_file(&entry).unwrap();
+        std::os::unix::fs::symlink(&outside, &entry).unwrap();
+        assert!(KnownCore::load(&root).is_none());
+        std::fs::remove_file(&entry).unwrap();
+        let file = std::fs::File::create(&entry).unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+        assert!(KnownCore::load(&root).is_none());
+        std::fs::remove_file(outside).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Launchers find the last server joined in `latest.log` by vanilla's line.
@@ -1509,6 +1843,50 @@ mod tests {
             "Connecting to play.example.net, 25577"
         );
         assert_eq!(line("[::1]:25566"), "Connecting to ::1, 25566");
+    }
+
+    #[test]
+    fn cancelling_stalled_login_closes_socket_without_waiting_for_worker() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (ready, login_received) = channel();
+        let (closed, peer_closed) = channel();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut connection = Connection::from_stream(socket).unwrap();
+            // Accept the handshake and Hello, then deliberately never reply.
+            connection.recv().unwrap();
+            connection.recv().unwrap();
+            ready.send(()).unwrap();
+            closed.send(connection.recv().is_err()).unwrap();
+        });
+        let mut session = Session::connect(
+            &address,
+            "CancelTest",
+            None,
+            cfg::ClientInformation::new(8),
+            Arc::new(Language::new()),
+            PathBuf::from("."),
+        );
+        login_received.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Login has not published the play/configuration writer yet.
+        assert!(session.writer.lock().unwrap().is_none());
+        let worker = session.thread.take().unwrap();
+        let start = std::time::Instant::now();
+        session.disconnect();
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(peer_closed.recv_timeout(Duration::from_secs(1)).unwrap());
+        server.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            !session
+                .poll()
+                .iter()
+                .any(|event| matches!(event, Event::Joined { .. }))
+        );
     }
 
     #[test]
@@ -1636,7 +2014,8 @@ mod tests {
 
         for packet in packets {
             assert!(
-                studio_recording_packet(&packet, packet.id(), b"raw packet payload").is_none(),
+                crate::studio::recorder::recordable(&packet, packet.id(), b"raw packet payload")
+                    .is_none(),
                 "{} should be excluded from recordings",
                 packet.name()
             );
@@ -1657,7 +2036,8 @@ mod tests {
             data: 4,
         };
         let packet = play::Clientbound::AddEntity(original.clone());
-        let (id, payload) = studio_recording_packet(&packet, packet.id(), b"unused").unwrap();
+        let (id, payload) =
+            crate::studio::recorder::recordable(&packet, packet.id(), b"unused").unwrap();
         let play::Clientbound::AddEntity(recorded) =
             play::Clientbound::decode(id, &payload).unwrap()
         else {
@@ -1777,50 +2157,6 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_stalled_login_closes_socket_without_waiting_for_worker() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap().to_string();
-        let (ready, login_received) = channel();
-        let (closed, peer_closed) = channel();
-        let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            let mut connection = Connection::from_stream(socket).unwrap();
-            // Accept the handshake and Hello, then deliberately never reply.
-            connection.recv().unwrap();
-            connection.recv().unwrap();
-            ready.send(()).unwrap();
-            closed.send(connection.recv().is_err()).unwrap();
-        });
-        let mut session = Session::connect(
-            &address,
-            "CancelTest",
-            None,
-            cfg::ClientInformation::new(8),
-            Arc::new(Language::new()),
-            PathBuf::from("."),
-        );
-        login_received.recv_timeout(Duration::from_secs(3)).unwrap();
-        // Login has not published the play/configuration writer yet.
-        assert!(session.writer.lock().unwrap().is_none());
-        let worker = session.thread.take().unwrap();
-        let start = std::time::Instant::now();
-        session.disconnect();
-        assert!(start.elapsed() < Duration::from_millis(500));
-        assert!(peer_closed.recv_timeout(Duration::from_secs(1)).unwrap());
-        server.join().unwrap();
-        worker.join().unwrap();
-        assert!(
-            !session
-                .poll()
-                .iter()
-                .any(|event| matches!(event, Event::Joined { .. }))
-        );
-    }
-
-    #[test]
     fn legacy_ping_request_is_the_1_6_ping_host_packet() {
         let bytes = legacy_ping_request("a.b", 25565);
         assert_eq!(&bytes[..3], &[254, 1, 250]);
@@ -1928,6 +2264,7 @@ mod tests {
         });
         let (_, events) = channel();
         let mut session = Session {
+            serial: next_serial(),
             cancellation: Arc::new(Cancellation::default()),
             events,
             writer: Arc::new(Mutex::new(None)),
@@ -1938,6 +2275,8 @@ mod tests {
             counters: Arc::new(Mutex::new(None)),
             cookies: Cookies::default(),
             debug: false,
+            far: Arc::new(crate::lod_net::Inbox::default()),
+            recorder: Arc::new(Mutex::new(None)),
         };
         let start = std::time::Instant::now();
         session.disconnect();
@@ -2045,6 +2384,7 @@ mod tests {
                 let _ = finished.send(());
             });
             let mut session = Session {
+                serial: next_serial(),
                 cancellation,
                 events,
                 writer: writer.clone(),
@@ -2099,6 +2439,7 @@ mod tests {
         let held = writer.lock().unwrap();
         let (_, events) = channel();
         let mut session = Session {
+            serial: next_serial(),
             cancellation,
             events,
             writer: writer.clone(),
@@ -2109,6 +2450,8 @@ mod tests {
             counters: Arc::new(Mutex::new(None)),
             cookies: Cookies::default(),
             debug: false,
+            far: Arc::new(crate::lod_net::Inbox::default()),
+            recorder: Arc::new(Mutex::new(None)),
         };
         session.disconnect();
         assert!(peer.recv().is_err());
@@ -2190,6 +2533,7 @@ mod tests {
             debug: false,
             far: Arc::default(),
             recorder: Arc::new(Mutex::new(None)),
+            serial: next_serial(),
         };
         let (thread_writer, thread_configuring, thread_recorder) = (
             session.writer.clone(),
@@ -2419,12 +2763,61 @@ mod tests {
         }
     }
 
+    /// A recorder that keeps what reaches it, as (id, payload).
+    #[derive(Clone, Default)]
+    struct TestRecorder(Arc<Mutex<Vec<(i32, Vec<u8>)>>>);
+    impl PacketRecorder for TestRecorder {
+        fn request_stop(&self) {}
+        fn poll_finish(&self) -> Option<std::io::Result<PathBuf>> {
+            Some(Ok(PathBuf::from("test.mcpr")))
+        }
+        fn work_handle(&self) -> Option<crate::studio::recorder::WorkHandle> {
+            None
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        fn received(&self, _packet: &play::Clientbound, id: i32, payload: &[u8]) {
+            self.0.lock().unwrap().push((id, payload.to_vec()));
+        }
+        fn record_packet(&self, id: i32, payload: &[u8]) {
+            self.0.lock().unwrap().push((id, payload.to_vec()));
+        }
+        fn status(&self) -> RecorderStatus {
+            RecorderStatus {
+                active: true,
+                finishing: false,
+                path: PathBuf::from("test.mcpr"),
+                elapsed: Duration::ZERO,
+                packet_count: self.0.lock().unwrap().len() as u64,
+                bytes_written: 0,
+                error: None,
+            }
+        }
+        fn stop(self: Box<Self>) -> std::io::Result<PathBuf> {
+            Ok(PathBuf::from("test.mcpr"))
+        }
+    }
+    impl TestRecorder {
+        fn decoded(&self) -> Vec<play::Clientbound> {
+            let packets = self.0.lock().unwrap();
+            packets
+                .iter()
+                .map(|(id, payload)| play::Clientbound::decode(*id, payload).unwrap())
+                .collect()
+        }
+    }
+
     #[test]
-    fn session_studio_recording_tap_records_packets_to_mcpr() {
+    fn session_recorder_gets_the_play_packets_the_network_thread_receives() {
         let (client, server) = horizon_protocol::connection::Pipe::pair();
-        let (mut reader, writer) = Connection::local(client).split();
+        let connection = Connection::local(client);
+        let cancellation = Arc::new(Cancellation::default());
+        cancellation.attach(&connection).unwrap();
+        let (mut reader, writer) = connection.split();
         let (send, events) = channel();
         let session = Session {
+            cancellation,
             events,
             writer: Arc::new(Mutex::new(Some(writer))),
             configuring: Arc::new(AtomicBool::new(false)),
@@ -2436,21 +2829,10 @@ mod tests {
             debug: false,
             far: Arc::default(),
             recorder: Arc::new(Mutex::new(None)),
+            serial: next_serial(),
         };
-
-        let temp_dir = std::env::temp_dir().join(format!(
-            "horizon-studio-test-{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let mcpr_path = temp_dir.join("test_tap.mcpr");
-
-        let meta = Metadata::new("Singleplayer World".into(), true, "26.3".into());
-        session.start_recording(&mcpr_path, meta).unwrap();
+        let recorder = TestRecorder::default();
+        session.start_recording(recorder.clone(), |_| {});
         assert!(session.is_recording());
 
         let (thread_writer, thread_configuring, thread_recorder) = (
@@ -2482,32 +2864,119 @@ mod tests {
             relatives: 0,
         });
         server.send(&pos_pkt.encode()).unwrap();
-
-        // Disconnect ends receive_play loop
+        // Disconnect ends receive_play's loop.
         let disc_pkt = play::Clientbound::Disconnect(cfg::Disconnect {
             reason: Tag::String("Replay tap test completed".into()),
         });
         server.send(&disc_pkt.encode()).unwrap();
-
         let _ = thread.join().unwrap();
 
-        let saved_path = session.stop_recording().unwrap().unwrap();
-        assert_eq!(saved_path, mcpr_path);
+        assert_eq!(
+            session.stop_recording().unwrap().unwrap(),
+            PathBuf::from("test.mcpr")
+        );
         assert!(!session.is_recording());
-        assert!(mcpr_path.exists());
+        // The recorder is handed both; what a recording keeps is the recorder's choice.
+        assert_eq!(recorder.decoded(), [pos_pkt, disc_pkt]);
+    }
 
-        // Verify that the recording archive contains the clientbound packets.
-        let mut recording = crate::studio::McprReader::open(&mcpr_path).unwrap();
-        assert_eq!(recording.total_packets(), 1);
-        assert_eq!(recording.metadata.server_name, "Singleplayer World");
-        assert!(recording.metadata.singleplayer);
-        assert!(recording.metadata.players.is_empty());
+    #[test]
+    fn session_recorder_gets_the_packets_the_client_makes() {
+        use horizon_protocol::entity_data::{Value, serializer};
 
-        let packet1 = recording.next_packet().unwrap().unwrap();
-        assert!(recording.next_packet().unwrap().is_none());
+        let session = Session::replay("StudioTester");
+        session.record_clientbound(&play::Clientbound::SwingAnimation(play::SwingAnimation {
+            id: 1,
+            hand: 0,
+            kind: 0,
+            duration: 6,
+        }));
+        let recorder = TestRecorder::default();
+        // What `initialize` writes comes first.
+        let snapshot = play::Clientbound::PlayerPosition(play::PlayerPosition {
+            teleport: 0,
+            position: [12.5, 64.0, -88.5],
+            delta: [0.0; 3],
+            yaw: 90.0,
+            pitch: 15.0,
+            relatives: 0,
+        });
+        session.start_recording(recorder.clone(), |rec| {
+            let encoded = snapshot.encode();
+            let mut reader = horizon_protocol::buf::Reader::new(&encoded);
+            let id = reader.varint().unwrap();
+            rec.record_packet(id, reader.rest());
+        });
+        let swing_pkt = play::Clientbound::SwingAnimation(play::SwingAnimation {
+            id: 42,
+            hand: 0,
+            kind: 1,
+            duration: 6,
+        });
+        session.record_clientbound(&swing_pkt);
+        let data_pkt = play::Clientbound::SetEntityData(play::SetEntityData {
+            id: 42,
+            values: vec![
+                (0, serializer::BYTE, Value::Byte(0x02)),
+                (6, serializer::POSE, Value::Id(5)),
+            ],
+        });
+        session.record_clientbound(&data_pkt);
+        assert_eq!(session.recorder_status().unwrap().packet_count, 3);
+        session.stop_recording().unwrap().unwrap();
+        // Nothing reaches a stopped recording.
+        session.record_clientbound(&swing_pkt);
 
-        let decoded1 = play::Clientbound::decode(packet1.id, &packet1.payload).unwrap();
-        assert_eq!(decoded1, pos_pkt);
+        assert_eq!(recorder.decoded(), [snapshot, swing_pkt, data_pkt]);
+    }
+
+    #[test]
+    fn fill_known_entries_rejects_path_traversal_and_reads_valid_entries() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("horizon-net-reg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let resources = temp_dir.join("res");
+        let valid_dir = resources.join("data/minecraft/worldgen/biome");
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        std::fs::write(
+            valid_dir.join("plains.json"),
+            br#"{"has_precipitation":true}"#,
+        )
+        .unwrap();
+        std::fs::write(temp_dir.join("secret.json"), br#"{"leaked":true}"#).unwrap();
+
+        let mut reg = cfg::RegistryData {
+            registry: "minecraft:worldgen/biome".into(),
+            entries: vec![
+                cfg::RegistryEntry {
+                    id: "minecraft:plains".into(),
+                    data: None,
+                },
+                cfg::RegistryEntry {
+                    id: "minecraft:../../../../secret".into(),
+                    data: None,
+                },
+                cfg::RegistryEntry {
+                    id: "..:plains".into(),
+                    data: None,
+                },
+            ],
+        };
+        let canonical = std::fs::canonicalize(&resources).unwrap();
+        let data = known_json(
+            &canonical,
+            Path::new("data/minecraft/worldgen/biome/plains.json"),
+            &mut (64 * 1024 * 1024),
+        )
+        .unwrap();
+        let core = KnownCore(std::collections::HashMap::from([(
+            ("minecraft:worldgen/biome".into(), "minecraft:plains".into()),
+            crate::lan::data::json_to_nbt(&data),
+        )]));
+        assert!(fill_known_entries(&mut reg, Some(&core)).is_err());
+        assert!(reg.entries[0].data.is_some());
+        assert!(reg.entries[1].data.is_none());
+        assert!(reg.entries[2].data.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

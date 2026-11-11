@@ -28,7 +28,18 @@ fn frame_adoption(glow_first: bool) {
         &mut |_, _| unreachable!(),
     )
     .unwrap();
-    let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+    let mut options = Options::parse(
+        [
+            "--game-dir".to_owned(),
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ]
+        .into_iter(),
+    )
+    .unwrap()
+    .unwrap();
     options.resources = root.clone();
     options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
     let mut game = Game::new(
@@ -44,7 +55,7 @@ fn frame_adoption(glow_first: bool) {
     game.build_registries();
     game.player = Some(
         horizon_client::motion::PlayerMotion::new(
-            game.motion,
+            &game.motion,
             horizon_core::geometry::Vec3::new(4.5, 100.0, 4.5),
         )
         .unwrap(),

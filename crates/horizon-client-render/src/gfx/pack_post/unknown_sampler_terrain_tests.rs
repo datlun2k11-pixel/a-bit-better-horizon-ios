@@ -44,6 +44,9 @@ fn unknown_samplers_and_colortex0_to_3_in_gbuffers_terrain_read_the_atlas() {
     };
     let inputs = horizon_shaders::GameInputs {
         terrain: Some(terrain),
+        // As in Renderer, block-entity programs can fall back to gbuffers_terrain.
+        // Supply real entity inputs without weakening the required-stage guard.
+        entities: Some(super::super::pack_entities::inputs()),
         ..Default::default()
     };
     const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0=>Float32x3];
@@ -114,10 +117,14 @@ fn unknown_samplers_and_colortex0_to_3_in_gbuffers_terrain_read_the_atlas() {
             contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
+    let terrain_group = unused_terrain_group(&post, &gpu.device);
     let hud = HudBatch::new(SIZE);
     let frame = fixture_frame(&hud);
     let pixels = gpu.render(&mut post, &color, &depth, &frame, &mut |rp, list, _, _| {
         if list == TerrainList::Solid {
+            if let Some(group) = &terrain_group {
+                rp.set_bind_group(3, group, &[]);
+            }
             rp.set_vertex_buffer(0, buffer.slice(..));
             rp.draw(0..6, 0..1);
         }
@@ -126,5 +133,99 @@ fn unknown_samplers_and_colortex0_to_3_in_gbuffers_terrain_read_the_atlas() {
     // 11-15 gdepth (colortex1).
     for (i, p) in pixels.iter().enumerate() {
         assert_eq!(*p, ATLAS, "column {}", i % SIZE[0] as usize);
+    }
+}
+
+/// The unknown-2D fallback is not permission to substitute a blank texture for a
+/// known missing resource, an authored-but-unbound texture, or another sampler type.
+#[test]
+fn unavailable_resources_still_disable_the_pack() {
+    use super::destination_tests::Fixture;
+    use std::io::{Cursor, Write};
+    let Some(gpu) = Fixture::new() else { return };
+    for (name, ty, expression, properties, custom_png) in [
+        (
+            "probeUnsupported",
+            "sampler3D",
+            "texture3D(probeUnsupported,vec3(0.5))",
+            "",
+            false,
+        ),
+        (
+            "shadowtex0",
+            "sampler2D",
+            "texture2D(shadowtex0,vec2(0.5))",
+            "shadow.enabled=false\n",
+            false,
+        ),
+        (
+            "probeDeclared",
+            "sampler2D",
+            "texture2D(probeDeclared,vec2(0.5))",
+            "texture.composite.probeDeclared=custom.png\n",
+            true,
+        ),
+    ] {
+        let fragment = format!(
+            "#version 120\nuniform {ty} {name};\nvoid main(){{gl_FragColor={expression};}}"
+        );
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, data) in [
+            ("final.vsh", VERTEX.as_bytes()),
+            ("final.fsh", fragment.as_bytes()),
+            ("shaders.properties", properties.as_bytes()),
+        ] {
+            zip.start_file(
+                format!("shaders/{path}"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(data).unwrap();
+        }
+        if custom_png {
+            let mut bytes = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&[255; 4])
+                    .unwrap();
+            }
+            zip.start_file(
+                "shaders/custom.png",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(&bytes).unwrap();
+        }
+        let pack = horizon_shaders::Pack::from_zip_bytes(
+            "original-missing-resource-controls",
+            zip.finish().unwrap().into_inner(),
+        )
+        .unwrap();
+        let mut macros = horizon_shaders::Macros::standard();
+        let (properties, _) = horizon_shaders::read_properties(&pack, &mut macros);
+        let parsed =
+            horizon_shaders::load_post(&pack, "", &properties, &macros, &Default::default());
+        assert!(parsed.complete, "{}: {:?}", name, parsed.notes);
+        let notes = match gpu.try_build(parsed) {
+            Ok(post) => {
+                assert!(
+                    !post.complete,
+                    "{name}: unavailable texture left an effect enabled"
+                );
+                post.notes
+            }
+            Err(refused) => refused.notes,
+        };
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains(&format!("texture {name} is unavailable"))),
+            "{name}: {notes:?}"
+        );
     }
 }

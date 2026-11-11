@@ -75,9 +75,13 @@ fn components(channels: u8) -> usize {
 pub fn load_textures(pack: &Pack, properties: &Properties) -> (Vec<CustomTexture>, Vec<String>) {
     let (mut textures, mut notes) = (Vec::new(), Vec::new());
     for e in &properties.entries {
-        let (stage, name) = if let Some(name) = e.key.strip_prefix("customTexture.") {
+        let custom = e.key.strip_prefix("customTexture.");
+        let Some(rest) = custom.or_else(|| e.key.strip_prefix("texture.")) else {
+            continue;
+        };
+        let (stage, name) = if let Some(name) = custom {
             (EVERY_STAGE, name)
-        } else if let Some(rest) = e.key.strip_prefix("texture.") {
+        } else {
             match rest {
                 "noise" => ("noise", "noise"),
                 _ => match rest.split_once('.') {
@@ -89,9 +93,17 @@ pub fn load_textures(pack: &Pack, properties: &Properties) -> (Vec<CustomTexture
                     }
                 },
             }
-        } else {
-            continue;
         };
+        let identifier = |s: &str| {
+            !s.is_empty()
+                && s.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+                })
+        };
+        if !identifier(name) || !(stage == EVERY_STAGE || identifier(stage)) {
+            notes.push(format!("`{}`: invalid program or sampler name", e.key));
+            continue;
+        }
         match source(pack, e.value.trim()) {
             Ok(source) => textures.push(CustomTexture {
                 stage: stage.to_owned(),
@@ -120,15 +132,13 @@ pub fn resolve_resources(
             return true;
         };
         let (namespace, path) = location.split_once(':').unwrap_or(("minecraft", location));
-        if path.starts_with("dynamic/") || path.starts_with("textures/atlas/") {
-            return true;
-        }
         let key = match t.stage.as_str() {
             EVERY_STAGE => format!("customTexture.{}", t.name),
             stage => format!("texture.{stage}.{}", t.name),
         };
-        // A resource location's characters (`ResourceLocation`): nothing reaches outside the
-        // game's resources.
+        // Resource-location characters alone are not enough for filesystem reads: a leading
+        // slash replaces the resource root in Path::join. Require nonempty relative segments,
+        // rejecting absolute paths, traversal, Windows separators/drives and URI escapes.
         let valid = |s: &str, slash: bool| {
             !s.is_empty()
                 && s.bytes().all(|b| {
@@ -137,19 +147,28 @@ pub fn resolve_resources(
                         || b"_-.".contains(&b)
                         || (slash && b == b'/')
                 })
-                && s.split('/').all(|part| part != ".." && part != ".")
+                && s.split('/')
+                    .all(|part| !part.is_empty() && part != ".." && part != ".")
         };
         if !valid(namespace, false) || !valid(path, true) {
             notes.push(format!("`{key}`: `{location}` is not a resource location"));
             return false;
         }
+        // Validate before recognizing generated textures too: malformed aliases must not
+        // survive as unresolved resources or reach a filesystem-backed read callback.
+        if path.starts_with("dynamic/") || path.starts_with("textures/atlas/") {
+            return true;
+        }
         let Some(bytes) = read(namespace, path) else {
             notes.push(format!("`{key}`: the game has no `{location}`"));
             return false;
         };
-        let Some(mut texture) = decode_png(&bytes) else {
-            notes.push(format!("`{key}`: `{location}` is not a PNG"));
-            return false;
+        let mut texture = match decode_png_checked(&bytes) {
+            Ok(texture) => texture,
+            Err(error) => {
+                notes.push(format!("`{key}`: `{location}`: {error}"));
+                return false;
+            }
         };
         let meta = read(namespace, &format!("{path}.mcmeta"));
         let text = meta.as_deref().map(String::from_utf8_lossy);
@@ -174,14 +193,17 @@ fn source(pack: &Pack, value: &str) -> Result<TextureSource, String> {
     if path.contains(':') {
         return Ok(TextureSource::Resource(path.to_owned()));
     }
-    let path = path.trim_start_matches('/');
+    let path = crate::pack::normalize(path)
+        .filter(|p| !p.is_empty())
+        .ok_or("texture path leaves the shaders folder")?;
     let bytes = pack
-        .read(path)
+        .read_checked(&path)
+        .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("can't find `{path}`"))?;
     let (blur, clamp) = mcmeta(pack.read_text(&format!("{path}.mcmeta")).as_deref());
     let rest: Vec<&str> = words.collect();
     let mut texture = if rest.is_empty() {
-        decode_png(&bytes).ok_or_else(|| format!("`{path}` is not a PNG"))?
+        decode_png_checked(&bytes).map_err(|why| format!("`{path}`: {why}"))?
     } else {
         raw(&bytes, &rest)?
     };
@@ -204,14 +226,36 @@ fn mcmeta(text: Option<&str>) -> (Option<bool>, Option<bool>) {
 
 /// A PNG as 8-bit RGBA, rows top first.
 pub fn decode_png(bytes: &[u8]) -> Option<Texture> {
+    decode_png_checked(bytes).ok()
+}
+
+fn decode_png_checked(bytes: &[u8]) -> Result<Texture, String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_limits(png::Limits {
+        bytes: MAX_DECODE_BYTES,
+    });
     // Packs ship PNGs with wrong chunk checksums (a server's obfuscated pack);
     // the game's other pack textures decode them, as stb_image does.
     decoder.ignore_checksums(true);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().ok()?;
-    let mut buf = vec![0; reader.output_buffer_size()?];
-    let info = reader.next_frame(&mut buf).ok()?;
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let info = reader.info();
+    let output = (info.width as usize)
+        .checked_mul(info.height as usize)
+        .ok_or("PNG size overflow")?
+        .checked_mul(4)
+        .ok_or("PNG size overflow")?
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("PNG size overflow")?;
+    let decoded = reader.output_buffer_size().ok_or("PNG size overflow")?;
+    if output.checked_add(decoded).ok_or("PNG size overflow")? > MAX_DECODE_BYTES {
+        return Err("expanded PNG exceeds the 256 MiB decoding budget".into());
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(decoded)
+        .map_err(|_| "cannot allocate decoded PNG")?;
+    buf.resize(decoded, 0);
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     let pixels = &buf[..info.buffer_size()];
     let rgba: Vec<f32> = match info.color_type {
         png::ColorType::Rgba => pixels.iter().map(|&b| b as f32 / 255.0).collect(),
@@ -234,9 +278,9 @@ pub fn decode_png(bytes: &[u8]) -> Option<Texture> {
             .flat_map(|&g| [g, g, g, 255])
             .map(|b| b as f32 / 255.0)
             .collect(),
-        png::ColorType::Indexed => return None,
+        png::ColorType::Indexed => return Err("indexed PNG was not expanded".into()),
     };
-    Some(Texture {
+    Ok(Texture {
         dim: Dim::D2,
         size: [info.width, info.height, 1],
         format: Format::RGBA8,
@@ -249,6 +293,8 @@ pub fn decode_png(bytes: &[u8]) -> Option<Texture> {
 
 /// The largest size a raw texture may give one of its dimensions.
 const MAX_SIZE: u32 = 16384;
+// Includes intermediate and expanded texels, not just the compressed source bytes.
+const MAX_DECODE_BYTES: usize = 256 * 1024 * 1024;
 
 /// A raw dump: `<type> <internalFormat> <dimensions...> <pixelFormat> <pixelType>`, its rows
 /// tightly packed, or padded to four bytes as GL unpacks by default.
@@ -336,7 +382,17 @@ fn raw(bytes: &[u8], words: &[&str]) -> Result<Texture, String> {
     }
     let out = components(format.channels);
     let count = size[0] as usize * rows;
-    let mut values = Vec::with_capacity(count * out);
+    let values_len = count.checked_mul(out).ok_or("texture size overflow")?;
+    let allocation = values_len
+        .checked_mul(std::mem::size_of::<Value>() + std::mem::size_of::<f32>())
+        .ok_or("texture size overflow")?;
+    if allocation > MAX_DECODE_BYTES {
+        return Err("expanded texture exceeds the decoding budget".into());
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(values_len)
+        .map_err(|_| "cannot allocate decoded texture")?;
     for r in 0..rows {
         for x in 0..size[0] as usize {
             let at = r * stride + x * texel;
@@ -554,6 +610,33 @@ mod tests {
             matches!(&textures[4].source, TextureSource::Resource(r) if r == "minecraft:dynamic/lightmap_1")
         );
     }
+    #[test]
+    fn custom_aliases_apply_to_all_stages_and_paths_stay_inside_pack() {
+        let pack = Pack::from_zip_bytes("textures", zip(&[("shaders/empty", "")])).unwrap();
+        let props = Properties::parse(
+            "customTexture.sky=minecraft:textures/sky.png\ntexture.noise=minecraft:textures/noise.png\ntexture.composite.colortex4.1=minecraft:textures/color.png",
+            &Macros::standard(),
+        );
+        let (textures, notes) = load_textures(&pack, &props);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!((&*textures[0].stage, &*textures[0].name), ("*", "sky"));
+        assert_eq!(
+            (&*textures[1].stage, &*textures[1].name),
+            ("noise", "noise")
+        );
+        assert_eq!(
+            (&*textures[2].stage, &*textures[2].name),
+            ("composite", "colortex4")
+        );
+        for value in [
+            "customTexture.sky=../outside.png",
+            "texture..sky=empty",
+            "texture.composite.=empty",
+        ] {
+            let (_, notes) = load_textures(&pack, &Properties::parse(value, &Macros::standard()));
+            assert!(!notes.is_empty(), "{value}");
+        }
+    }
 
     /// Raw textures are linear and clamped, PNGs nearest and repeating, and each key of a
     /// `.mcmeta` overrides its own default only (Iris 1.11.7 with a probe pack of ours, #9064).
@@ -664,5 +747,71 @@ mod tests {
         assert!(
             matches!(&textures[2].source, TextureSource::Resource(r) if r == "minecraft:dynamic/lightmap_1")
         );
+    }
+    #[test]
+    fn malformed_resource_locations_never_reach_the_resource_reader() {
+        let pack =
+            Pack::from_zip_bytes("invalid-resources", zip(&[("shaders/final.fsh", "")])).unwrap();
+        for location in [
+            "minecraft:/private/secret.png",
+            "minecraft://server/share.png",
+            "minecraft:textures//private.png",
+            "minecraft:textures/",
+            "minecraft:../secret.png",
+            "minecraft:textures/../../secret.png",
+            "minecraft:textures/./secret.png",
+            "..:secret.png",
+            ".:secret.png",
+            "minecraft:dynamic/../../secret.png",
+            "minecraft:dynamic//lightmap_1",
+            "minecraft:textures/atlas/../../secret.png",
+            "minecraft:textures/atlas//blocks.png",
+            "c:/windows/secret.png",
+            "c:\\windows\\secret.png",
+            "minecraft:\\server\\share.png",
+            "file:///private/secret.png",
+            "minecraft:%2e%2e/secret.png",
+            "minecraft:textures/secret.png:stream",
+            ":textures/secret.png",
+            "minecraft:",
+        ] {
+            let props = Properties::parse(
+                &format!("customTexture.test={location}"),
+                &Macros::standard(),
+            );
+            let (mut textures, notes) = load_textures(&pack, &props);
+            assert!(notes.is_empty(), "{location}: {notes:?}");
+            assert_eq!(
+                textures.len(),
+                1,
+                "exercise resource resolution, not a missing pack file"
+            );
+            let notes = resolve_resources(&mut textures, &|namespace, path| {
+                panic!("invalid location {location:?} reached reader: {namespace:?}:{path:?}");
+            });
+            assert!(
+                textures.is_empty(),
+                "{location} survived for a fallback reader"
+            );
+            assert_eq!(notes.len(), 1, "{location}: {notes:?}");
+            assert!(
+                notes[0].contains("not a resource location"),
+                "{location}: {notes:?}"
+            );
+        }
+        // Valid generated textures stay unresolved for the GPU; no disk reads are needed.
+        let props = Properties::parse(
+            "customTexture.light=minecraft:dynamic/lightmap_1\ncustomTexture.atlas=minecraft:textures/atlas/blocks.png",
+            &Macros::standard(),
+        );
+        let (mut textures, notes) = load_textures(&pack, &props);
+        assert!(notes.is_empty());
+        assert!(
+            resolve_resources(&mut textures, &|_, _| panic!(
+                "generated resource read from disk"
+            ))
+            .is_empty()
+        );
+        assert_eq!(textures.len(), 2);
     }
 }

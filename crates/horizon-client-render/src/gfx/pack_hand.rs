@@ -305,6 +305,27 @@ fn runs(quads: u32, items: &[(u32, i32)]) -> Vec<(u32, u32, i32)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hand_model_view_applies_walking_bob_exactly_once() {
+        let (fov, aspect, far) = (70.0_f32, 16.0 / 9.0, 512.0);
+        let bob = Mat4::from_translation(glam::Vec3::new(0.04, -0.07, 0.0))
+            * Mat4::from_rotation_z(0.035)
+            * Mat4::from_rotation_x(0.02);
+        let rotation = crate::camera::view_matrix(28.0, 17.0);
+        let view = bob * rotation;
+        let hand_projection = projection(fov, aspect, far);
+        let native = Mat4::from_scale(glam::Vec3::new(1.0, 1.0, HAND_DEPTH))
+            * Mat4::perspective_rh_gl(fov.to_radians(), aspect, 0.05, far)
+            * bob
+            * rotation;
+        assert!((hand_projection * view).abs_diff_eq(native, 1e-5));
+        assert!(
+            !(hand_projection * bob * view).abs_diff_eq(native, 1e-4),
+            "double bob should change the regression fixture"
+        );
+        assert!((hand_projection * hand_projection.inverse()).abs_diff_eq(Mat4::IDENTITY, 1e-5));
+    }
+
     /// The arm, then an item whose middle quad is translucent, then a second item: the opaque
     /// quads keep their order first, the translucent one comes after them, and each run keeps
     /// its item's id.

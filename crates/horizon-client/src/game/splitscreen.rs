@@ -8,7 +8,6 @@
 //! (game/screens.rs); the second player leaving the world, the first leaving theirs, or the AirPlay display
 //! going away ends it too.
 use super::{Game, UiResources};
-use crate::game::event_loop::EventLoopCtl;
 use horizon_client::{Result, audio::Audio, hud::HudAtlas};
 use std::time::Instant;
 use winit::{application::ApplicationHandler, event::WindowEvent};
@@ -38,6 +37,8 @@ impl<'a> Game<'a> {
     /// Splitscreen can start: the world is this window's own and on an AirPlay display.
     pub(super) fn splitscreen_available(&self) -> bool {
         !self.splitscreen.guest
+            && !self.options.split_guest
+            && !self.options.paced_by_split
             && self.integrated.is_some()
             && self.pending_save.is_none()
             && self.title.is_none()
@@ -55,9 +56,7 @@ impl<'a> Game<'a> {
         let player = horizon_client::auth::current()
             .map_or_else(|| self.options.player_name(), |a| a.name.clone());
         let name = guest_name(&player);
-        let pipe = server
-            .join_split(&name)
-            .ok_or("the integrated server did not answer")?;
+        let pipe = server.join_splitscreen(horizon_protocol::crypto::offline_uuid(&name))?;
         // A client and nothing else: no control socket, no benchmark, no world of its own to open.
         let mut options = self.options.clone();
         options.control = None;
@@ -72,11 +71,9 @@ impl<'a> Game<'a> {
         // The controller is the first player's.
         settings.controller.enabled = false;
         let vanilla = self.vanilla_root();
-        let root = super::packs::startup_root(
-            &vanilla,
-            &self.settings.resource_packs,
-            &self.server_packs.active,
-        )?;
+        // The GUI and cloned pack must describe the same running generation,
+        // including mods and any selection still waiting for a reload.
+        let root = self.options.resources.clone();
         let mut atlas = HudAtlas::build_over(&root, &vanilla)?;
         atlas.font.uniform = self.settings.force_unicode;
         atlas.font.japanese = self.settings.japanese_glyphs;
@@ -86,7 +83,7 @@ impl<'a> Game<'a> {
         };
         let audio = Audio::silent(&self.options.resources);
         // The resources outlive both games; the second borrows them as the first does.
-        let res = self.resource_source;
+        let res = &self.resource_source;
         let mut guest = Game::new(res, self.pack.clone(), gui, options, settings, audio, None)?;
         guest.splitscreen.guest = true;
         guest.focused = self.focused;
@@ -108,9 +105,7 @@ impl<'a> Game<'a> {
 
     fn end_splitscreen(&mut self) {
         if let Some(server) = &self.integrated {
-            let player = horizon_client::auth::current()
-                .map_or_else(|| self.options.player_name(), |a| a.name.clone());
-            server.leave_split(&guest_name(&player));
+            server.leave_splitscreen();
         }
         self.splitscreen.active = false;
         horizon_airplay::phone_shows_game(false);
@@ -123,6 +118,11 @@ impl<'a> Game<'a> {
     /// Release the memory connection before dropping its renderer and client state.
     pub(super) fn stop_splitscreen(&mut self) {
         if let Some(mut guest) = self.splitscreen_guest.take() {
+            guest.clear_lod();
+            self.retired_far_terrain
+                .append(&mut guest.retired_far_terrain);
+            self.retire_guest_skin_workers(&mut guest);
+            self.retire_guest_culling_workers(&mut guest);
             if let Some(mut remote) = guest.remote.take() {
                 remote.session.disconnect();
             }
@@ -130,11 +130,11 @@ impl<'a> Game<'a> {
         }
     }
 
-    pub(super) fn poll_splitscreen(&mut self, event_loop: &dyn EventLoopCtl) {
+    pub(super) fn poll_splitscreen(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let mut guest = self.splitscreen_guest.take();
         update(self, &mut guest);
         if let Some(second) = &mut guest {
-            second.idle(event_loop);
+            second.about_to_wait(event_loop);
         }
         update(self, &mut guest);
         self.splitscreen_guest = guest;
@@ -155,6 +155,11 @@ pub(super) fn update<'a>(host: &mut Game<'a>, guest: &mut Option<Box<Game<'a>>>)
     {
         // Dropping the guest closes its connection, and the server sees the player leave.
         if let Some(mut second) = guest.take() {
+            second.clear_lod();
+            host.retired_far_terrain
+                .append(&mut second.retired_far_terrain);
+            host.retire_guest_skin_workers(&mut second);
+            host.retire_guest_culling_workers(&mut second);
             if let Some(error) = second.error.take() {
                 log::warn!("Horizon: splitscreen guest: {error}");
             }

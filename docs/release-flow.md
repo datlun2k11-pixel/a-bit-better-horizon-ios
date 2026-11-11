@@ -1,5 +1,7 @@
 # Release flow
 
+> This page includes inherited desktop-engine release automation. For mobile artifacts, use [this fork’s releases](https://github.com/heyskylo/horizon-ios/releases) and [iOS workflow](https://github.com/heyskylo/horizon-ios/actions/workflows/ios.yml); see the [mobile installation guide](../README.md#install-a-build). Desktop workflow and release-label behavior below is upstream reference, not a promise that those jobs run for mobile.
+
 How a change gets from a pull request to players: the checks a pull request passes, how it merges, and the
 automatic releases that follow. Releases are automatic and frequent so the latest Horizon is always playable.
 Since 2026-10-28 Horizon ships only the **Nightly** (Ludovic's decision; the Team proposed it): the batch train builds
@@ -125,7 +127,7 @@ requires `verify` for everyone, and Ludovic's review for the files `.github/CODE
 and ships releases). Branches don't have to be up to date with main: main's own `checks` run catches the rare
 semantic conflict.
 
-**Who merges.** The Horizon Team (GitHub team `horizon-team`: kacpherek, levzzz5154, rdbtCVS, Online5277) and
+**Who merges.** The Horizon Team (GitHub team `horizon-team`: kacpherek, levzzz5154, rdbtCVS, Online5277, dezer-x) and
 Ludovic. The orchestrator's agents prove only the risky pull requests (below), so a contributor's ordinary pull
 request doesn't wait for them.
 
@@ -154,10 +156,10 @@ paths, `lan_e2e`, a screenshot for anything visible) before it merges. Risky mea
 
 Unsure? Add `needs-proof`: it costs a few hours, a broken release costs more.
 
-`parity` becomes required once it has run green on pull requests for a while (a week without a false failure):
+For this mobile fork, choose required status checks from successful runs of its actual iOS workflow in GitHub’s branch rules. Do not require an inherited desktop parity job that the fork does not run. Inspect the mobile workflow’s recent runs with:
 
 ```sh
-gh api -X POST repos/horizon-rust/horizon/branches/main/protection/required_status_checks/contexts -f 'contexts[]=parity / parity'
+gh run list --repo heyskylo/horizon-ios --workflow ios.yml
 ```
 
 A skipped `parity` (a fork's pull request without the label) counts as passed, so requiring it never blocks a
@@ -589,7 +591,7 @@ listed `linux_only` are skipped there (see above). By hand: `gh workflow run "ni
 Releases ship often, so nothing they leave behind may grow without bound.
 
 - **Artifacts:** every upload keeps 3 days (nightly parity logs 7); a release's assets live on the release itself.
-- **Mac runners:** `tools/ci/runner-gc.sh` runs every 6 hours from launchd on the Mac mini, as a copy taken from main
+- **Mac runners:** `tools/ci/runner-gc.sh` runs every 30 minutes from launchd (`StartInterval` 1800) on the Mac mini, as a copy taken from main
   (`~/.actions-runners/runner-gc.sh`, plist `dev.horizon.runner-gc`), never from a pull request's checkout. It skips a
   runner in a job, removes a checkout's cargo build folders past 12 GB (`MAX_TARGET_GB`) and harness work folders
   under `.local/` untouched for 3 days (`STALE_DAYS`), and keeps the 2 newest shared preparations (`KEEP_PREPARED`)
@@ -597,5 +599,9 @@ Releases ship often, so nothing they leave behind may grow without bound.
   (`ORPHAN_HOURS`): parent gone, command line under a runner's checkout or a worktree's `.local/`. `tools/parity.py`
   stops its own harnesses on SIGTERM and SIGHUP (a cancelled job), so these come only from a SIGKILL or a harness run
   by hand. Runner builds go through the machine's sccache (`tools/ci/runner-env.sh`), so what it removes
-  comes back from the cache. Update the copy after changing the script:
-  `ssh macmini 'curl -fsSL https://raw.githubusercontent.com/horizon-rust/horizon/main/tools/ci/runner-gc.sh -o ~/.actions-runners/runner-gc.sh'`.
+  comes back from the cache. It also runs `tools/ci/git-slim.sh` on each idle runner's checkout (the nightly runner's
+  too): actions/checkout switches git's gc off in a persistent checkout and fetches into it at every job, so packs
+  pile up (1051 of them, 111 GB, in one desktop checkout on 2026-11-09). git-slim removes the leftovers of cut-short
+  fetches, collects a `.git` over 5 GB (`MAX_GIT_MB`) with `git gc --prune=now` and folds more than 40 packs
+  (`MAX_PACKS`) into few. Update the copies after changing the scripts (git-slim.sh goes beside runner-gc.sh):
+  `ssh macmini 'cd ~/.actions-runners && for f in runner-gc.sh git-slim.sh; do curl -fsSL https://raw.githubusercontent.com/horizon-rust/horizon/main/tools/ci/$f -o $f; done'`.

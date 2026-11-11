@@ -24,7 +24,7 @@ jobs:
   bench:
     # Our checks runners (label horizon-checks, docs/ci-runners.md): the branch and the base on the same machine, as
     # the comparison needs. SELF_HOSTED_CI=light or off: GitHub's.
-    runs-on: ${{ vars.SELF_HOSTED_CI != 'off' && vars.SELF_HOSTED_CI != 'light' && fromJSON('["self-hosted", "linux", "horizon-checks"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'horizon-rust/horizon' && vars.SELF_HOSTED_CI != 'off' && vars.SELF_HOSTED_CI != 'light' && fromJSON('["self-hosted", "linux", "horizon-checks"]') || 'ubuntu-latest' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -52,7 +52,7 @@ jobs:
           BASE: ${{ inputs.base || 'main' }}
           SCALE: ${{ inputs.scale || '1' }}
         run: |
-          git fetch https://github.com/horizon-rust/horizon.git "$BASE"
+          git fetch -- https://github.com/horizon-rust/horizon.git "$BASE"
           # Our runners keep the folder beside the checkout between jobs.
           git worktree remove --force ../base 2> /dev/null || rm -rf ../base
           git worktree prune
@@ -65,8 +65,10 @@ jobs:
             --example pack_load_bench -- --scale "$SCALE") > base.md \
             || echo "The bench does not build on the base." > base.md
       - name: Summary
+        env:
+          BASE: ${{ inputs.base || 'main' }}
         run: |
           {
             echo "### Branch ($(git rev-parse --short HEAD))"; cat head.md
-            echo; echo "### Base (${{ inputs.base || 'main' }})"; cat base.md
+            echo; echo "### Base ($BASE)"; cat base.md
           } | tee -a "$GITHUB_STEP_SUMMARY"

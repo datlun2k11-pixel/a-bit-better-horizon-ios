@@ -23,8 +23,9 @@ impl Game<'_> {
         let level = ParticleLevel {
             world: &self.world,
             facts: self.res.facts(),
-            collision: self.collision,
+            collision: &self.collision,
             player: None,
+            cached_chunk: std::cell::Cell::new(None),
         };
         self.particles.tick(&level);
     }
@@ -35,7 +36,7 @@ impl Game<'_> {
         self.particles.requested = Some(Vec::new());
         self.player = None;
         assert!(!add(self, &smoke, at, [0.0; 3]), "menu has no client level");
-        self.player = Some(PlayerMotion::new(self.motion, Vec3::new(0.0, 100.0, 0.0))?);
+        self.player = Some(PlayerMotion::new(&self.motion, Vec3::new(0.0, 100.0, 0.0))?);
         for role in [
             ExecutionRole::IntegratedServer,
             ExecutionRole::DedicatedServer,

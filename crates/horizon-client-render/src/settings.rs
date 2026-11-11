@@ -135,7 +135,7 @@ pub struct Settings {
     pub entity_distance: f32,
     pub entity_shadows: bool,
     pub biome_blend: i32,
-    /// "low", "fast", "fancy", "fabulous" or "custom".
+    /// "fast", "fancy", "fabulous" or "custom".
     pub graphics_preset: String,
     pub mipmap_levels: i32,
     pub weather_radius: i32,
@@ -203,12 +203,11 @@ pub struct Settings {
     pub startup_api: crate::graphics::GraphicsApi,
     /// `Monitor.videoModes` of the window's monitor, for the Video page (set by the game).
     pub video_modes: Vec<crate::window::VideoMode>,
+    /// Fullbright is held off: this window plays on another's server (set by the game, not
+    /// saved). The graphics screen hides its row; `extras.fullbright` keeps the choice.
+    pub fullbright_held: bool,
     /// Controller settings (`horizon-controller.txt`, Horizon's own).
     pub controller: crate::gamepad::PadSettings,
-    /// Touch overlay settings (`horizon-touch.txt`, Horizon's own): the active layout.
-    pub touch: crate::touch::TouchSettings,
-    /// The other touch layouts (`touch-layouts/`, Horizon's own).
-    pub touch_profiles: crate::touch::TouchProfiles,
     /// Horizon's optional extras (`horizon-extras.txt`), all off by default.
     pub extras: crate::extras::Extras,
     /// The Horizon mods turned on (`horizon-mods.txt`), all off by default.
@@ -297,9 +296,8 @@ impl Default for Settings {
             horizon: Default::default(),
             startup_api: Default::default(),
             video_modes: Vec::new(),
+            fullbright_held: false,
             controller: Default::default(),
-            touch: Default::default(),
-            touch_profiles: Default::default(),
             extras: Default::default(),
             mods: Default::default(),
             shader_packs: Vec::new(),
@@ -343,6 +341,13 @@ impl Settings {
             .and_then(|mode| self.video_modes.iter().position(|m| *m == mode))
             .map_or(-1, |i| i as i32)
     }
+    /// Loads only the crates' settings stores (`horizon_hooks::settings`) from the files next to
+    /// `path`, into the seat whose turn it is (`horizon_hooks::seat`): a splitscreen player whose
+    /// settings were made from P1's rather than loaded.
+    pub fn load_stores(path: &Path) {
+        let dir = path.parent();
+        horizon_hooks::settings::engine::load(&mut |file| fs::read_to_string(dir?.join(file)).ok());
+    }
     pub fn load(path: &Path) -> Self {
         let mut horizon = path
             .parent()
@@ -368,18 +373,17 @@ impl Settings {
             .and_then(|dir| fs::read_to_string(dir.join(crate::extras::FILE)).ok())
             .unwrap_or_default();
         let mut extras = crate::extras::Extras::parse(&extras_text);
+        // The settings stores of the crates above the engine: their lines of this file, or of
+        // their own (docs/layers.md, "Platform registries").
+        horizon_hooks::settings::engine::load(&mut |file| match path.parent() {
+            _ if file == crate::extras::FILE => Some(extras_text.clone()),
+            Some(dir) => fs::read_to_string(dir.join(file)).ok(),
+            None => None,
+        });
         // The enabled mods are the game folder's, shared by its players (`--player-dir`).
         let mods = path
             .parent()
             .map(|dir| crate::mod_list::ModList::load(&crate::logging::shared_dir(dir)))
-            .unwrap_or_default();
-        let touch = path
-            .parent()
-            .map(crate::touch::TouchSettings::load)
-            .unwrap_or_default();
-        let touch_profiles = path
-            .parent()
-            .map(|dir| crate::touch::TouchProfiles::load(dir, &touch.profile))
             .unwrap_or_default();
         let mut settings = match fs::read(path) {
             Ok(bytes) => {
@@ -390,8 +394,6 @@ impl Settings {
                     controller,
                     extras,
                     mods,
-                    touch,
-                    touch_profiles,
                     ..Self::parse(&text)
                 }
             }
@@ -400,14 +402,16 @@ impl Settings {
                 controller,
                 extras,
                 mods,
-                touch,
-                touch_profiles,
                 ..Self::default()
             },
         };
         // Horizon's own key bindings live in horizon-extras.txt, not in options.txt.
         let emote = settings.extras.emote_key.clone();
         settings.keys.set("key.emote", &emote);
+        // `Options.load`: `sharePresence` decides what the friends service posts.
+        crate::social::set_share_presence(crate::social::SharePresence::of(
+            settings.file.int("sharePresence").clamp(0, 2) as u8,
+        ));
         settings.describe_for_crashes();
         // Options.load: the backend asked for at startup, what a restart is measured from.
         Self {
@@ -514,9 +518,8 @@ impl Settings {
             horizon: Default::default(),
             startup_api: Default::default(),
             video_modes: Vec::new(),
+            fullbright_held: false,
             controller: Default::default(),
-            touch: Default::default(),
-            touch_profiles: Default::default(),
             extras: Default::default(),
             mods: Default::default(),
             shader_packs: Vec::new(),
@@ -679,24 +682,17 @@ impl Settings {
     pub fn with_option(&self, key: &str, value: &str) -> Result<Self, String> {
         let mut file = self.to_file();
         file.set_text(key, value)?;
-        let mut settings = Self {
+        let mut next = Self {
             horizon: self.horizon.clone(),
             controller: self.controller.clone(),
-            touch: self.touch.clone(),
-            touch_profiles: self.touch_profiles.clone(),
             extras: self.extras.clone(),
             mods: self.mods.clone(),
             video_modes: self.video_modes.clone(),
             ..Self::from_file(file)
         };
-        // Options.applyGraphicsPreset: a new preset's own options are applied
-        // at once, as the options screen's slider does (options_ui::set_slider).
-        if key == "graphicsPreset" && settings.graphics_preset != self.graphics_preset {
-            crate::options_ui::apply_preset(&mut settings);
-        }
         // Horizon's own bindings aren't in options.txt.
-        settings.keys.set("key.emote", self.keys.get("key.emote"));
-        Ok(settings)
+        next.keys.set("key.emote", self.keys.get("key.emote"));
+        Ok(next)
     }
     /// The `options.txt` text (Options.save).
     pub fn serialize(&self) -> String {
@@ -710,89 +706,12 @@ impl Settings {
         if let Some(dir) = path.parent() {
             self.horizon.save(dir);
             self.controller.save(dir);
-            self.touch.save(dir);
-            self.touch_profiles.save(dir, &self.touch);
             let mut extras = self.extras.clone();
             extras.emote_key = self.keys.get("key.emote").to_owned();
             extras.save(dir);
+            horizon_hooks::settings::engine::save_own(dir, &[crate::extras::FILE]);
             self.mods.save(&crate::logging::shared_dir(dir));
         }
-    }
-    /// The touch layouts a player can switch to: "Default", then the other names in order.
-    pub fn touch_layout_names(&self) -> Vec<String> {
-        let mut rest: Vec<String> = self
-            .touch_profiles
-            .layouts
-            .keys()
-            .filter(|name| !name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE))
-            .cloned()
-            .collect();
-        if !rest.contains(&self.touch.profile)
-            && !self
-                .touch
-                .profile
-                .eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
-        {
-            rest.push(self.touch.profile.clone());
-        }
-        rest.sort_by_key(|name| name.to_ascii_lowercase());
-        let mut names = vec![crate::touch::DEFAULT_PROFILE.to_owned()];
-        names.append(&mut rest);
-        names
-    }
-    fn touch_layout_taken(&self, name: &str) -> bool {
-        // "Default" is the one every player has: a second one by that name would be a puzzle.
-        name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
-            || name.eq_ignore_ascii_case(&self.touch.profile)
-            || self
-                .touch_profiles
-                .layouts
-                .keys()
-                .any(|used| used.eq_ignore_ascii_case(name))
-    }
-    /// A new touch layout, switched to: the default D-pad arrangement, not a copy of the current
-    /// one, with the one in use kept. `None` when the name is empty, unusable or taken.
-    pub fn create_touch_layout(&mut self, raw: &str) -> Option<String> {
-        let name = raw.trim();
-        if !crate::touch::valid_profile_name(name) || self.touch_layout_taken(name) {
-            return None;
-        }
-        let mut layout = crate::touch::TouchSettings::default();
-        layout.profile = name.to_owned();
-        let previous = std::mem::replace(&mut self.touch, layout);
-        self.touch_profiles
-            .layouts
-            .insert(previous.profile.clone(), previous);
-        Some(name.to_owned())
-    }
-    /// Switch to a kept layout, keeping the one in use; `false` when it is the active one already
-    /// or unknown.
-    pub fn switch_touch_layout(&mut self, name: &str) -> bool {
-        if name.eq_ignore_ascii_case(&self.touch.profile) {
-            return false;
-        }
-        let Some(mut next) = self.touch_profiles.layouts.remove(name).or_else(|| {
-            // A player who moved the active layout's file away still gets the stock one back.
-            name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
-                .then(crate::touch::TouchSettings::default)
-        }) else {
-            return false;
-        };
-        next.profile = name.to_owned();
-        let previous = std::mem::replace(&mut self.touch, next);
-        self.touch_profiles
-            .layouts
-            .insert(previous.profile.clone(), previous);
-        true
-    }
-    /// Forget a kept layout; the one in use and "Default" stay.
-    pub fn delete_touch_layout(&mut self, name: &str) -> bool {
-        if name.eq_ignore_ascii_case(&self.touch.profile)
-            || name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
-        {
-            return false;
-        }
-        self.touch_profiles.layouts.remove(name).is_some()
     }
     /// Volume of a sound source (master excluded).
     pub fn volume(&self, source: &str) -> f32 {
@@ -935,6 +854,7 @@ pub enum Opt {
     /// Horizon's controller settings (`horizon-controller.txt`).
     PadEnabled,
     PadVibration,
+    PadPlayInBackground,
     PadAdaptiveTriggers,
     PadLightbar,
     PadLookSensitivity,
@@ -944,24 +864,24 @@ pub enum Opt {
     PadRepeatInterval,
     PadInvertX,
     PadInvertY,
+    PadCraftOnServers,
     PadToggleSneak,
     PadMoveDeadzone,
     PadLookDeadzone,
     PadTriggerThreshold,
     PadGlyphs,
+    /// A Nintendo pad's face buttons by place or by letter (`PadSettings::nintendo_letters`).
+    PadNintendoButtons,
     PadKeyboard,
-    /// Horizon's touch overlay settings (`horizon-touch.txt`).
-    TouchOpacity,
-    TouchScale,
-    /// Whether a button of the touch overlay is shown.
-    TouchShow(crate::touch::Control),
-    /// The D-pad, or the analog stick that replaces it.
-    TouchStick,
-    /// The analog stick's own size and opacity.
-    TouchStickScale,
-    TouchStickOpacity,
+    PadGameplayGuide,
+    /// The radial menu's opener held or pressed once (`PadSettings::radial_mode`).
+    PadRadialMode,
+    /// The stick the radial menu selects with (`PadSettings::radial_stick`).
+    PadRadialStick,
     /// `options.modelPart.*`: one skin layer (index into `options_file::MODEL_PARTS`).
     ModelPart(usize),
+    /// A slider of a page a crate registered (`horizon_hooks::pages`): (page, row).
+    Page(usize, usize),
     /// 3D skin layers: the player's outer layer as extruded slabs.
     SkinLayers3d,
     MainHand,
@@ -986,43 +906,6 @@ pub enum Opt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn touch_layouts_are_created_from_the_default_and_swapped() {
-        let mut s = Settings::default();
-        s.touch.set_placement(crate::touch::Control::Jump, 0.25, 0.6);
-        let default = s.touch.clone();
-        // A new layout is the default D-pad arrangement, and becomes the active one.
-        assert_eq!(s.create_touch_layout("pvp").as_deref(), Some("pvp"));
-        assert_eq!(s.touch.profile, "pvp");
-        assert_eq!(
-            s.touch.placements.len(),
-            0,
-            "not a copy of the layout in use"
-        );
-        assert_eq!(s.touch_profiles.layouts["Default"], default);
-        // Editing it, then going back, keeps both layouts.
-        s.touch.set_placement(crate::touch::Control::Forward, 0.1, 0.1);
-        assert_eq!(
-            s.touch_layout_names(),
-            [crate::touch::DEFAULT_PROFILE.to_owned(), "pvp".to_owned()]
-        );
-        assert!(s.switch_touch_layout(crate::touch::DEFAULT_PROFILE));
-        assert_eq!(s.touch, default);
-        assert!(s.switch_touch_layout("pvp"));
-        assert!(s.touch.placements.contains_key(&crate::touch::Control::Forward));
-        // Names must be new, whatever their case, and usable as files.
-        assert_eq!(s.create_touch_layout("PVP"), None);
-        assert_eq!(s.create_touch_layout("Default"), None);
-        assert_eq!(s.create_touch_layout("bad/name"), None);
-        assert_eq!(s.create_touch_layout(""), None);
-        // The one in use and Default cannot be forgotten; another kept one can.
-        assert!(!s.delete_touch_layout("pvp"));
-        assert!(!s.delete_touch_layout(crate::touch::DEFAULT_PROFILE));
-        assert!(s.switch_touch_layout(crate::touch::DEFAULT_PROFILE));
-        assert!(s.delete_touch_layout("pvp"));
-        assert!(!s.switch_touch_layout("pvp"));
-        assert_eq!(s.touch_layout_names(), [crate::touch::DEFAULT_PROFILE]);
-    }
     #[test]
     fn the_narrator_reads_its_status_and_the_voice_under_master() {
         let s = Settings::parse("narrator:2\nsoundCategory_master:0.5\nsoundCategory_voice:0.5\n");
@@ -1232,32 +1115,13 @@ mod tests {
         s.extras.minimap = true;
         s.horizon.fog = !s.horizon.fog;
         s.controller.vibration = !s.controller.vibration;
-        s.touch.opacity = 0.5;
         let set = s.with_option("fov", "90").unwrap();
         assert_eq!(set.fov, 90.0);
         assert_eq!(set.mods, s.mods);
         assert_eq!(set.extras, s.extras);
         assert_eq!(set.horizon, s.horizon);
         assert_eq!(set.controller, s.controller);
-        assert_eq!(set.touch, s.touch);
         assert!(s.with_option("fov", "200").is_err());
-    }
-    #[test]
-    fn setting_the_graphics_preset_applies_its_options() {
-        let mut s = Settings::parse("graphicsPreset:custom\n");
-        s.graphics_preset = "custom".into();
-        s.render_distance = 16;
-        let low = s.with_option("graphicsPreset", "low").unwrap();
-        assert_eq!(low.graphics_preset, "low");
-        assert_eq!(low.render_distance, 6);
-        assert_eq!(low.simulation_distance, 5);
-        // The same preset again is not a change (Options' listener only runs then).
-        let same = low.with_option("graphicsPreset", "low").unwrap();
-        assert_eq!(same.render_distance, 6);
-        // Custom closes the preset: it applies nothing.
-        let custom = low.with_option("graphicsPreset", "custom").unwrap();
-        assert_eq!(custom.graphics_preset, "custom");
-        assert_eq!(custom.render_distance, 6);
     }
     #[test]
     fn gui_scale_survives_temporary_small_framebuffer() {

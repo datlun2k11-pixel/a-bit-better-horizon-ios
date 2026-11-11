@@ -139,7 +139,10 @@ pub fn durability(damage: u32, max: u32, mode: Durability) -> Option<String> {
     let left = max.saturating_sub(damage);
     Some(match mode {
         Durability::Number => left.to_string(),
-        Durability::Percent => format!("{}%", (left * 100 + max / 2) / max),
+        Durability::Percent => format!(
+            "{}%",
+            (u64::from(left) * 100 + u64::from(max) / 2) / u64::from(max)
+        ),
     })
 }
 /// The colour of a durability text: `ItemStack.getBarColor`'s hue, green full to red empty.
@@ -196,6 +199,9 @@ impl Combo {
                 .is_some_and(|(t, at)| t == id && now - at <= Self::CONFIRM),
         };
         if confirmed {
+            // Network events continue while the widget is disabled. Expiry
+            // must not depend on a previous frame having queried count().
+            self.count(now);
             self.target = None;
             self.count += 1;
             self.last_hit = now;
@@ -580,6 +586,24 @@ mod tests {
     }
 
     #[test]
+    fn large_durability_percentages_do_not_overflow() {
+        for max in [i32::MAX as u32, u32::MAX] {
+            assert_eq!(
+                durability(0, max, Durability::Percent).as_deref(),
+                Some("100%")
+            );
+            assert_eq!(
+                durability(max / 2, max, Durability::Percent).as_deref(),
+                Some("50%")
+            );
+            assert_eq!(
+                durability(max, max, Durability::Percent).as_deref(),
+                Some("0%")
+            );
+        }
+    }
+
+    #[test]
     fn combos_count_confirmed_hits_until_this_player_is_hurt() {
         let mut c = Combo::default();
         c.attacked(7, 0.0);
@@ -609,6 +633,24 @@ mod tests {
         c.attacked(7, 8.5);
         c.hurt(7, Some(false), 8.6);
         assert_eq!(c.count(8.7), 1);
+    }
+
+    #[test]
+    fn combo_timeout_does_not_require_the_widget_to_be_drawn() {
+        let mut c = Combo::default();
+        c.hurt(7, Some(true), 0.0);
+        // No count() call while the widget is off, or while frames are suspended.
+        c.hurt(7, Some(true), 10.0);
+        assert_eq!(c.count(10.0), 1, "the old combo expired before this hit");
+        c.hurt(7, Some(true), 11.0);
+        assert_eq!(c.count(11.0), 2);
+        c.attacked(7, 20.0);
+        c.hurt(7, None, 20.0);
+        assert_eq!(
+            c.count(20.0),
+            1,
+            "the untagged confirmation path expires too"
+        );
     }
 
     #[test]

@@ -36,7 +36,9 @@ fn takes_terrain(programs: &[&str]) -> Option<(bool, bool)> {
         ..Default::default()
     };
     let post = horizon_shaders::load_post(&pack, "", &properties, &macros, &inputs);
-    let post = gpu.try_build(post).ok()?;
+    let post = gpu
+        .try_build(post)
+        .expect("undrawn-terrain fixture must build");
     Some((post.has_terrain(), post.has_water()))
 }
 

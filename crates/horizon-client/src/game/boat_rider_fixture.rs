@@ -24,7 +24,7 @@ impl Game<'_> {
         let (client, peer) = Pipe::pair();
         self.connect_local(client, "BoatSeatFixture")?;
         self.remote.as_mut().unwrap().entity_id = 1;
-        self.player = Some(PlayerMotion::new(self.motion, Vec3::new(0.0, 100.0, 0.0))?);
+        self.player = Some(PlayerMotion::new(&self.motion, Vec3::new(0.0, 100.0, 0.0))?);
 
         let mut output = Vec::new();
         for case in cases {

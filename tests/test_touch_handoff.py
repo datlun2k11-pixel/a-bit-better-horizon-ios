@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from test_mobile_command_keyboard import method as production_method
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,48 +23,44 @@ class TouchHandoffTests(unittest.TestCase):
         fixture = r'''
 #![allow(dead_code)]
 use std::time::Instant;
-mod keybinds {
-    use winit::event::MouseButton;
-    use winit::keyboard::KeyCode;
-    pub struct DisplayName;
-    impl DisplayName { pub fn plain(self) -> String { String::new() } }
-    pub fn key_code(_: &str) -> Option<KeyCode> { None }
-    pub fn mouse_button(_: &str) -> Option<MouseButton> { None }
-    pub fn display_name(_: &str) -> DisplayName { DisplayName }
-}
 #[path = "TOUCH_SOURCE"] mod touch;
 #[path = "MODE_SOURCE"] mod input_mode;
-use touch::{Control, Out, Touches};
+use touch::{Control, Out, Touches, MenuGesture, MenuMode};
 type Result<T> = std::result::Result<T, std::convert::Infallible>;
-struct ActiveEventLoop;
+trait EventLoopCtl {}
+struct ActiveEventLoop; impl EventLoopCtl for ActiveEventLoop {}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TouchPhase { Started, Moved, Ended, Cancelled }
 struct Point { x: f64, y: f64 }
 struct Touch { id: u64, phase: TouchPhase, location: Point }
 struct Batch { scale: f32, width: f32, height: f32 }
-struct MenuFinger { id: u64, pressed: bool, closed: bool }
+#[derive(Clone,Copy,PartialEq,Eq)]enum MenuTarget { Pointer }
+struct MenuFinger { id: u64, gesture: MenuGesture, target: MenuTarget }
 #[derive(Default)]
 struct TouchInput { seen: bool, hardware: input_mode::InputMode,
     menu: Option<MenuFinger>, fingers: Touches }
-#[derive(Default)]
-struct Settings { touch: touch::TouchSettings }
-struct Game { touch: TouchInput, last_input: Instant, playing: bool,
-    settings: Settings,
+#[derive(Default)]struct Pad{in_use:bool}
+#[derive(Default)]struct EmoteWheel{controller:Option<()>}
+struct Game { emote_wheel:EmoteWheel,pad:Pad,touch: TouchInput, last_input: Instant, playing: bool,
     actions: Vec<Out>, buttons: Vec<bool>, menu_calls: usize }
 mod horizon_gamecontroller { pub fn keyboard_connected() -> bool { true } }
 impl Game {
+ fn menu_input_blocked(&self)->bool{false}
+ fn cancel_touch_for_reload(&mut self){panic!("no reload in handoff fixture");}
     fn new(playing: bool, pressed: bool) -> Self {
-        Self { touch: TouchInput { menu: Some(MenuFinger { id: 1, pressed, closed: false }),
+        let mut gesture=MenuGesture::new((0.0,0.0),MenuMode::Drag);
+        if pressed { gesture.frame(); gesture.frame(); }
+        Self { emote_wheel:EmoteWheel::default(),pad:Pad::default(),touch: TouchInput { menu: Some(MenuFinger { id: 1, gesture, target: MenuTarget::Pointer }),
             ..TouchInput::default() }, last_input: Instant::now(), playing,
-            settings: Settings::default(),
             actions: vec![], buttons: vec![], menu_calls: 0 }
     }
+    fn pad_cancel_inputs(&mut self,_:&dyn EventLoopCtl){panic!("no controller was active in this menu-gesture probe");}
     fn touch_batch(&self) -> Option<Batch> { Some(Batch { scale: 2.0, width: 500.0, height: 300.0 }) }
     fn touch_now(&mut self) -> f64 { 0.0 }
     fn touch_playing(&self) -> bool { self.playing }
-    fn touch_menu(&mut self, _: &ActiveEventLoop, _: u64, _: TouchPhase, _: (f32,f32)) { self.menu_calls += 1; }
-    fn touch_button(&mut self, _: &ActiveEventLoop, down: bool) { self.buttons.push(down); }
-    fn touch_act(&mut self, _: &ActiveEventLoop, actions: Vec<Out>, _: f32) -> Result<()> { self.actions.extend(actions); Ok(()) }
+    fn touch_menu(&mut self, _: &dyn EventLoopCtl, _: u64, _: TouchPhase, _: (f32,f32)) { self.menu_calls += 1; }
+    fn touch_button(&mut self, _: &dyn EventLoopCtl, down: bool) { self.buttons.push(down); }
+    fn touch_act(&mut self, actions: Vec<Out>, _: f32) -> Result<()> { self.actions.extend(actions); Ok(()) }
 METHODS
 }
 fn event(id: u64, phase: TouchPhase, at: (f32,f32)) -> Touch {
@@ -113,33 +110,16 @@ fn cancelled_menu_finger_releases_without_delayed_press() {
     }
 }
 '''
-        # The module's own unit tests need the real keybinds table; the dispatcher does not.
-        touch_source = (ROOT / "crates/horizon-client-render/src/touch.rs").read_text()
-        touch_source = touch_source.split("\n#[cfg(test)]", 1)[0] + "\n"
+        fixture = fixture.replace("TOUCH_SOURCE", str(ROOT / "crates/horizon-client/src/touch.rs"))
         fixture = fixture.replace("MODE_SOURCE", str(ROOT / "crates/horizon-client/src/game/input_mode.rs"))
         fixture = fixture.replace("METHODS", "\n".join(method(name) for name in (
-            "touch_event", "touch_release_menu", "touch_keyboard_used")))
+            "touch_event", "touch_release_menu", "touch_keyboard_used")) + "\n" + production_method(
+                (ROOT / "crates/horizon-client/src/game/pad.rs").read_text(), "pad_yield_input") + "\n" + production_method(
+                (ROOT / "crates/horizon-client/src/game/emote_wheel.rs").read_text(), "cancel_emote_controller"))
         with tempfile.TemporaryDirectory(prefix="horizon-touch-handoff-") as folder:
             folder = Path(folder)
-            (folder / "touch_source.rs").write_text(touch_source)
-            (folder / "fixture.rs").write_text(
-                fixture.replace("TOUCH_SOURCE", str(folder / "touch_source.rs")))
-            (folder / "winit_stub.rs").write_text(
-                "pub mod event {\n"
-                "    #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n"
-                "    pub enum MouseButton { Left, Right, Middle, Back, Forward, Other(u16) }\n"
-                "}\n"
-                "pub mod keyboard {\n"
-                "    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]\n"
-                "    pub enum KeyCode { KeyA, KeyF }\n"
-                "}\n")
-            stub = subprocess.run(["rustc", "--edition=2024", "--crate-type", "lib",
-                                   "--crate-name", "winit", str(folder / "winit_stub.rs"),
-                                   "-o", str(folder / "libwinit.rlib")],
-                                  capture_output=True, text=True)
-            self.assertEqual(stub.returncode, 0, stub.stdout + stub.stderr)
+            (folder / "fixture.rs").write_text(fixture)
             build = subprocess.run(["rustc", "--edition=2024", "--test", str(folder / "fixture.rs"),
-                                    "--extern", f"winit={folder / 'libwinit.rlib'}",
                                     "-o", str(folder / "probe")], capture_output=True, text=True)
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
             run = subprocess.run([str(folder / "probe")], capture_output=True, text=True)

@@ -18,7 +18,7 @@
 //! Composite-style programs draw one quad from (0,0) to (1,1) with an identity model-view and an
 //! orthographic projection onto it, the texture coordinate equal to the position (OQ-6).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use naga::ShaderStage;
@@ -37,15 +37,19 @@ mod image_parameters;
 mod integer_bounds;
 mod interface_blocks;
 mod ordering;
+mod reachability;
 mod rewrite;
 mod scan;
+mod varyings;
 
 pub use geometry::{GeometryInputs, translate_geometry};
 
 use scan::Stage;
+#[cfg(test)]
+use varyings::{struct_parts, varying_parts};
 
 /// What a program's stages need from the game.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Interface {
     /// The uniform block at binding 0: its size and each value's name, GLSL type and offset.
     /// Ours come first: `hz_target` (the target's width, height, 1/width, 1/height), and the
@@ -88,6 +92,7 @@ pub struct Image {
 /// A compute program (`deferred4_a.csh`): its module, what it reads and writes, and how many
 /// work groups it runs: `workGroups`, or `workGroupsRender` times the target's size over the
 /// local size (1, 1 when neither is set).
+#[derive(Clone)]
 pub struct ComputeProgram {
     pub module: naga::Module,
     pub interface: Interface,
@@ -131,6 +136,7 @@ pub struct Error {
     pub message: String,
 }
 
+#[derive(Clone)]
 pub struct Program {
     pub vertex: naga::Module,
     pub fragment: naga::Module,
@@ -146,6 +152,31 @@ pub enum Target {
     Buffers,
     /// The window (`final`).
     Window,
+}
+
+/// Terrain vertex-colour policy selected by the pack's documented rendering settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainLighting {
+    pub old_lighting: bool,
+    pub separate_ao: bool,
+    /// Ambient-occlusion strength, from zero to one.
+    pub ao_strength: f32,
+}
+
+impl Default for TerrainLighting {
+    fn default() -> Self {
+        Self {
+            old_lighting: true,
+            separate_ao: false,
+            ao_strength: 1.0,
+        }
+    }
+}
+
+fn terrain_lighting_constants(policy: Option<TerrainLighting>) -> String {
+    policy.map_or_else(String::new, |policy| format!(
+        "const bool hz_old_lighting = {};\nconst bool hz_separate_ao = {};\nconst float hz_ao_strength = {:?};\n",
+        policy.old_lighting, policy.separate_ao, policy.ao_strength))
 }
 
 /// What a gbuffers-style program's vertex stage reads. The game writes it: it knows its vertex
@@ -166,6 +197,8 @@ pub struct GbuffersInputs {
     /// The alpha test applied to output 0 (`gl_FragData[0]`, `gl_FragColor`), the loader's
     /// (3.2 `alphaTest.<program>`): `None` keeps every fragment.
     pub alpha_test: Option<AlphaTest>,
+    /// Terrain-only lighting policy, supplied by the renderer.
+    pub terrain_lighting: Option<TerrainLighting>,
     /// The program may read `currentRenderedItemId` without declaring it, as Iris 1.11.7
     /// lets the hand's (observed with probe packs; terrain's may not).
     pub item_id_declared: bool,
@@ -173,7 +206,25 @@ pub struct GbuffersInputs {
     /// `gl_FragDepth`, while `gl_FragCoord.z` stays the geometry's own: the sky shows only where
     /// nothing else drew, and reads its own depth as in Iris 1.11.7.
     pub far_depth: bool,
+    /// `normals` and `specular` are bound as paged maps of the atlas `texture` reads
+    /// (`horizon-client-render`'s `paged_maps.rs`), not as images of its layout: the program's
+    /// texture calls on them read through `hz_pagedTexture`.
+    pub paged_maps: bool,
+    /// Translucent terrain: a fragment behind the boats' water patches (`horizonWaterMask`, the
+    /// patches' depth, 1 where there are none) is discarded, so no water shows inside a hull
+    /// (`RenderTypes.waterMask`), while the frame's depth stays the pack's own.
+    pub water_mask: bool,
+    /// The shadow pass's translucent terrain: a fragment inside a boat's water patch
+    /// (`horizonWaterPatch*`, camera-relative boxes) is discarded, so no water casts its light
+    /// into a hull. Not with a geometry stage.
+    pub water_patches: bool,
 }
+
+/// The sampler of the boats' water patches' depth (`GbuffersInputs::water_mask`).
+pub const WATER_MASK: &str = "horizonWaterMask";
+
+/// How many boats' water patches the shadow pass keeps water out of (`GbuffersInputs::water_patches`).
+pub const WATER_PATCHES: usize = 16;
 
 /// A fragment stays when its output 0's alpha compares to `reference` as `op` says (a GLSL
 /// comparison operator, `true` for GL's `ALWAYS`, `false` for `NEVER`).
@@ -248,6 +299,20 @@ const GBUFFERS_MATRICES: &str = "    hz_ModelViewMatrix = gbufferModelView;\n   
      mat4 hz_light = mat4(vec4(1.0 / 256.0, 0.0, 0.0, 0.0), vec4(0.0, 1.0 / 256.0, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(1.0 / 32.0, 1.0 / 32.0, 0.0, 1.0));\n    \
      hz_TextureMatrix = mat4[8](mat4(1.0), hz_light, hz_light, mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0), mat4(1.0));\n";
 
+/// `pp` with `declaration` after its leading directives (`#version`, `#extension`...).
+fn with_declaration(pp: &Preprocessed, declaration: &str) -> Preprocessed {
+    let mut at = 0;
+    for line in pp.code.split_inclusive('\n') {
+        let t = line.trim_start();
+        if !(t.is_empty() || t.starts_with('#')) {
+            break;
+        }
+        at += line.len();
+    }
+    let code = format!("{}{declaration}\n{}", &pp.code[..at], &pp.code[at..]);
+    Preprocessed { code, ..pp.clone() }
+}
+
 /// Whether `code` names `name` (a whole identifier).
 fn uses_name(code: &str, name: &str) -> bool {
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
@@ -267,19 +332,10 @@ fn translate(
     } else {
         GBUFFERS_MATRICES.to_owned()
     };
-    // Struct types without a name get one (`anonymous_structs`), interface blocks travel
-    // as plain varyings (`interface_blocks`), and buffer vectors that atomic functions use by
-    // component become arrays (`atomic_vectors`).
-    let flat = |pp: &Preprocessed| {
-        let named = anonymous_structs::name(&pp.code);
-        let code = named.as_deref().unwrap_or(&pp.code);
-        let flat = interface_blocks::flatten(code)
-            .or(named)
-            .map(|code| Preprocessed { code, ..pp.clone() });
-        let split = atomic_vectors::rewrite(flat.as_ref().unwrap_or(pp));
-        split.or(flat)
-    };
-    let (vertex_flat, fragment_flat) = (flat(vertex), flat(fragment));
+    let (vertex_flat, fragment_flat) = (
+        reachability::prepare(vertex),
+        reachability::prepare(fragment),
+    );
     let vertex = vertex_flat.as_ref().unwrap_or(vertex);
     let fragment = fragment_flat.as_ref().unwrap_or(fragment);
     // A `bool` member of a storage buffer travels as a `uint` (`buffer_bools`).
@@ -289,10 +345,40 @@ fn translate(
     );
     let vertex = vertex_bools.as_ref().unwrap_or(vertex);
     let fragment = fragment_bools.as_ref().unwrap_or(fragment);
+    // The boats' water patches' depth, read by our `main` (`GbuffersInputs::water_mask`).
+    let masked = gbuffers
+        .filter(|g| g.water_mask)
+        .map(|_| with_declaration(fragment, &format!("uniform sampler2D {WATER_MASK};")));
+    let fragment = masked.as_ref().unwrap_or(fragment);
+    // The boats' water patches (`GbuffersInputs::water_patches`): the vertex's camera-relative
+    // place to the fragment, and the patches' boxes.
+    let patches = gbuffers.is_some_and(|g| g.water_patches);
+    let varying = |pp: &Preprocessed, dir: &str| {
+        let old = pp.version.as_ref().is_none_or(|(v, _)| *v < 130);
+        format!(
+            "{} vec3 horizonPatchPos;",
+            if old { "varying" } else { dir }
+        )
+    };
+    let patch_vertex = patches.then(|| with_declaration(vertex, &varying(vertex, "out")));
+    let vertex = patch_vertex.as_ref().unwrap_or(vertex);
+    let patch_fragment = patches.then(|| {
+        let uniforms: String = std::iter::once("uniform int horizonWaterPatchCount;".to_owned())
+            .chain((0..2 * WATER_PATCHES).map(|k| format!("uniform vec4 horizonWaterPatch{k};")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        with_declaration(
+            fragment,
+            &format!("{}\n{uniforms}", varying(fragment, "in")),
+        )
+    });
+    let fragment = patch_fragment.as_ref().unwrap_or(fragment);
     let mut v = Stage::scan(vertex, ShaderStage::Vertex);
     let mut f = Stage::scan(fragment, ShaderStage::Fragment);
     v.gbuffers = gbuffers.is_some();
     f.gbuffers = gbuffers.is_some();
+    v.paged_maps = gbuffers.is_some_and(|g| g.paged_maps);
+    f.paged_maps = v.paged_maps;
     let mut errors: Vec<Error> = v
         .errors
         .drain(..)
@@ -405,57 +491,13 @@ fn translate(
             binding: 1 + 2 * i as u32,
         })
         .collect();
-    let images = bind_images([&v, &f], samplers.len());
+    let images = bind_images([&v, &f], samplers.len())?;
 
-    // Varyings by name: the vertex outputs, then fragment inputs the vertex stage lacks. A
-    // matrix or array travels as one varying per column or element (`varying_parts`), a
-    // struct as its members packed into vectors (`struct_parts`).
-    let mut locations: BTreeMap<String, (u32, String)> = BTreeMap::new();
-    let mut split: BTreeMap<String, (String, Vec<(String, String)>)> = BTreeMap::new();
-    let vars = v.outs.iter().map(|o| (&v, o));
-    for (stage, var) in vars.chain(f.ins.iter().map(|i| (&f, i))) {
-        if locations.contains_key(&var.name) || split.contains_key(&var.name) {
-            continue;
-        }
-        if var.structure {
-            match struct_parts(&var.decl, &stage.structs) {
-                Some(parts) => {
-                    let mut copies = Vec::new();
-                    for (k, (decl, members)) in parts.into_iter().enumerate() {
-                        let part = format!("hz_v_{}_{k}", var.name);
-                        let next = locations.len() as u32;
-                        locations.insert(part.clone(), (next, decl));
-                        for (swizzle, access) in members {
-                            copies.push((format!("{part}{swizzle}"), access));
-                        }
-                    }
-                    split.insert(var.name.clone(), (String::new(), copies));
-                }
-                None => errors.push(Error {
-                    file: stage.pp.files.first().cloned().unwrap_or_default(),
-                    line: 0,
-                    message: format!("`{}`: this struct can't be a varying", var.name),
-                }),
-            }
-            continue;
-        }
-        match varying_parts(&var.decl) {
-            Some((global, parts)) => {
-                let mut copies = Vec::new();
-                for (k, (decl, access)) in parts.into_iter().enumerate() {
-                    let part = format!("hz_v_{}_{k}", var.name);
-                    let next = locations.len() as u32;
-                    locations.insert(part.clone(), (next, decl));
-                    copies.push((part, access));
-                }
-                split.insert(var.name.clone(), (global, copies));
-            }
-            None => {
-                let next = locations.len() as u32;
-                locations.insert(var.name.clone(), (next, var.decl.clone()));
-            }
-        }
-    }
+    let varyings::Varyings {
+        locations,
+        split,
+        private,
+    } = varyings::assign(&v, &f, &mut errors);
 
     // Terrain's fade input is supplied without a pack declaration. Inject it only when
     // the renderer provides the actual value; other geometry and authored globals keep
@@ -465,6 +507,9 @@ fn translate(
         .filter(|_| uses_name(&vertex.code, "mc_chunkFade") && !v.globals.contains("mc_chunkFade"));
     let header = |stage: &Stage| {
         let mut h = resources(&uniforms, &samplers, &images);
+        h.push_str(&terrain_lighting_constants(
+            gbuffers.and_then(|g| g.terrain_lighting),
+        ));
         if let Some(reference) = alpha_test_ref {
             writeln!(h, "const float alphaTestRef = {reference:?};").unwrap();
         }
@@ -489,6 +534,11 @@ fn translate(
         }
         for (name, (global, _)) in split.iter().filter(|(_, (g, _))| !g.is_empty()) {
             writeln!(h, "{}", global.replace("@", name)).unwrap();
+        }
+        if stage.kind == ShaderStage::Vertex {
+            for decl in &private {
+                writeln!(h, "{decl}").unwrap();
+            }
         }
         if let (Some(inputs), ShaderStage::Vertex) = (gbuffers, stage.kind) {
             h.push_str(&inputs.declarations);
@@ -534,6 +584,9 @@ fn translate(
         writeln!(vertex_main, "    {name} = hz_init_{name}();").unwrap();
     }
     vertex_main.push_str("    hz_main();\n");
+    if patches {
+        vertex_main.push_str("    horizonPatchPos = hz_Vertex.xyz;\n");
+    }
     // A struct's own declaration is the pack's: only a stage that declares it copies it.
     let declared = |list: &[scan::Var], name: &str, global: &str| {
         !global.is_empty() || list.iter().any(|var| var.name == name)
@@ -577,6 +630,42 @@ fn translate(
     if gbuffers.is_some_and(|g| g.far_depth) {
         fragment_main.push_str("    gl_FragDepth = 1.0;\n");
     }
+    // Inside a boat's water patch (`GbuffersInputs::water_patches`): each box is a corner and
+    // its y range, then its two horizontal edges; water there, a little below and above (waves),
+    // casts nothing. Direct unrolled checks avoid local array allocations and spilling (#14782).
+    if patches {
+        fragment_main.push_str("    if (horizonWaterPatchCount > 0) {\n        vec2 hz_p = horizonPatchPos.xz;\n        float hz_y = horizonPatchPos.y;\n");
+        for k in 0..WATER_PATCHES {
+            let (a, b) = (2 * k, 2 * k + 1);
+            let prefix = if k == 0 {
+                String::new()
+            } else {
+                format!("if (horizonWaterPatchCount > {k}) ")
+            };
+            writeln!(
+                fragment_main,
+                "        {prefix}{{\n            \
+                 vec2 hz_d = hz_p - horizonWaterPatch{a}.xy;\n            \
+                 float hz_s = dot(hz_d, horizonWaterPatch{b}.xy) / max(dot(horizonWaterPatch{b}.xy, horizonWaterPatch{b}.xy), 1e-6);\n            \
+                 float hz_t = dot(hz_d, horizonWaterPatch{b}.zw) / max(dot(horizonWaterPatch{b}.zw, horizonWaterPatch{b}.zw), 1e-6);\n            \
+                 if (hz_s >= 0.0 && hz_s <= 1.0 && hz_t >= 0.0 && hz_t <= 1.0\n                \
+                 && hz_y >= horizonWaterPatch{a}.z - 0.5 && hz_y <= horizonWaterPatch{a}.w + 0.25) {{ discard; }}\n        }}"
+            )
+            .unwrap();
+        }
+        fragment_main.push_str("    }\n");
+    }
+    // Behind a boat's water patch, within 3% of its distance (the water's surface lies at the
+    // patch, and packs wave it): no water there. Depth 1 is no patch.
+    if gbuffers.is_some_and(|g| g.water_mask) {
+        writeln!(
+            fragment_main,
+            "    float hz_mask = texelFetch(sampler2D({WATER_MASK}, hz_s_{WATER_MASK}), ivec2(gl_FragCoord.xy), 0).r;\n    \
+             if (textureSize(sampler2D({WATER_MASK}, hz_s_{WATER_MASK}), 0).x > 1 && hz_mask < 1.0\n        \
+             && gl_FragCoord.z > hz_mask - 0.03 * (1.0 - hz_mask)) {{ discard; }}"
+        )
+        .unwrap();
+    }
     fragment_main.push_str("    hz_main();\n");
     for copy in &f.out_copies {
         writeln!(fragment_main, "    {copy}").unwrap();
@@ -613,8 +702,11 @@ fn translate(
     }
     let vertex_module = compile(&v, &v_text, header(&v).lines().count());
     let fragment_module = compile(&f, &f_text, header(&f).lines().count());
-    let (vertex, fragment) = match (vertex_module, fragment_module) {
-        (Ok(v), Ok(f)) => (v, f),
+    let (vertex, fragment, used) = match (vertex_module, fragment_module) {
+        (Ok((v, mut used)), Ok((f, fragment_used))) => {
+            used.extend(fragment_used);
+            (v, f, used)
+        }
         (a, b) => return Err(a.err().into_iter().chain(b.err()).flatten().collect()),
     };
     let (initial_values, notes) = defaults::merge([(&v, &vertex), (&f, &fragment)])?;
@@ -635,7 +727,14 @@ fn translate(
         })
         .collect();
     let outputs = f.outputs.iter().copied().collect();
-    let mut images = images;
+    let samplers = samplers
+        .into_iter()
+        .filter(|s| used.contains(&s.binding))
+        .collect();
+    let mut images: Vec<_> = images
+        .into_iter()
+        .filter(|i| used.contains(&i.binding))
+        .collect();
     mark_atomic(&vertex, &mut images);
     mark_atomic(&fragment, &mut images);
     Ok(Program {
@@ -675,14 +774,35 @@ fn mark_atomic(module: &naga::Module, images: &mut [Image]) {
 }
 
 /// The images of `stages`, by name, bound after `samplers` samplers.
-fn bind_images(stages: [&Stage; 2], samplers: usize) -> Vec<Image> {
+fn bind_images(stages: [&Stage; 2], samplers: usize) -> Result<Vec<Image>, Vec<Error>> {
     let mut images: BTreeMap<String, scan::ImageDecl> = BTreeMap::new();
     for stage in stages {
         for i in &stage.images {
-            images.entry(i.name.clone()).or_insert_with(|| i.clone());
+            match images.entry(i.name.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(i.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let old = entry.get_mut();
+                    if old.ty != i.ty || old.format != i.format {
+                        return Err(vec![Error {
+                            file: stage.pp.files.first().cloned().unwrap_or_default(),
+                            line: 0,
+                            message: format!(
+                                "`{}`: image type or format differs between stages",
+                                i.name
+                            ),
+                        }]);
+                    }
+                    if old.access != i.access {
+                        old.access.clear();
+                    }
+                    old.coherent |= i.coherent;
+                }
+            }
         }
     }
-    images
+    Ok(images
         .into_values()
         .enumerate()
         .map(|(k, i)| Image {
@@ -693,7 +813,7 @@ fn bind_images(stages: [&Stage; 2], samplers: usize) -> Vec<Image> {
             binding: 1 + 2 * samplers as u32 + k as u32,
             before: None,
         })
-        .collect()
+        .collect())
 }
 
 /// `#version 450`, the uniform block at binding 0, each sampler as a texture and a sampler
@@ -767,8 +887,53 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
             binding: 1 + 2 * i as u32,
         })
         .collect();
-    let mut images = bind_images([&c, &c], samplers.len());
+    let mut images = bind_images([&c, &c], samplers.len())?;
+    // `workGroups` is an ivec3, `workGroupsRender` a vec2 (a third number, the depth of a 2D
+    // render, is taken as 1); anything else is not understood rather than guessed.
+    let mut sizes = |name: &str, counts: &[usize]| {
+        let v = constant(&c, name)?;
+        if !counts.contains(&v.len())
+            || v.iter()
+                .any(|x| !x.is_finite() || *x < 0.0 || *x > u32::MAX as f64)
+        {
+            errors.push(Error {
+                file: compute.files.first().cloned().unwrap_or_default(),
+                line: 0,
+                message: format!("`{name}` must have {counts:?} numbers, not {}", v.len()),
+            });
+            return None;
+        }
+        Some(v)
+    };
+    let mut work_groups =
+        sizes("workGroups", &[3]).map(|v| [v[0] as u32, v[1] as u32, v[2] as u32]);
+    let work_groups_render =
+        sizes("workGroupsRender", &[2, 3]).map_or([1.0, 1.0], |v| [v[0] as f32, v[1] as f32]);
+    if work_groups.is_some() && constant(&c, "workGroupsRender").is_some() {
+        errors.push(Error {
+            file: compute.files.first().cloned().unwrap_or_default(),
+            line: 0,
+            message: "both workGroups and workGroupsRender are declared".into(),
+        });
+    }
     let code = c.rewrite(&samplers, &uniforms);
+    let mut folded = None;
+    let code = match work_groups.map(|g| fold_work_groups(&code, g)) {
+        Some(Ok(Some((code, fold)))) => {
+            work_groups = Some(fold.dispatch);
+            folded = Some(fold);
+            code
+        }
+        Some(Err(message)) => {
+            errors.push(Error {
+                file: compute.files.first().cloned().unwrap_or_default(),
+                line: 0,
+                message,
+            });
+            code
+        }
+        _ => code,
+    };
     let code = work_group_size(&code).unwrap_or_else(|message| {
         errors.push(Error {
             file: compute.files.first().cloned().unwrap_or_default(),
@@ -798,6 +963,9 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
         images.push(copy);
     }
     let mut main = String::from("\nvoid main() {\n");
+    if let Some(fold) = &folded {
+        main.push_str(&fold.unfold());
+    }
     main.push_str(
         "    hz_Fog = hz_FogParameters(hz_fog_color, hz_fog.x, hz_fog.y, hz_fog.z, hz_fog.w);\n",
     );
@@ -805,29 +973,15 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
         writeln!(main, "    {name} = hz_init_{name}();").unwrap();
     }
     main.push_str("    hz_main();\n}\n");
-    let header = resources(&uniforms, &samplers, &images) + &c.prelude();
+    let mut header = resources(&uniforms, &samplers, &images) + &c.prelude();
+    if folded.is_some() {
+        header.push_str("uvec3 hz_WorkGroupID;\n");
+    }
     let text = format!("{header}{code}{main}");
-    // `workGroups` is an ivec3, `workGroupsRender` a vec2 (a third number, the depth of a 2D
-    // render, is taken as 1); anything else is not understood rather than guessed.
-    let mut sizes = |name: &str, counts: &[usize]| {
-        let v = constant(&c, name)?;
-        if !counts.contains(&v.len()) {
-            errors.push(Error {
-                file: compute.files.first().cloned().unwrap_or_default(),
-                line: 0,
-                message: format!("`{name}` must have {counts:?} numbers, not {}", v.len()),
-            });
-            return None;
-        }
-        Some(v)
-    };
-    let work_groups = sizes("workGroups", &[3]).map(|v| [v[0] as u32, v[1] as u32, v[2] as u32]);
-    let work_groups_render =
-        sizes("workGroupsRender", &[2, 3]).map_or([1.0, 1.0], |v| [v[0] as f32, v[1] as f32]);
     if !errors.is_empty() {
         return Err(errors);
     }
-    let module = compile(&c, &text, header.lines().count()).map_err(|e| {
+    let (module, used) = compile(&c, &text, header.lines().count()).map_err(|e| {
         errors.extend(e);
         std::mem::take(&mut errors)
     })?;
@@ -857,6 +1011,8 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
         images,
         buffers: c.buffers.iter().copied().collect(),
     };
+    interface.samplers.retain(|s| used.contains(&s.binding));
+    interface.images.retain(|i| used.contains(&i.binding));
     mark_atomic(&module, &mut interface.images);
     Ok(ComputeProgram {
         notes,
@@ -865,6 +1021,83 @@ pub fn translate_compute(compute: &Preprocessed) -> Result<ComputeProgram, Vec<E
         work_groups,
         work_groups_render,
     })
+}
+
+/// The most work groups wgpu dispatches along one dimension (WebGPU's
+/// `maxComputeWorkgroupsPerDimension`, which wgpu's Metal backend reports too).
+pub const MAX_WORK_GROUPS_PER_DIMENSION: u32 = 65_535;
+
+/// A `workGroups` over [`MAX_WORK_GROUPS_PER_DIMENSION`] in some dimension, run as the same
+/// number of groups in the shape `dispatch`.
+#[derive(Debug, PartialEq)]
+struct Fold {
+    groups: [u32; 3],
+    dispatch: [u32; 3],
+}
+
+impl Fold {
+    /// The start of `main`: the group's place in `groups`, from its linear index in `dispatch`.
+    fn unfold(&self) -> String {
+        let ([x, y, _], [a, b, _]) = (self.groups, self.dispatch);
+        format!(
+            "    uint hz_group = gl_WorkGroupID.x + {a}u * (gl_WorkGroupID.y + {b}u * gl_WorkGroupID.z);\n    \
+             hz_WorkGroupID = uvec3(hz_group % {x}u, hz_group / {x}u % {y}u, hz_group / {}u);\n",
+            x * y
+        )
+    }
+}
+
+/// `code` for a dispatch of `groups` laid out as a [`Fold`] when a dimension is over the limit:
+/// `gl_WorkGroupID`, `gl_GlobalInvocationID` and `gl_NumWorkGroups` read what they would in
+/// `groups`. The shape uses every group exactly, so no group returns early before a `barrier()`.
+fn fold_work_groups(code: &str, groups: [u32; 3]) -> Result<Option<(String, Fold)>, String> {
+    if groups.iter().all(|&n| n <= MAX_WORK_GROUPS_PER_DIMENSION) {
+        return Ok(None);
+    }
+    let too_many = || {
+        format!(
+            "`workGroups` {groups:?} can't be dispatched: no shape of at most \
+                 {MAX_WORK_GROUPS_PER_DIMENSION} per dimension holds them"
+        )
+    };
+    let total = groups
+        .iter()
+        .try_fold(1u32, |t, &n| t.checked_mul(n))
+        .ok_or_else(too_many)?;
+    let divisor = |n: u32| {
+        (1..=n.min(MAX_WORK_GROUPS_PER_DIMENSION))
+            .rev()
+            .find(|d| n.is_multiple_of(*d))
+            .unwrap_or(1)
+    };
+    let a = divisor(total);
+    let b = divisor(total / a);
+    let c = total / a / b;
+    if c > MAX_WORK_GROUPS_PER_DIMENSION {
+        return Err(too_many());
+    }
+    let [x, y, z] = groups;
+    let mut tokens: Vec<String> = crate::macros::lex(code)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for t in &mut tokens {
+        match t.as_str() {
+            "gl_WorkGroupID" => *t = "hz_WorkGroupID".to_owned(),
+            "gl_GlobalInvocationID" => {
+                *t = "(hz_WorkGroupID * gl_WorkGroupSize + gl_LocalInvocationID)".to_owned()
+            }
+            "gl_NumWorkGroups" => *t = format!("uvec3({x}u, {y}u, {z}u)"),
+            _ => {}
+        }
+    }
+    Ok(Some((
+        tokens.concat(),
+        Fold {
+            groups,
+            dispatch: [a, b, c],
+        },
+    )))
 }
 
 /// `code` with `gl_WorkGroupSize` written as the constant its `layout(local_size_*)` declares:
@@ -1056,172 +1289,6 @@ fn constant(stage: &Stage, name: &str) -> Option<Vec<f64>> {
     Some(values)
 }
 
-/// A matrix or array varying (`flat mat3 @[2];`): wgpu's stage interfaces take only scalars
-/// and vectors (WGSL), so it becomes a private global (`mat3 @[2];`) and one varying per
-/// column or element, each with the qualifiers and how to reach it (`[1][2]`). `None` for
-/// scalars and vectors, and for sizes that are not plain numbers.
-fn varying_parts(decl: &str) -> Option<(String, Vec<(String, String)>)> {
-    let (before, after) = decl.split_once('@')?;
-    let mut words: Vec<&str> = before.split_whitespace().collect();
-    let ty = words.pop()?;
-    let qualifiers: String = words.iter().map(|w| format!("{w} ")).collect();
-    let array = after.trim().trim_end_matches(';').trim();
-    let mut sizes = Vec::new();
-    let mut rest = array;
-    while let Some(r) = rest.strip_prefix('[') {
-        let (n, r) = r.split_once(']')?;
-        sizes.push(n.trim().parse::<usize>().ok()?);
-        rest = r.trim_start();
-    }
-    if !rest.is_empty() {
-        return None;
-    }
-    // matC or matCxR: C columns of R rows.
-    let column = ty.strip_prefix("mat").and_then(|d| {
-        let (c, r) = d.split_once('x').unwrap_or((d, d));
-        Some((c.parse::<usize>().ok()?, r.parse::<usize>().ok()?))
-    });
-    if sizes.is_empty() && column.is_none() {
-        return None;
-    }
-    let part_ty = column.map_or(ty.to_owned(), |(_, r)| format!("vec{r}"));
-    if let Some((c, _)) = column {
-        sizes.push(c);
-    }
-    let count: usize = sizes.iter().product();
-    let parts = (0..count)
-        .map(|mut k| {
-            let mut access = String::new();
-            for &size in sizes.iter().rev() {
-                access.insert_str(0, &format!("[{}]", k % size));
-                k /= size;
-            }
-            (format!("{qualifiers}{part_ty} @;"), access)
-        })
-        .collect();
-    Some((format!("{ty} @{array};"), parts))
-}
-
-/// A struct varying (`flat Params @;`) as vectors: its scalar, vector and matrix members, through
-/// nested structs and arrays, packed four components at a time by base type. Each part: its
-/// declaration and, per member, the swizzle of the part and how to reach the member (`.a[1].b`).
-/// `None` for a member that can't travel (`bool`, an unknown type, a size that is not a number).
-#[allow(clippy::type_complexity)]
-fn struct_parts(
-    decl: &str,
-    structs: &std::collections::HashMap<String, Vec<(String, String)>>,
-) -> Option<Vec<(String, Vec<(String, String)>)>> {
-    let (before, after) = decl.split_once('@')?;
-    let mut words: Vec<&str> = before.split_whitespace().collect();
-    let ty = words.pop()?;
-    let qualifiers: String = words.iter().map(|w| format!("{w} ")).collect();
-    let mut leaves = Vec::new();
-    leaves_of(
-        ty,
-        after.trim().trim_end_matches(';'),
-        String::new(),
-        structs,
-        &mut leaves,
-    )?;
-    // Slots of one base type and up to four components: (base, used, members (from, size, access)).
-    let mut slots: Vec<(&str, usize, Vec<(usize, usize, String)>)> = Vec::new();
-    for (base, size, access) in leaves {
-        match slots
-            .iter_mut()
-            .find(|(b, used, _)| *b == base && used + size <= 4)
-        {
-            Some(slot) => {
-                slot.2.push((slot.1, size, access));
-                slot.1 += size;
-            }
-            None => slots.push((base, size, vec![(0, size, access)])),
-        }
-    }
-    Some(
-        slots
-            .into_iter()
-            .map(|(base, used, members)| {
-                let ty = match (base, used) {
-                    (b, 1) => b.to_owned(),
-                    ("float", n) => format!("vec{n}"),
-                    ("int", n) => format!("ivec{n}"),
-                    (_, n) => format!("uvec{n}"),
-                };
-                // Integers only travel flat.
-                let flat = if base != "float" && !qualifiers.contains("flat") {
-                    "flat "
-                } else {
-                    ""
-                };
-                let members = members
-                    .into_iter()
-                    .map(|(from, size, access)| {
-                        let swizzle = if used == 1 {
-                            String::new()
-                        } else {
-                            format!(".{}", &"xyzw"[from..from + size])
-                        };
-                        (swizzle, access)
-                    })
-                    .collect();
-                (format!("{flat}{qualifiers}{ty} @;"), members)
-            })
-            .collect(),
-    )
-}
-
-/// The scalars and vectors inside a value of type `ty` with array suffix `array`, reached by
-/// `access`: (base type, components, access).
-fn leaves_of(
-    ty: &str,
-    array: &str,
-    access: String,
-    structs: &std::collections::HashMap<String, Vec<(String, String)>>,
-    out: &mut Vec<(&'static str, usize, String)>,
-) -> Option<()> {
-    if let Some(rest) = array.trim().strip_prefix('[') {
-        let (n, rest) = rest.split_once(']')?;
-        for k in 0..n.trim().parse::<usize>().ok()? {
-            leaves_of(ty, rest, format!("{access}[{k}]"), structs, out)?;
-        }
-        return Some(());
-    }
-    if let Some(members) = structs.get(ty) {
-        for (member_ty, member) in members {
-            let (name, array) = member
-                .split_once('[')
-                .map_or((member.as_str(), ""), |(n, _)| (n, &member[n.len()..]));
-            leaves_of(member_ty, array, format!("{access}.{name}"), structs, out)?;
-        }
-        return Some(());
-    }
-    if let Some(dims) = ty.strip_prefix("mat") {
-        let (c, r) = dims.split_once('x').unwrap_or((dims, dims));
-        let (c, r) = (c.parse::<usize>().ok()?, r.parse::<usize>().ok()?);
-        for k in 0..c {
-            out.push(("float", r, format!("{access}[{k}]")));
-        }
-        return Some(());
-    }
-    let (base, size) = match ty {
-        "float" => ("float", 1),
-        "int" => ("int", 1),
-        "uint" => ("uint", 1),
-        _ => {
-            let (base, n) = if let Some(n) = ty.strip_prefix("vec") {
-                ("float", n)
-            } else if let Some(n) = ty.strip_prefix("ivec") {
-                ("int", n)
-            } else {
-                ("uint", ty.strip_prefix("uvec")?)
-            };
-            (base, n.parse().ok()?)
-        }
-    };
-    out.push((base, size, access));
-    Some(())
-}
-
 /// `sampler2DShadow` → (`texture2D`, `samplerShadow`); `isampler3D` → (`itexture3D`, `sampler`).
 pub(super) fn split_sampler(ty: &str) -> (String, &'static str) {
     let shadow = ty.ends_with("Shadow");
@@ -1232,7 +1299,12 @@ pub(super) fn split_sampler(ty: &str) -> (String, &'static str) {
 }
 
 /// Parses and validates one stage; errors at the pack's files and lines.
-fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Module, Vec<Error>> {
+fn compile(
+    stage: &Stage,
+    text: &str,
+    header_lines: usize,
+) -> Result<(naga::Module, BTreeSet<u32>), Vec<Error>> {
+    // `text` is the source the span is in: the rewrites below keep its lines.
     let specialized = image_parameters::rewrite(text).map_err(|message| {
         vec![Error {
             file: stage.pp.files.first().cloned().unwrap_or_default(),
@@ -1292,13 +1364,15 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
                     .or_else(|| repeated_prototype(&text, e))
             }) {
                 Some(fixed) if tries < 256 => text = fixed.into(),
-                _ => return parse(&text),
+                _ => {
+                    return Err(parse(&text).expect_err("the unchanged source failed to parse"));
+                }
             },
         }
     };
     end_returns_give_zero(&mut module);
     lengths_of_loaded_arrays(&mut module);
-    Validator::new(ValidationFlags::all(), Capabilities::all())
+    let info = Validator::new(ValidationFlags::all(), Capabilities::all())
         .subgroup_operations(naga::valid::SubgroupOperationSet::all())
         .subgroup_stages(naga::valid::ShaderStages::all())
         .validate(&module)
@@ -1314,7 +1388,18 @@ fn compile(stage: &Stage, text: &str, header_lines: usize) -> Result<naga::Modul
             }
             vec![at(&text, span, message)]
         })?;
-    Ok(module)
+    let used = module
+        .global_variables
+        .iter()
+        .filter_map(|(handle, variable)| {
+            let binding = variable.binding.as_ref()?;
+            (binding.group == 0
+                && (0..module.entry_points.len())
+                    .any(|entry| !info.get_entry_point(entry)[handle].is_empty()))
+            .then_some(binding.binding)
+        })
+        .collect();
+    Ok((module, used))
 }
 
 /// `block.member.length()` of a buffer block's runtime-sized array: naga's frontend loads the
@@ -1861,7 +1946,7 @@ mod tests {
     use crate::pack::tests::zip;
     use crate::{Macros, Pack, preprocess};
 
-    fn program(files: &[(&str, &str)], target: Target) -> Result<Program, Vec<Error>> {
+    pub(super) fn program(files: &[(&str, &str)], target: Target) -> Result<Program, Vec<Error>> {
         let files: Vec<(String, &str)> = files
             .iter()
             .map(|(p, t)| (format!("shaders/{p}"), *t))
@@ -2367,6 +2452,123 @@ in VertexData {{ {member} }} vIn;
     }
 
     #[test]
+    fn paged_maps_read_through_their_page_table() {
+        let vsh = "#version 120\nvarying vec2 uv;\nvoid main() { gl_Position = ftransform(); uv = gl_MultiTexCoord0.st; }\n";
+        // A read with a bias, at a level, with gradients; a local named like a map is not one.
+        let fsh = "#version 120\nuniform sampler2D normals;\nuniform sampler2D specular;\nvarying vec2 uv;\n\
+                   float f() { float normals = 0.5; return normals; }\n\
+                   void main() { gl_FragData[0] = texture2D(normals, uv, -1.0) + texture2DLod(specular, uv, 0.0)\n\
+                   + textureGrad(normals, uv, dFdx(uv), dFdy(uv)) + vec4(f()); }\n";
+        let files = [
+            ("shaders/gbuffers_entities.vsh", vsh),
+            ("shaders/gbuffers_entities.fsh", fsh),
+        ];
+        let pack = Pack::from_zip_bytes("P.zip", zip(&files)).unwrap();
+        let m = Macros::standard();
+        for paged_maps in [false, true] {
+            let inputs = GbuffersInputs {
+                body: "    hz_Vertex = vec4(0.0, 0.0, 0.0, 1.0);\n".into(),
+                paged_maps,
+                ..Default::default()
+            };
+            let p = translate_gbuffers(
+                &preprocess(&pack, "gbuffers_entities.vsh", &m),
+                &preprocess(&pack, "gbuffers_entities.fsh", &m),
+                Target::Buffers,
+                &inputs,
+            )
+            .unwrap_or_else(|e| panic!("{e:?}"));
+            // Calls of the functions named `name`, in every function's body.
+            let calls = |name: &str| {
+                let bodies: Vec<String> = (p.fragment.functions.iter().map(|(_, f)| &f.body))
+                    .chain([&p.fragment.entry_points[0].function.body])
+                    .map(|body| format!("{body:?}"))
+                    .collect();
+                (p.fragment.functions.iter())
+                    .filter(|(_, f)| f.name.as_deref() == Some(name))
+                    .map(|(h, _)| {
+                        let call = format!("function: {h:?}");
+                        bodies
+                            .iter()
+                            .map(|b| b.matches(&call).count())
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>()
+            };
+            // The three reads of the maps, and each of the three overloads reading.
+            let n = if paged_maps { 3 } else { 0 };
+            assert_eq!((calls("hz_pagedTexture"), calls("hz_pagedRead")), (n, n));
+        }
+    }
+
+    #[test]
+    fn shadow_water_inside_a_boats_patch_is_discarded() {
+        let vsh = "#version 120\nvoid main() { gl_Position = ftransform(); }\n";
+        let fsh = "#version 120\nvoid main() { gl_FragData[0] = vec4(0.2, 0.4, 0.8, 0.5); }\n";
+        let files = [("shaders/shadow.vsh", vsh), ("shaders/shadow.fsh", fsh)];
+        let pack = Pack::from_zip_bytes("P.zip", zip(&files)).unwrap();
+        let m = Macros::standard();
+        for water_patches in [false, true] {
+            let inputs = GbuffersInputs {
+                body: "    hz_Vertex = vec4(0.0, 0.0, 0.0, 1.0);\n".into(),
+                water_patches,
+                ..Default::default()
+            };
+            let p = translate_shadow(
+                &preprocess(&pack, "shadow.vsh", &m),
+                &preprocess(&pack, "shadow.fsh", &m),
+                &inputs,
+            )
+            .unwrap_or_else(|e| panic!("{e:?}"));
+            let boxes = (p.interface.uniforms.iter())
+                .filter(|u| u.name.starts_with("horizonWaterPatch"))
+                .count();
+            let kills = (p.fragment.functions.iter().map(|(_, f)| f))
+                .chain([&p.fragment.entry_points[0].function])
+                .any(|f| format!("{:?}", f.body).contains("Kill"));
+            let expected = if water_patches {
+                2 * WATER_PATCHES + 1
+            } else {
+                0
+            };
+            assert_eq!((boxes, kills), (expected, water_patches));
+        }
+    }
+
+    #[test]
+    fn water_behind_a_boats_patch_is_discarded() {
+        let vsh = "#version 120\nvoid main() { gl_Position = ftransform(); }\n";
+        let fsh = "#version 120\n#extension GL_ARB_shader_texture_lod : enable\n\
+                   void main() { gl_FragData[0] = vec4(0.2, 0.4, 0.8, 0.5); }\n";
+        let files = [
+            ("shaders/gbuffers_water.vsh", vsh),
+            ("shaders/gbuffers_water.fsh", fsh),
+        ];
+        let pack = Pack::from_zip_bytes("P.zip", zip(&files)).unwrap();
+        let m = Macros::standard();
+        for water_mask in [false, true] {
+            let inputs = GbuffersInputs {
+                body: "    hz_Vertex = vec4(0.0, 0.0, 0.0, 1.0);\n".into(),
+                water_mask,
+                ..Default::default()
+            };
+            let p = translate_gbuffers(
+                &preprocess(&pack, "gbuffers_water.vsh", &m),
+                &preprocess(&pack, "gbuffers_water.fsh", &m),
+                Target::Buffers,
+                &inputs,
+            )
+            .unwrap_or_else(|e| panic!("{e:?}"));
+            let sampler = (p.interface.samplers.iter()).any(|s| s.name == WATER_MASK);
+            let kills = (p.fragment.functions.iter().map(|(_, f)| f))
+                .chain([&p.fragment.entry_points[0].function])
+                .any(|f| format!("{:?}", f.body).contains("Kill"));
+            // The pack's own program discards nothing: only our check does.
+            assert_eq!((sampler, kills), (water_mask, water_mask));
+        }
+    }
+
+    #[test]
     fn the_alpha_test_discards_below_its_reference() {
         assert_eq!(
             AlphaTest::parse("GREATER 0.1"),
@@ -2542,6 +2744,46 @@ in VertexData {{ {member} }} vIn;
         for name in ["shadowModelView", "shadowProjection", "gbufferModelView"] {
             assert!(names.contains(&name), "{name} missing from {names:?}");
         }
+    }
+
+    #[test]
+    fn vertex_outputs_the_fragment_stage_never_reads_take_no_location() {
+        // As GL's linker drops an inactive varying: only `seen` travels. The others stay
+        // globals of the vertex stage, which still reads what it wrote into them.
+        let vsh = "#version 120\nvarying vec4 seen;\nflat varying int count;\nvarying mat3 tbn;\n\
+                   varying vec2 uvs[2];\nvoid main() {\n    gl_Position = ftransform();\n    \
+                   count = 3;\n    tbn = mat3(2.0);\n    uvs[1] = vec2(4.0);\n    \
+                   seen = vec4(float(count), tbn[0][0], uvs[1]);\n}\n";
+        let fsh = "#version 120\nvarying vec4 seen;\nflat varying int count;\nvarying mat3 tbn;\n\
+                   varying vec2 uvs[2];\nvoid main() { gl_FragColor = seen; }\n";
+        let p = program(
+            &[("composite.vsh", vsh), ("composite.fsh", fsh)],
+            Target::Buffers,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        let locations = |module: &naga::Module, output: bool| -> Vec<u32> {
+            let f = &module.entry_points[0].function;
+            let bindings: Vec<Option<naga::Binding>> = if output {
+                let ty = f.result.as_ref().map(|r| r.ty);
+                match ty.map(|t| &module.types[t].inner) {
+                    Some(naga::TypeInner::Struct { members, .. }) => {
+                        members.iter().map(|m| m.binding.clone()).collect()
+                    }
+                    _ => f.result.iter().map(|r| r.binding.clone()).collect(),
+                }
+            } else {
+                f.arguments.iter().map(|a| a.binding.clone()).collect()
+            };
+            bindings
+                .into_iter()
+                .filter_map(|b| match b {
+                    Some(naga::Binding::Location { location, .. }) => Some(location),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(locations(&p.vertex, true), [0]);
+        assert_eq!(locations(&p.fragment, false), [0]);
     }
 
     #[test]
@@ -3736,6 +3978,223 @@ in VertexData {{ {member} }} vIn;
             Target::Buffers,
         );
         assert!(p.is_ok(), "{:?}", p.err());
+    }
+    #[test]
+    fn terrain_lighting_constants_are_explicit_and_opt_in() {
+        assert!(terrain_lighting_constants(None).is_empty());
+        assert_eq!(
+            TerrainLighting::default(),
+            TerrainLighting {
+                old_lighting: true,
+                separate_ao: false,
+                ao_strength: 1.0
+            }
+        );
+        let policy = TerrainLighting {
+            old_lighting: false,
+            separate_ao: true,
+            ao_strength: 0.375,
+        };
+        let source = terrain_lighting_constants(Some(policy));
+        assert!(source.contains("const bool hz_old_lighting = false;"));
+        assert!(source.contains("const bool hz_separate_ao = true;"));
+        assert!(source.contains("const float hz_ao_strength = 0.375;"));
+        let pack = Pack::from_zip_bytes(
+            "lighting",
+            zip(&[
+                (
+                    "shaders/terrain.vsh",
+                    "#version 120\nvoid main(){gl_Position=gl_Vertex;gl_FrontColor=gl_Color;}",
+                ),
+                (
+                    "shaders/terrain.fsh",
+                    "#version 120\nvoid main(){gl_FragColor=gl_Color;}",
+                ),
+            ]),
+        )
+        .unwrap();
+        let macros = Macros::standard();
+        let vertex = preprocess(&pack, "terrain.vsh", &macros);
+        let fragment = preprocess(&pack, "terrain.fsh", &macros);
+        let inputs = GbuffersInputs {
+            body: "hz_Vertex=vec4(0.0,0.0,0.0,1.0);hz_Color=vec4(hz_old_lighting?1.0:0.0,hz_separate_ao?1.0:0.0,hz_ao_strength,1.0);".into(),
+            terrain_lighting: Some(policy), ..Default::default()
+        };
+        for result in [
+            translate_gbuffers(&vertex, &fragment, Target::Buffers, &inputs),
+            translate_shadow(&vertex, &fragment, &inputs),
+        ] {
+            let program = result.unwrap_or_else(|e| panic!("{e:?}"));
+            for module in [&program.vertex, &program.fragment] {
+                for name in ["hz_old_lighting", "hz_separate_ao", "hz_ao_strength"] {
+                    assert!(
+                        module
+                            .constants
+                            .iter()
+                            .any(|(_, c)| c.name.as_deref() == Some(name)),
+                        "{name}"
+                    );
+                }
+                assert!(
+                    !program
+                        .interface
+                        .uniforms
+                        .iter()
+                        .any(|u| u.name == "hz_ao_strength")
+                );
+            }
+        }
+        let plain = GbuffersInputs {
+            body: "hz_Vertex=vec4(0.0,0.0,0.0,1.0);hz_Color=vec4(1.0);".into(),
+            ..Default::default()
+        };
+        let program = translate_gbuffers(&vertex, &fragment, Target::Buffers, &plain).unwrap();
+        assert!(
+            !program
+                .vertex
+                .constants
+                .iter()
+                .any(|(_, c)| c
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("hz_old_lighting")
+                        || name.starts_with("hz_separate_ao")
+                        || name.starts_with("hz_ao_strength")))
+        );
+    }
+
+    #[test]
+    fn opengl_vertex_and_instance_ids_remain_signed_integers() {
+        program(&[("composite.vsh","#version 330\nvoid main(){int vertex=gl_VertexID;int instance=gl_InstanceID;int corner=gl_VertexID & 3;bool earlier=vertex<instance;gl_Position=gl_Vertex+vec4(float(corner),float(vertex-instance),earlier?1.0:0.0,0.0);}"),("composite.fsh","#version 330\nvoid main(){gl_FragColor=vec4(1.0);}")],Target::Buffers).unwrap_or_else(|errors|panic!("{errors:?}"));
+    }
+
+    #[test]
+    fn vertex_and_instance_ids_keep_their_builtin_inputs() {
+        let vertex = "#version 330\nvoid main() { gl_Position = gl_Vertex + vec4(float(gl_VertexID), float(gl_InstanceID), 0.0, 0.0); }\n";
+        let p = program(
+            &[
+                ("composite.vsh", vertex),
+                (
+                    "composite.fsh",
+                    "#version 330\nvoid main() { gl_FragColor = vec4(1.0); }\n",
+                ),
+            ],
+            Target::Buffers,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        for builtin in [naga::BuiltIn::VertexIndex, naga::BuiltIn::InstanceIndex] {
+            assert!(
+                p.vertex.entry_points[0]
+                    .function
+                    .arguments
+                    .iter()
+                    .any(|a| { a.binding == Some(naga::Binding::BuiltIn(builtin)) }),
+                "missing {builtin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_max_promotes_integer_arguments_and_arrays_may_follow_types() {
+        let vertex = "#version 450\nconst ivec3[2] positions = ivec3[2](ivec3(0), ivec3(1));\nvoid main() { uint id = uint(gl_VertexID); uint value = max(id - 1, 1); uvec3 v = max(uvec3(id), ivec3(1)); gl_Position = vec4(positions[0], 1.0) + vec4(v, value); }\n";
+        program(&[("composite.vsh",vertex),("composite.fsh","#version 450\nvoid main() { gl_FragColor=vec4(max(vec3(0.0),1.0),max(0.0,1.0)); }\n")],Target::Buffers).unwrap_or_else(|e|panic!("{e:?}"));
+    }
+
+    #[test]
+    fn unused_declared_samplers_are_not_required_inputs() {
+        let fragment = "#version 120\nuniform sampler2D colortex0; uniform sampler2D normals; varying vec2 texcoord;\nvoid main() { gl_FragColor = texture2D(colortex0, texcoord); }\n";
+        let p = program(
+            &[("composite.vsh", VSH_120), ("composite.fsh", fragment)],
+            Target::Window,
+        )
+        .unwrap();
+        assert_eq!(
+            p.interface
+                .samplers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["colortex0"]
+        );
+    }
+
+    #[test]
+    fn rendered_item_id_uses_the_per_draw_slot_in_geometry_and_shadow() {
+        let pack = Pack::from_zip_bytes("Item.zip", zip(&[
+            ("shaders/items.vsh", "#version 450\nuniform int currentRenderedItemId;\nvoid main() { gl_Position = gl_Vertex + vec4(float(currentRenderedItemId)); }\n"),
+            ("shaders/items.fsh", "#version 450\nuniform int currentRenderedItemId;\nuniform vec4 entityColor;\nvoid main() { gl_FragColor = entityColor + vec4(float(currentRenderedItemId)); }\n"),
+        ])).unwrap();
+        let macros = Macros::standard();
+        let vertex = preprocess(&pack, "items.vsh", &macros);
+        let fragment = preprocess(&pack, "items.fsh", &macros);
+        let inputs = GbuffersInputs {
+            body: "hz_Vertex = vec4(0.0, 0.0, 0.0, 1.0);".into(),
+            ..Default::default()
+        };
+        for p in [
+            translate_gbuffers(&vertex, &fragment, Target::Buffers, &inputs),
+            translate_shadow(&vertex, &fragment, &inputs),
+        ] {
+            let p = p.unwrap_or_else(|e| panic!("{e:?}"));
+            assert!(p.interface.draw);
+            assert!(
+                !p.interface
+                    .uniforms
+                    .iter()
+                    .any(|u| u.name == "currentRenderedItemId")
+            );
+            for module in [&p.vertex, &p.fragment] {
+                let (_, draw) = module
+                    .global_variables
+                    .iter()
+                    .find(|(_, v)| {
+                        v.binding
+                            .as_ref()
+                            .is_some_and(|b| b.group == 2 && b.binding == 0)
+                    })
+                    .unwrap();
+                let naga::TypeInner::Struct { members, span } = &module.types[draw.ty].inner else {
+                    panic!("draw block is not a struct")
+                };
+                assert_eq!(*span, 32);
+                assert_eq!(
+                    members
+                        .iter()
+                        .find(|m| m.name.as_deref() == Some("currentRenderedItemId"))
+                        .unwrap()
+                        .offset,
+                    12
+                );
+                assert_eq!(
+                    members
+                        .iter()
+                        .find(|m| m.name.as_deref() == Some("entityColor"))
+                        .unwrap()
+                        .offset,
+                    16
+                );
+            }
+        }
+    }
+    #[test]
+    fn image_access_is_combined_and_conflicting_formats_rejected() {
+        let vertex = "#version 430\nlayout(rgba8) writeonly uniform image2D sharedImage;void main(){imageStore(sharedImage,ivec2(0),vec4(1.0));gl_Position=gl_Vertex;}";
+        let fragment = "#version 430\nlayout(rgba8) readonly uniform image2D sharedImage;void main(){gl_FragColor=imageLoad(sharedImage,ivec2(0));}";
+        let p = program(
+            &[("composite.vsh", vertex), ("composite.fsh", fragment)],
+            Target::Buffers,
+        )
+        .unwrap();
+        assert_eq!(p.interface.images.len(), 1);
+        assert_eq!(p.interface.images[0].access, "");
+        let bad = fragment.replace("rgba8", "rgba16f");
+        assert!(
+            program(
+                &[("composite.vsh", vertex), ("composite.fsh", &bad)],
+                Target::Buffers
+            )
+            .is_err()
+        );
     }
 
     /// Parameters and locals named like a bool uniform hide it (GLSL 4.60, 4.2): the uniform is

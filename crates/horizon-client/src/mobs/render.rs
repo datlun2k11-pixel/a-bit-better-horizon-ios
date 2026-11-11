@@ -152,15 +152,7 @@ pub fn armor_tint(undyed: Option<u32>, stack: Option<&crate::items::ItemStack>) 
         .unwrap_or(undyed);
     abgr(dyed)
 }
-/// ColorLerper.Type.SHEEP colour: white is 0xE6E6E6, others 75% of the dye.
-pub fn sheep_wool_rgb(color: u8) -> u32 {
-    if color == 0 {
-        return 0xE6E6E6;
-    }
-    let src = DYE[color as usize & 15];
-    let f = |c: u32| ((c as f32 * 0.75).floor() as u32).min(255);
-    f(src >> 16 & 255) << 16 | f(src >> 8 & 255) << 8 | f(src & 255)
-}
+pub use crate::pack_palette::{diffuse as dye, sheep_wool as sheep_wool_rgb};
 /// `ColorLerper.getLerpedColor(ColorLerper.Type.SHEEP, ageInTicks)`: the 16
 /// wool colours in DyeColor order, one per 25 ticks, lerped in between. The
 /// colour a `jeb_` sheep's wool takes.
@@ -596,7 +588,7 @@ pub fn body(m: &Mob) -> (Cow<'static, str>, Cow<'_, str>) {
 pub fn body_color(m: &Mob, alpha: f32) -> u32 {
     match m.species() {
         Species::Wolf => super::tame::tint(m, alpha),
-        Species::TropicalFish => abgr(DYE[m.extra.variant2 as usize & 15]),
+        Species::TropicalFish => abgr(dye(m.extra.variant2 as usize)),
         // LivingEntityRenderer.submit: a spectator is invisible
         // (Player.updateInvisibilityStatus) but not to another spectator or
         // itself, so its body is forced translucent (654311423, alpha 38).
@@ -607,9 +599,26 @@ pub fn body_color(m: &Mob, alpha: f32) -> u32 {
 /// Extra render layers drawn over the body with the same pose. `age` is the
 /// render state's `ageInTicks` (`Mob.age` plus the partial tick).
 pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
+    layers_with_cape(m, age, true)
+}
+
+fn layers_with_cape(m: &Mob, age: f32, legacy_avatar_cape: bool) -> Vec<Layer> {
     use Species as S;
     let mut v = Vec::new();
     if avatar(m) {
+        // CapeLayer: not over an elytra, which wears the cape's texture itself.
+        if legacy_avatar_cape
+            && let Some(cape) = &m.cape
+            && m.extra.chest.as_deref() != Some("minecraft:elytra")
+        {
+            v.push(Layer {
+                model: "player#cape".into(),
+                texture: cape.clone().into(),
+                color: 0xFFFF_FFFF,
+                full_bright: false,
+                scroll: 0.0,
+            });
+        }
         return v;
     }
     let white = 0xFFFF_FFFF;
@@ -664,7 +673,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 &mut v,
                 model,
                 texture,
-                abgr(DYE[m.extra.color as usize & 15]),
+                abgr(dye(m.extra.color as usize)),
                 false,
             );
         }
@@ -751,7 +760,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
             if let Some(armor) = m.extra.body.as_deref()
                 && let Some(material) = armor
                     .strip_prefix("minecraft:")
-                    .and_then(|a| a.strip_suffix("_horse_armor"))
+                    .and_then(super::equine::horse_armor_asset)
             {
                 let tex = interned(format_args!("entity/equipment/horse_body/{material}"));
                 let color = if material == "leather" {
@@ -794,7 +803,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 &mut v,
                 model,
                 texture,
-                abgr(DYE[m.extra.color as usize & 15]),
+                abgr(dye(m.extra.color as usize)),
                 false,
             );
         }
@@ -940,7 +949,7 @@ pub fn layers(m: &Mob, age: f32) -> Vec<Layer> {
                 &mut v,
                 model,
                 interned(format_args!("entity/fish/tropical_{letter}_pattern_{n}")),
-                abgr(DYE[m.extra.variant3 as usize & 15]),
+                abgr(dye(m.extra.variant3 as usize)),
                 false,
             );
         }
@@ -1112,7 +1121,7 @@ fn enderman_render_offset(m: &Mob, alpha: f32) -> glam::DVec3 {
 /// `base_transform` from a pose of the entity's origin (`EntityRenderDispatcher.submit`
 /// under a pose stack, as `SpawnerRenderer` draws the mob inside a spawner).
 pub fn base_transform_at(m: &Mob, alpha: f32, origin: glam::Mat4) -> glam::Mat4 {
-    let mut body = m.previous_body_yaw + wrap(m.body_yaw - m.previous_body_yaw) * alpha;
+    let mut body = anim::body_rot(m, alpha);
     if shaking(m) {
         // LivingEntityRenderer.setupRotations: a rapid wobble.
         let ticks = (m.age as f32 + alpha).floor();
@@ -1458,6 +1467,13 @@ pub(super) fn posed(base: glam::Mat4, p: [f32; 9]) -> glam::Mat4 {
         ))
         * glam::Mat4::from_scale(glam::Vec3::new(p[6], p[7], p[8]))
 }
+
+/// Keeps the original multiplication order when the local rotation was reused.
+pub(super) fn posed_rotated(base: glam::Mat4, p: [f32; 9], rotation: glam::Mat4) -> glam::Mat4 {
+    base * glam::Mat4::from_translation(glam::Vec3::new(p[0], p[1], p[2]) / 16.0)
+        * rotation
+        * glam::Mat4::from_scale(glam::Vec3::new(p[6], p[7], p[8]))
+}
 /// `draw_scrolled` through the GPU path when the mob takes it (`skin`), on
 /// the CPU otherwise.
 #[allow(clippy::too_many_arguments)]
@@ -1497,11 +1513,19 @@ pub fn render(
     data: &MobData,
     out: &mut Vec<Vertex>,
 ) {
-    render_with(m, alpha, camera, atlas, light, data, &[], out);
+    let _ = render_with(m, alpha, camera, atlas, light, data, &[], out);
 }
+/// A rendered armor subrange and its actual item (or trim material) identifier.
+#[derive(Clone, Debug)]
+pub struct RenderedItem {
+    pub start: usize,
+    pub end: usize,
+    pub item: String,
+}
+
 /// `render` plus extra layers posed like the body (`HumanoidArmorLayer`:
 /// the armour model's parts copy the body's): (model, texture rect, colour,
-/// overlay: 0 or `ARMOR_GLINT`, as `EquipmentLayerRenderer` never tints them).
+/// overlay: 0 or `ARMOR_GLINT`, item/trim identity, emissive flag).
 #[allow(clippy::too_many_arguments)]
 pub fn render_with(
     m: &Mob,
@@ -1510,9 +1534,10 @@ pub fn render_with(
     atlas: Atlas,
     light: u32,
     data: &MobData,
-    extra: &[(&Part, [f32; 4], u32, u32, bool)],
+    extra: &[(&Part, [f32; 4], u32, u32, String, bool)],
     out: &mut Vec<Vertex>,
-) {
+) -> Vec<RenderedItem> {
+    let mut items = Vec::new();
     // The invisibility effect hides the model (a drinking wandering trader);
     // an illusioner shows its four mirror images instead.
     if super::trader::is_invisible(m) {
@@ -1523,10 +1548,12 @@ pub fn render_with(
                 let shifted =
                     camera - glam::DVec3::new(off[0] + w[0], off[1] + w[1], off[2] + w[2]);
                 let base = base_transform(m, alpha, shifted);
-                render_visible(m, alpha, base, atlas, light, data, extra, true, out, None);
+                render_visible(
+                    m, alpha, base, atlas, light, data, extra, true, out, &mut items, None, true,
+                );
             }
         }
-        return;
+        return items;
     }
     render_visible(
         m,
@@ -1538,8 +1565,11 @@ pub fn render_with(
         extra,
         true,
         out,
+        &mut items,
         None,
+        true,
     );
+    items
 }
 /// `render` with the model's ordinary draws posed on the GPU when the mob
 /// allows it (`super::skin`): the same picture, no vertices on the CPU.
@@ -1553,10 +1583,10 @@ pub fn render_skinned(
     data: &MobData,
     out: &mut Vec<Vertex>,
     skin: &mut super::skin::Skin,
-) {
+) -> Vec<RenderedItem> {
+    let mut items = Vec::new();
     if super::trader::is_invisible(m) {
-        render_with(m, alpha, camera, atlas, light, data, &[], out);
-        return;
+        return render_with(m, alpha, camera, atlas, light, data, &[], out);
     }
     render_visible(
         m,
@@ -1568,9 +1598,49 @@ pub fn render_skinned(
         &[],
         true,
         out,
+        &mut items,
         Some(skin),
+        true,
     );
+    items
 }
+/// An avatar body and its supplied armor in Game, whose explicit CapeLayer
+/// owns cape geometry. This shares CPU/GPU poses with the standalone renderer
+/// while avoiding a second, differently posed cape from its legacy layers.
+#[allow(clippy::too_many_arguments)]
+pub fn render_avatar(
+    m: &Mob,
+    alpha: f32,
+    camera: glam::DVec3,
+    atlas: Atlas,
+    light: u32,
+    data: &MobData,
+    extra: &[(&Part, [f32; 4], u32, u32, String, bool)],
+    body_visible: bool,
+    skin: Option<&mut super::skin::Skin>,
+    out: &mut Vec<Vertex>,
+) -> Vec<RenderedItem> {
+    let mut items = Vec::new();
+    if body_visible && super::trader::is_invisible(m) {
+        return items;
+    }
+    render_visible(
+        m,
+        alpha,
+        base_transform(m, alpha, camera),
+        atlas,
+        light,
+        data,
+        extra,
+        body_visible,
+        out,
+        &mut items,
+        skin,
+        false,
+    );
+    items
+}
+
 /// `CapeLayer.submit` with `PlayerCapeModel`: the player model's body posed
 /// as the player's, its cape turned by `ModelPart.rotateBy` with the cape's
 /// flap and leans. `base` is the player's root transform (moved out over a
@@ -1597,7 +1667,7 @@ pub fn cape(
         m.previous.y + (m.position.y - m.previous.y) * a,
         m.previous.z + (m.position.z - m.previous.z) * a,
     ];
-    let body = m.previous_body_yaw + wrap(m.body_yaw - m.previous_body_yaw) * alpha;
+    let body = anim::body_rot(m, alpha);
     // LivingEntityRenderState.fallFlyingScale.
     let ticks = m.extra.fall_fly_ticks as f32 + alpha;
     let gliding = (ticks * ticks / 100.0).clamp(0.0, 1.0);
@@ -1822,11 +1892,15 @@ pub fn render_layers(
     atlas: Atlas,
     light: u32,
     data: &MobData,
-    extra: &[(&Part, [f32; 4], u32, u32, bool)],
+    extra: &[(&Part, [f32; 4], u32, u32, String, bool)],
     out: &mut Vec<Vertex>,
-) {
+) -> Vec<RenderedItem> {
+    let mut items = Vec::new();
     let base = base_transform(m, alpha, camera);
-    render_visible(m, alpha, base, atlas, light, data, extra, false, out, None);
+    render_visible(
+        m, alpha, base, atlas, light, data, extra, false, out, &mut items, None, true,
+    );
+    items
 }
 /// A mob drawn under `origin` instead of at its position (the spinning mob
 /// of `SpawnerRenderer.submitEntityInSpawner`).
@@ -1838,9 +1912,24 @@ pub fn render_posed(
     light: u32,
     data: &MobData,
     out: &mut Vec<Vertex>,
-) {
+) -> Vec<RenderedItem> {
+    let mut items = Vec::new();
     let base = base_transform_at(m, alpha, origin);
-    render_visible(m, alpha, base, atlas, light, data, &[], true, out, None);
+    render_visible(
+        m,
+        alpha,
+        base,
+        atlas,
+        light,
+        data,
+        &[],
+        true,
+        out,
+        &mut items,
+        None,
+        true,
+    );
+    items
 }
 /// The custom model's key of a body model: `main` is the wide player model, `kind.model`.
 fn cem_key(model_key: &str) -> &str {
@@ -1858,8 +1947,8 @@ fn cem_key(model_key: &str) -> &str {
 /// choose a variant for each.
 pub fn drawn_textures(m: &Mob, data: &MobData) -> Vec<String> {
     fn push(names: &mut Vec<String>, custom: Option<&super::cem::CemLayer>, vanilla: String) {
-        if let Some(texture) = custom.and_then(|c| c.texture.clone()) {
-            names.push(texture);
+        if let Some(texture) = custom.and_then(|c| c.texture_for(&vanilla)) {
+            names.push(texture.to_owned());
         }
         names.push(vanilla);
     }
@@ -1900,7 +1989,7 @@ fn cem_texture<'a>(
     atlas: Atlas<'_>,
 ) -> &'a str {
     custom
-        .and_then(|c| c.texture.as_deref())
+        .and_then(|c| c.texture_for(vanilla))
         .filter(|t| atlas(t).is_some())
         .unwrap_or(vanilla)
 }
@@ -1922,6 +2011,39 @@ fn posed_body(
     alpha: f32,
     data: &MobData,
 ) -> (std::sync::Arc<Part>, Poses, Vec<(String, String, [f32; 3])>) {
+    posed_body_stage(m, alpha, data, true)
+}
+
+/// Only the emote's body deformation for a layer, such as WingsLayer, that already has
+/// its native pose and must not inherit the vanilla torso animation a second time.
+/// The result is model-relative: multiply the wearer's existing base by this once.
+pub fn emote_body_delta(m: &Mob, alpha: f32, data: &MobData) -> Option<glam::Mat4> {
+    m.emote.as_ref()?;
+    // Evaluate the real pose first: CEM keeps only the first world's result per frame.
+    // Its following baseline evaluation reads that frame's start without storing again.
+    let (model, posed, _) = posed_body_stage(m, alpha, data, true);
+    let (baseline_model, baseline, _) = posed_body_stage(m, alpha, data, false);
+    let to = part_matrix(&model, glam::Mat4::IDENTITY, &posed, "body", 0.0)?;
+    let from = part_matrix(
+        &baseline_model,
+        glam::Mat4::IDENTITY,
+        &baseline,
+        "body",
+        0.0,
+    )?;
+    if to == from || !to.is_finite() || !from.is_finite() || from.determinant() == 0.0 {
+        return None;
+    }
+    let delta = to * from.inverse();
+    delta.is_finite().then_some(delta)
+}
+
+fn posed_body_stage(
+    m: &Mob,
+    alpha: f32,
+    data: &MobData,
+    with_emote: bool,
+) -> (std::sync::Arc<Part>, Poses, Vec<(String, String, [f32; 3])>) {
     let s = anim::state(m, alpha);
     let (model_key, _) = body(m);
     let cem = data
@@ -1938,7 +2060,11 @@ fn posed_body(
             .unwrap_or_else(|| m.kind.model.clone()),
     };
     let mut poses = Poses::new(&model);
-    anim::setup(m, &s, &mut poses, &data.animations);
+    if with_emote {
+        anim::setup(m, &s, &mut poses, &data.animations);
+    } else {
+        anim::vanilla_setup(m, &s, &mut poses, &data.animations);
+    }
     if let Some(c) = custom
         && let Some(animation) = &c.animation
     {
@@ -1955,10 +2081,12 @@ fn render_visible(
     atlas: Atlas,
     light: u32,
     data: &MobData,
-    extra: &[(&Part, [f32; 4], u32, u32, bool)],
+    extra: &[(&Part, [f32; 4], u32, u32, String, bool)],
     body_visible: bool,
     out: &mut Vec<Vertex>,
+    items: &mut Vec<RenderedItem>,
     skin: Option<&mut super::skin::Skin>,
+    legacy_avatar_cape: bool,
 ) {
     // The armour is a layer: none for a spectator.
     let extra = if layers_shown(m) { extra } else { &[] };
@@ -2033,7 +2161,9 @@ fn render_visible(
     if let Some(animation) = body_animation {
         animation.run(m, &s, &mut poses);
     }
-    let mut all_layers = layers(m, s.age);
+    // Game owns the full native CapeLayer. Avoid allocating/cloning the legacy
+    // avatar layer at all when it will be drawn by that owner instead.
+    let mut all_layers = layers_with_cape(m, s.age, legacy_avatar_cape);
     // WardenRenderer: the translucent emissive layers fade with the animations.
     if m.species() == Species::Warden {
         for (model, texture, a) in super::warden::emissive_layers(m, alpha) {
@@ -2127,9 +2257,15 @@ fn render_visible(
         draw_body(out, &mut skin);
     }
     // The worn armour's layers (and their emissive overlays, full bright).
-    for (part, uv, color, layer_overlay, glows) in extra {
+    for (part, uv, color, layer_overlay, item, glows) in extra {
+        let start = out.len();
         let light = if *glows { FULL_BRIGHT } else { light };
         draw(part, base, &poses, *uv, *color, light, *layer_overlay, out);
+        items.push(RenderedItem {
+            start,
+            end: out.len(),
+            item: item.clone(),
+        });
     }
     // One Poses refilled for every layer (armour draws up to seven): it keeps
     // its maps' capacity.
@@ -2177,6 +2313,10 @@ fn render_visible(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .apply(folder, variant, profession, &mut layer_poses);
         }
+        if layer.model == "player#cape" {
+            // The part's own pose turns it to face backwards (yRot pi); the tilt goes after that.
+            layer_poses.xrot("cape", -cape_tilt(m, alpha).to_radians());
+        }
         let light = if layer.full_bright {
             FULL_BRIGHT
         } else {
@@ -2216,6 +2356,28 @@ fn render_visible(
                 0,
                 out,
             );
+        }
+        let armor = armor_slot(&layer.model)
+            .and_then(|slot| match slot {
+                super::gear::HEAD => m.extra.head.as_deref(),
+                super::gear::CHEST => m.extra.chest.as_deref(),
+                super::gear::LEGS => m.extra.legs.as_deref(),
+                super::gear::FEET => m.extra.feet.as_deref(),
+                _ => None,
+            })
+            .or_else(|| {
+                layer
+                    .model
+                    .contains("_armor#")
+                    .then_some(m.extra.head.as_deref())
+                    .flatten()
+            });
+        if let Some(item) = armor {
+            items.push(RenderedItem {
+                start,
+                end: out.len(),
+                item: item.to_owned(),
+            });
         }
         if translucent_layer(m, layer) {
             mark_oit(&mut out[start..]);
@@ -2279,6 +2441,24 @@ fn render_visible(
     if shell_last {
         draw_body(out, &mut skin);
     }
+}
+/// `PlayerCapeModel.setupAnim`'s tilt in degrees: 6 at rest, `capeLean / 2` as the player moves forward,
+/// `capeFlap` as it falls, 25 more crouching. Vanilla's cloak trails the player by a quarter of the gap a
+/// tick, so it lags three ticks of motion; that lag stands in for `xCloak`, and the walk bob is left out.
+fn cape_tilt(m: &Mob, alpha: f32) -> f32 {
+    let (sin, cos) = (lerp(alpha, m.previous_body_yaw, m.body_yaw).to_radians()).sin_cos();
+    let (dx, dy, dz): (f64, f64, f64) = (
+        -3.0 * (m.position.x - m.previous.x),
+        -3.0 * (m.position.y - m.previous.y),
+        -3.0 * (m.position.z - m.previous.z),
+    );
+    let flap = (dy * 10.0).clamp(-6.0, 32.0) as f32;
+    let lean = ((dx * f64::from(sin) - dz * f64::from(cos)) * 100.0).clamp(0.0, 150.0) as f32;
+    let crouch = if m.visual_crouching() { 25.0 } else { 0.0 };
+    6.0 + lean / 2.0 + flap + crouch
+}
+fn lerp(t: f32, a: f32, b: f32) -> f32 {
+    a + (b - a) * t
 }
 /// `EnergySwirlLayer`'s model, texture and `xOffset(t)` for a charged creeper
 /// (`CreeperPowerLayer`) or a powered wither (`WitherArmorLayer`); `t` is `ageInTicks`.
@@ -2995,7 +3175,7 @@ mod tests {
             for posed in [false, true] {
                 let mut vertices = Vec::new();
                 if posed {
-                    render_posed(
+                    let _ = render_posed(
                         &mob,
                         0.5,
                         glam::Mat4::IDENTITY,
@@ -3244,18 +3424,33 @@ mod tests {
             species_placements: Default::default(),
         };
         let atlas = |_: &str| Some([0.0, 0.0, 0.25, 0.25]);
-        let part = &kind.model;
+        let part = &*kind.model;
         for overlay in [ARMOR_GLINT, 0] {
             let mut vertices = Vec::new();
-            render_with(
+            let extra = [(
+                part,
+                [0.5, 0.5, 0.75, 0.75],
+                0xFFFF_FFFF,
+                overlay,
+                "minecraft:iron_chestplate".into(),
+                false,
+            )];
+            let items = render_with(
                 &mob,
                 0.5,
                 glam::DVec3::ZERO,
                 &atlas,
                 0xf0f0,
                 &data,
-                &[(part, [0.5, 0.5, 0.75, 0.75], 0xFFFF_FFFF, overlay, false)],
+                &extra,
                 &mut vertices,
+            );
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].item, "minecraft:iron_chestplate");
+            assert!(
+                vertices[items[0].start..items[0].end]
+                    .iter()
+                    .all(|v| v.uv[0] >= 0.5)
             );
             let (armour, body): (Vec<&Vertex>, Vec<&Vertex>) =
                 vertices.iter().partition(|v| v.uv[0] >= 0.5);
@@ -3274,6 +3469,28 @@ mod tests {
                     assert_eq!(v.glint_uv, [0.0, 0.0]);
                 }
             }
+            // Invisible players keep equipment and item spans, with the same glint overlay.
+            let mut hidden_body = Vec::new();
+            let items = render_layers(
+                &mob,
+                0.5,
+                glam::DVec3::ZERO,
+                &atlas,
+                0xf0f0,
+                &data,
+                &extra,
+                &mut hidden_body,
+            );
+            assert!(!hidden_body.is_empty());
+            assert!(
+                hidden_body
+                    .iter()
+                    .all(|v| v.uv[0] >= 0.5 && v.layer == overlay)
+            );
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].item, "minecraft:iron_chestplate");
+            assert_eq!(items[0].start, 0);
+            assert_eq!(items[0].end, hidden_body.len());
         }
     }
     #[test]
@@ -3908,11 +4125,25 @@ mod emissive_tests {
         let atlas = |_: &str| Some([0.0, 0.0, 0.5, 0.5]);
         let part = m.kind.model.clone();
         let extra = [
-            (part.as_ref(), [0.5, 0.0, 1.0, 0.5], 0xFFFF_FFFF, 0, false),
-            (part.as_ref(), [0.5, 0.5, 1.0, 1.0], 0xFFFF_FFFF, 0, true),
+            (
+                part.as_ref(),
+                [0.5, 0.0, 1.0, 0.5],
+                0xFFFF_FFFF,
+                0,
+                "minecraft:iron_chestplate".into(),
+                false,
+            ),
+            (
+                part.as_ref(),
+                [0.5, 0.5, 1.0, 1.0],
+                0xFFFF_FFFF,
+                0,
+                "minecraft:iron_chestplate".into(),
+                true,
+            ),
         ];
         let mut out = Vec::new();
-        render_with(
+        let items = render_with(
             &m,
             0.0,
             glam::DVec3::ZERO,
@@ -3923,6 +4154,14 @@ mod emissive_tests {
             &mut out,
         );
         assert_eq!(out.len(), 12, "body, armour, armour's glow");
+        assert_eq!(items.len(), 2);
+        assert_eq!((items[0].start, items[0].end), (4, 8));
+        assert_eq!((items[1].start, items[1].end), (8, 12));
+        assert!(
+            items
+                .iter()
+                .all(|item| item.item == "minecraft:iron_chestplate")
+        );
         assert!(out[..8].iter().all(|v| v.light == 7));
         assert!(out[8..].iter().all(|v| v.light == FULL_BRIGHT));
     }

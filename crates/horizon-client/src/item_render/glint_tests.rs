@@ -83,6 +83,7 @@ fn state(sprite: &str, foil: FoilType, display: DisplayContext) -> ItemRenderSta
         transforms: Default::default(),
     };
     ItemRenderState {
+        item: "minecraft:stone".into(),
         display,
         layers: vec![LayerRender {
             geometry: LayerGeometry::Quads(Arc::new(baked)),

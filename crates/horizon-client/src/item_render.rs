@@ -6,14 +6,16 @@
 //! and the special model renderers submit, in pose space. A sink then draws
 //! them: [`gui`] into the HUD batch with the GUI item lighting, [`WorldSink`]
 //! into entity vertices with the level's lighting.
-pub mod cit;
 mod components;
+mod definitions;
+use components::custom_model_data_json;
+pub use components::{custom_data_matches, tag_json};
+pub mod cit;
 mod glint_atlas;
 #[cfg(test)]
 mod glint_tests;
 pub mod gui;
 mod special;
-pub use components::custom_data_matches;
 
 use crate::{
     block_entity_render::{ModelPart, diffuse},
@@ -25,8 +27,8 @@ use horizon_assets::{
     animation::AnimationMetadata,
     item_bake::{BakedItemModel, SpriteLookup, SpriteMask, bake_item_model},
     item_model::{
-        ClientItem, Components, Context, DisplayContext, FoilType, ItemEnv, ItemModels,
-        LayerContent, LevelState, OwnerState, SpecialModel, StackView,
+        Components, Context, DisplayContext, FoilType, ItemEnv, ItemModels, LayerContent,
+        LevelState, OwnerState, SpecialModel, StackView,
     },
     model::Direction,
     palette::PalettedPermutations,
@@ -205,6 +207,8 @@ pub struct LayerRender {
 /// `ItemStackRenderState`.
 #[derive(Clone, Debug)]
 pub struct ItemRenderState {
+    /// The actual top-level stack being rendered, independent of its selected model.
+    pub item: String,
     pub display: DisplayContext,
     pub layers: Vec<LayerRender>,
     pub oversized_in_gui: bool,
@@ -459,6 +463,9 @@ fn submit_quads(
     // translucency up once.
     let mut last: Option<(&str, bool)> = None;
     let mut last_rect: Option<(&str, Option<Rect>)> = None;
+    // A glint in the GUI follows the quad's sprite in the glint atlas: looked up once a sprite too.
+    let gui_glint = display == DisplayContext::Gui && foil == Foil::Standard;
+    let mut last_glint: Option<(&str, Option<Rect>)> = None;
     for q in &baked.quads {
         let rect = match last_rect {
             Some((sprite, rect)) if sprite == q.material.sprite => rect,
@@ -511,8 +518,15 @@ fn submit_quads(
             pos,
             uv,
             foil_uv: q.uv,
-            gui_glint_uv: (display == DisplayContext::Gui && foil == Foil::Standard)
-                .then(|| atlas.get(sprite_name(&q.material.sprite)))
+            gui_glint_uv: gui_glint
+                .then(|| match last_glint {
+                    Some((sprite, rect)) if sprite == q.material.sprite => rect,
+                    _ => {
+                        let rect = atlas.get(sprite_name(&q.material.sprite)).copied();
+                        last_glint = Some((&q.material.sprite, rect));
+                        rect
+                    }
+                })
                 .flatten()
                 .map(|r| {
                     q.uv.map(|[u, v]| [r.u0 + (r.u1 - r.u0) * u, r.v0 + (r.v1 - r.v0) * v])
@@ -609,7 +623,9 @@ impl FileSprites {
             }
             None => (iw, ih),
         };
-        if w == 0 || h == 0 {
+        // Match atlas validation before deriving frame coordinates: an oversized
+        // frame otherwise divides by zero or reads beyond the decoded image.
+        if w == 0 || h == 0 || iw % w != 0 || ih % h != 0 {
             return None;
         }
         let columns = iw / w;
@@ -671,36 +687,6 @@ pub struct ItemRenderer {
     glint_atlas: Mutex<HashMap<String, Rect>>,
 }
 
-/// Every `items/**/*.json` client item definition, by identifier. Through
-/// `json_folder`: from the prepared data file when the root has one.
-fn load_definitions(root: &Path) -> BTreeMap<String, ClientItem> {
-    let mut out = BTreeMap::new();
-    let Ok(namespaces) = fs::read_dir(root.join("assets")) else {
-        return out;
-    };
-    for ns in namespaces.flatten() {
-        let Ok(folder) = horizon_world::json_folder::read(&ns.path().join("items")) else {
-            continue;
-        };
-        let namespace = ns.file_name().to_string_lossy().into_owned();
-        for file in &folder.files {
-            let Some(text) = file.bytes().ok().and_then(|b| std::str::from_utf8(b).ok()) else {
-                continue;
-            };
-            match ClientItem::from_json(text) {
-                Ok(item) => {
-                    out.insert(format!("{namespace}:{}", file.name), item);
-                }
-                Err(e) => log::warn!(
-                    "Horizon: item definition {namespace}:{} not loaded: {e}",
-                    file.name
-                ),
-            }
-        }
-    }
-    out
-}
-
 fn glint_padding(filtering: i32, bit: i32) -> usize {
     if filtering == 2 {
         bit.wrapping_sub(1).clamp(0, 4) as usize
@@ -735,7 +721,15 @@ impl ItemRenderer {
         root: &Path,
         library: std::result::Result<Arc<ModelLibrary>, String>,
     ) -> crate::Result<Self> {
-        Self::load_tables(root, library, true)
+        Self::load_tables(root, library, true, None)
+    }
+    /// Reuse the parsed entity-model document from the shared startup batch.
+    pub fn load_with_library_and_entity_models(
+        root: &Path,
+        library: std::result::Result<Arc<ModelLibrary>, String>,
+        document: &crate::mobs::EntityModelDocument,
+    ) -> crate::Result<Self> {
+        Self::load_tables(root, library, true, Some(document))
     }
     /// What a dedicated server reads: the item prototypes (the stacks'
     /// default components) and ids, without the client item definitions,
@@ -745,12 +739,13 @@ impl ItemRenderer {
         root: &Path,
         library: std::result::Result<Arc<ModelLibrary>, String>,
     ) -> crate::Result<Self> {
-        Self::load_tables(root, library, false)
+        Self::load_tables(root, library, false, None)
     }
     fn load_tables(
         root: &Path,
         library: std::result::Result<Arc<ModelLibrary>, String>,
         drawn: bool,
+        entity_models: Option<&crate::mobs::EntityModelDocument>,
     ) -> crate::Result<Self> {
         let prototypes: BTreeMap<String, Components> = horizon_world::item_defaults::shared(root)?
             .iter()
@@ -760,7 +755,7 @@ impl ItemRenderer {
             .collect::<serde_json::Result<_>>()?;
         let models = ItemModels {
             definitions: if drawn {
-                load_definitions(root)
+                definitions::load(root)
             } else {
                 BTreeMap::new()
             },
@@ -778,7 +773,10 @@ impl ItemRenderer {
                 .unwrap_or_default(),
         );
         let parts = if drawn {
-            special::load_parts(root)
+            entity_models.map_or_else(
+                || special::load_parts(root),
+                special::load_parts_from_document,
+            )
         } else {
             HashMap::new()
         };
@@ -951,6 +949,7 @@ impl ItemRenderer {
             })
             .collect();
         ItemRenderState {
+            item: stack.item.clone(),
             display,
             layers,
             oversized_in_gui: resolved.oversized_in_gui,
@@ -1013,59 +1012,6 @@ pub fn glam_matrix(m: &horizon_assets::math::Mat4) -> Mat4 {
 // Stacks
 // ---------------------------------------------------------------------------
 
-/// An NBT value as the JSON its component codec reads.
-pub fn tag_json(tag: &Tag) -> Value {
-    match tag {
-        Tag::End => Value::Null,
-        Tag::Byte(v) => Value::from(*v),
-        Tag::Short(v) => Value::from(*v),
-        Tag::Int(v) => Value::from(*v),
-        Tag::Long(v) => Value::from(*v),
-        Tag::Float(bits) => serde_json::Number::from_f64(f64::from(f32::from_bits(*bits)))
-            .map_or(Value::Null, Value::Number),
-        Tag::Double(bits) => {
-            serde_json::Number::from_f64(f64::from_bits(*bits)).map_or(Value::Null, Value::Number)
-        }
-        Tag::ByteArray(a) => Value::Array(a.iter().map(|b| Value::from(*b as i8)).collect()),
-        Tag::String(s) => Value::String(s.to_string_lossy()),
-        Tag::List(l) => Value::Array(l.iter().map(tag_json).collect()),
-        Tag::Compound(c) => Value::Object(
-            c.iter()
-                .map(|(k, v)| (k.to_string_lossy(), tag_json(v)))
-                .collect(),
-        ),
-        Tag::IntArray(a) => Value::Array(a.iter().map(|v| Value::from(*v)).collect()),
-        Tag::LongArray(a) => Value::Array(a.iter().map(|v| Value::from(*v)).collect()),
-    }
-}
-/// Custom model flags use Codec.BOOL even though NBT stores them as numbers.
-/// Keep the other custom-model fields, and generic NBT JSON, numeric.
-fn custom_model_data_json(tag: &Tag) -> Value {
-    let mut value = tag_json(tag);
-    let flags: Option<Vec<Value>> = match tag.get("flags") {
-        Some(Tag::List(flags)) => flags
-            .iter()
-            .map(|flag| crate::item_data::component_bool(flag).map(Value::Bool))
-            .collect(),
-        Some(Tag::ByteArray(flags)) => flags
-            .iter()
-            .map(|flag| crate::item_data::component_bool(&Tag::Byte(*flag as i8)).map(Value::Bool))
-            .collect(),
-        Some(Tag::IntArray(flags)) => flags
-            .iter()
-            .map(|flag| crate::item_data::component_bool(&Tag::Int(*flag)).map(Value::Bool))
-            .collect(),
-        Some(Tag::LongArray(flags)) => flags
-            .iter()
-            .map(|flag| crate::item_data::component_bool(&Tag::Long(*flag)).map(Value::Bool))
-            .collect(),
-        _ => None,
-    };
-    if let (Some(flags), Some(object)) = (flags, value.as_object_mut()) {
-        object.insert("flags".into(), Value::Array(flags));
-    }
-    value
-}
 /// The resolver's view of a client stack: its item, count and component patch.
 pub fn stack_view(stack: &crate::items::ItemStack) -> StackView {
     let mut view = StackView::new(&stack.item, stack.count as i32);
@@ -1181,14 +1127,22 @@ pub fn rendered_amount(count: u32) -> u32 {
 /// `ItemEntityRenderer.submitMultipleFromCount`: the poses of each copy of
 /// a stack (`seed` is `ItemClusterRenderState.getSeedForItemStack`).
 pub fn cluster_poses(state: &ItemRenderState, pose: Mat4, amount: u32, seed: i64) -> Vec<Mat4> {
+    if amount == 0 {
+        return Vec::new();
+    }
+    let (lo, hi) = state.bounding_box();
+    cluster_poses_with_depth(pose, amount, seed, hi.z - lo.z)
+}
+
+/// [`cluster_poses`] with the depth of the resolved model's bounding box
+/// already computed for this draw (also used to place the stack's bob).
+pub fn cluster_poses_with_depth(pose: Mat4, amount: u32, seed: i64, depth: f32) -> Vec<Mat4> {
     use horizon_core::random::{LegacyRandom, RandomSource};
     let mut out = Vec::new();
     if amount == 0 {
         return out;
     }
     let mut random = LegacyRandom::new(seed);
-    let (lo, hi) = state.bounding_box();
-    let depth = hi.z - lo.z;
     let mut next = || random.next_float() * 2.0 - 1.0;
     if depth > 0.0625 {
         out.push(pose);
@@ -1214,6 +1168,7 @@ pub fn cluster_poses(state: &ItemRenderState, pose: Mat4, amount: u32, seed: i64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use horizon_assets::item_model::ClientItem;
 
     #[test]
     fn custom_model_flags_select_their_model_after_stack_nbt_decoding() {
@@ -1277,6 +1232,7 @@ mod tests {
     #[test]
     fn posed_item_bounds_include_each_cluster_transform() {
         let state = ItemRenderState {
+            item: "minecraft:trident".into(),
             display: DisplayContext::Ground,
             layers: vec![LayerRender {
                 geometry: LayerGeometry::Special {
@@ -1308,6 +1264,43 @@ mod tests {
         let (lo, hi) = state.posed_bounds(&poses).expect("item model has vertices");
         assert_eq!(lo, Vec3::new(-2.0, 1.5, -0.25));
         assert_eq!(hi, Vec3::new(2.5, 3.0, 0.25));
+    }
+
+    #[test]
+    fn stack_copy_positions_keep_the_flat_and_solid_random_sequences() {
+        // Captured from the original cluster renderer with seed 7, three
+        // copies and an identity pose. Flat items draw two random values
+        // per extra copy; solid items draw three.
+        for (depth, expected) in [
+            (
+                0.03125,
+                [
+                    [0, 0, 3_175_088_128],
+                    [1_024_310_737, 1_017_789_485, 0],
+                    [1_025_054_461, 3_180_766_298, 1_027_604_480],
+                ],
+            ),
+            (
+                0.25,
+                [
+                    [0, 0, 0],
+                    [1_032_699_345, 1_026_178_093, 1_033_443_069],
+                    [3_189_154_906, 3_174_720_933, 3_141_056_154],
+                ],
+            ),
+        ] {
+            let copies = cluster_poses_with_depth(Mat4::IDENTITY, 3, 7, depth);
+            assert_eq!(copies.len(), expected.len());
+            for (pose, position) in copies.iter().zip(expected) {
+                let expected =
+                    Mat4::from_translation(Vec3::from_array(position.map(f32::from_bits)));
+                assert_eq!(
+                    pose.to_cols_array().map(f32::to_bits),
+                    expected.to_cols_array().map(f32::to_bits)
+                );
+            }
+        }
+        assert!(cluster_poses_with_depth(Mat4::IDENTITY, 0, 7, 0.25).is_empty());
     }
 
     /// One frame's glint is read once and shared: every item drawn from the
@@ -1383,7 +1376,7 @@ mod tests {
         let empty = r#"{"model":{"type":"minecraft:empty"}}"#;
         fs::write(definitions.join("top.json"), empty)?;
         fs::write(definitions.join("postman/head.json"), empty)?;
-        let loaded = load_definitions(&root);
+        let loaded = definitions::load(&root);
         let _ = fs::remove_dir_all(&root);
         assert!(loaded.contains_key("horizon:top"));
         assert!(loaded.contains_key("horizon:postman/head"));
@@ -1417,6 +1410,59 @@ mod tests {
         assert!(client.cit.is_some());
         assert!(server.cit.is_none());
         assert_eq!(server.models.prototypes, client.models.prototypes);
+        Ok(())
+    }
+
+    #[test]
+    fn item_sprite_rejects_invalid_animation_dimensions() -> crate::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-item-frame-dimensions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let texture = root.join("assets/test/textures/item.png");
+        fs::create_dir_all(texture.parent().unwrap())?;
+        let mut encoder = png::Encoder::new(fs::File::create(&texture)?, 4, 4);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()?
+            .write_image_data(&[255; 4 * 4 * 4])?;
+        let sprites = FileSprites {
+            root: root.clone(),
+            permutations: Vec::new(),
+            cache: Mutex::default(),
+            translucent: Mutex::default(),
+        };
+        let metadata = texture.with_extension("png.mcmeta");
+        for (width, height) in [(8, 4), (4, 8), (3, 4), (4, 3)] {
+            fs::write(
+                &metadata,
+                serde_json::json!({"animation": {"width": width, "height": height}}).to_string(),
+            )?;
+            assert!(sprites.load("test:item").is_none(), "{width}x{height}");
+            let library = ModelLibrary::with_item_generator(std::collections::BTreeMap::from([(
+                "test:item".into(),
+                horizon_assets::model::CuboidModel::from_json(
+                    r#"{"parent":"builtin/generated","textures":{"layer0":"test:item"}}"#,
+                )?,
+            )]))?;
+            let baked = bake_item_model(&library, &sprites, "test:item")?;
+            assert!(!baked.quads.is_empty());
+            assert!(
+                baked
+                    .quads
+                    .iter()
+                    .all(|q| q.material.sprite == "minecraft:missingno")
+            );
+        }
+        fs::write(&metadata, r#"{"animation":{"width":2,"height":2}}"#)?;
+        let mask = sprites.load("test:item").unwrap();
+        assert_eq!((mask.width, mask.height, mask.frames.len()), (2, 2, 4));
+        assert!(mask.frames.iter().all(|frame| frame == &[false; 4]));
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

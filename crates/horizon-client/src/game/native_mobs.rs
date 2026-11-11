@@ -140,7 +140,7 @@ fn finite(v: [f64; 3]) -> bool {
 }
 
 /// `/summon`'s world bounds (`Level.isInSpawnableBounds`).
-fn spawnable(pos: [f64; 3]) -> bool {
+pub(super) fn spawnable(pos: [f64; 3]) -> bool {
     finite(pos)
         && (-30_000_000.0..30_000_000.0).contains(&pos[0])
         && (-30_000_000.0..30_000_000.0).contains(&pos[2])
@@ -204,6 +204,8 @@ impl Game<'_> {
             m.no_gravity = options.no_gravity;
             if let Some(name) = &options.name {
                 m.custom_name = Some(name.clone());
+                // A plain name replaces any styled one the spawn gave.
+                m.custom_name_text = None;
                 m.name_visible = true;
             }
             if let Some(health) = options.health.filter(|h| h.is_finite() && *h > 0.0) {

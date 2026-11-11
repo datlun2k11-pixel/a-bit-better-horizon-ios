@@ -176,10 +176,12 @@ struct Server {
 impl Server {
     fn tick(&mut self, entities: &[EntityState]) {
         let mut ctx = TickCtx {
+            sea_level: 63,
             world: &mut self.world,
             entities,
             next_entity: &mut self.next_entity,
             spawn: [8.5, f64::from(MIN_Y + 5), 8.5],
+            spawn_angle: [0.0; 2],
             difficulty: 2,
             difficulty_locked: false,
             clock_rate: 1.0,
@@ -1045,6 +1047,8 @@ fn guests_see_each_other_and_the_world_entities() {
         vertical_collision: false,
         horizontal_collision: false,
         needs_sync: false,
+        sync_position: false,
+        stepped: false,
         idle: false,
         bare: false,
         leash: None,
@@ -1684,10 +1688,12 @@ fn a_respawned_guest_is_immune_until_its_client_loads_the_world() {
     let border = horizon_client::worldborder::WorldBorder::default();
     let at = [8.5, f64::from(MIN_Y + 5), 8.5];
     let ctx = TickCtx {
+        sea_level: 63,
         world: &mut s.world,
         entities: &[],
         next_entity: &mut s.next_entity,
         spawn: at,
+        spawn_angle: [0.0; 2],
         difficulty: 2,
         difficulty_locked: false,
         clock_rate: 1.0,

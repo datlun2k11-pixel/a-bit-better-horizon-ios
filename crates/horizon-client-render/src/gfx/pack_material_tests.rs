@@ -149,6 +149,7 @@ void main() {
         post,
         wgpu::TextureFormat::Rgba8Unorm,
         world,
+        &Default::default(),
     )
     .expect("the pack runs");
     let mut pass = post
@@ -168,7 +169,7 @@ void main() {
         }
         let maps_expected = case == 0;
         pass.groups.clear();
-        post.resize(&device, [15, 1]);
+        post.resize(&device, &queue, [15, 1]).unwrap();
         let read = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 256,

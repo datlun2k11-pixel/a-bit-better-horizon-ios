@@ -352,6 +352,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.remove_moving_piston(pos);
         } else if block_changed
             && (self.b.has_flag(old, super::data::state_flags::BLOCK_ENTITY)
+                || self.level.has_native_block_entity(old)
                 || self.level.has_mod_block_entity(pos))
             && !self.keeps_block_entity(state, old)
         {
@@ -381,6 +382,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         if update_flags & flags::UPDATE_SKIP_ON_PLACE == 0 {
             self.on_place(state, pos, old, moved);
         }
+        let landed = self.state(pos);
+        if self.block_of(landed) == new_block {
+            self.level.ensure_block_entity(pos, landed);
+        }
         Some(old)
     }
     /// `BlockState.shouldChangedStateKeepBlockEntity(oldState)`: copper chests
@@ -391,11 +396,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         (tags.copper_chests.contains(new) && tags.copper_chests.contains(old))
             || (tags.copper_golem_statues.contains(new) && tags.copper_golem_statues.contains(old))
     }
-    /// `MovingPistonBlock.destroy`: a `moving_piston` that goes away takes the
-    /// piston base behind it with it when that base is extended (a head that was
-    /// still moving over a base that finished extending). An unextended base, or
-    /// no piston base at all, stays.
-    pub(crate) fn destroy_moving_piston_base(&mut self, pos: BlockPos, state: BlockStateId) {
+    /// `MovingPistonBlock.destroy`, called after a player's successful removal.
+    /// Ordinary replacement (including finishing the moving head) does not call
+    /// this hook. An extended piston base behind the removed block goes with it.
+    pub(super) fn destroy_moving_piston_base(&mut self, pos: BlockPos, state: BlockStateId) {
         let b = self.b;
         let Some(facing) = b.table.dir(state, b.props.facing) else {
             return;

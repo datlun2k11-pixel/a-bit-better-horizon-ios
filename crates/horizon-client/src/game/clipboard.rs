@@ -28,7 +28,7 @@ impl Game<'_> {
     /// Shift in `keys` without the key being down.
     pub(super) fn has_control_down_with_quirk(&self) -> bool {
         let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.physical_keys.contains(k));
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
             self.modifiers.super_key() || held([KeyCode::SuperLeft, KeyCode::SuperRight])
         } else {
             self.modifiers.control_key() || held([KeyCode::ControlLeft, KeyCode::ControlRight])
@@ -39,7 +39,7 @@ impl Game<'_> {
     /// part of AltGr.
     pub(super) fn types_text(&self) -> bool {
         let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.physical_keys.contains(k));
-        let edit = if cfg!(target_os = "macos") {
+        let edit = if cfg!(any(target_os = "macos", target_os = "ios")) {
             held([KeyCode::SuperLeft, KeyCode::SuperRight])
         } else {
             held([KeyCode::ControlLeft, KeyCode::ControlRight])

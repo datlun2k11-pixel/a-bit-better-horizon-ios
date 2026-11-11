@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 class MouseScrollingHookTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
     def test_axes_accumulation_context_gates_and_cancellation(self):
-        source = (ROOT / "crates/horizon-client/src/game.rs").read_text(encoding="utf-8")
+        source = "".join((ROOT / "crates/horizon-client/src" / path).read_text(encoding="utf-8")
+                         for path in ("game/play_input.rs", "game.rs"))
         start = source.index("                    let (raw_x, raw_y) = match delta")
         normalize = source[start:source.index("                    // ScreenEvent.MouseScrolled.Pre", start)]
         start = source.index("                    if self.hotbar_takes_wheel()", start)
@@ -35,13 +36,13 @@ struct SpectatorGui { active: bool }
 impl SpectatorGui { fn is_menu_active(&self) -> bool { self.active } }
 fn glfw_modifiers(bits: u32) -> u32 { bits }
 struct Game { screen: Screen, overlay: bool, sleeping: Option<()>, player: Option<Player>,
-    legacy_claimed: bool, synthetic: bool, cancel: bool, mouse: mouse::MouseLook, selected: usize,
+    zoom_claimed: bool, legacy_claimed: bool, synthetic: bool, cancel: bool, mouse: mouse::MouseLook, selected: usize,
     settings: Settings, physical_buttons: HashSet<MouseButton>, cursor: (f32, f32), modifiers: u32,
     spectator: bool, spectator_gui: SpectatorGui, menu_scrolls: Vec<i32>, legacy_calls: usize,
     calls: Vec<([f64; 2], [i32; 2], [bool; 3], [f32; 2], u32)> }
 impl Game {
     fn new() -> Self { Self { screen: Screen::Playing, overlay: false, sleeping: None,
-        player: Some(Player { flying_speed: 0.1 }), legacy_claimed: false, synthetic: false,
+        player: Some(Player { flying_speed: 0.1 }), zoom_claimed:false, legacy_claimed: false, synthetic: false,
         cancel: false, mouse: mouse::MouseLook::default(), selected: 4,
         settings: Settings { discrete_scroll: false, mouse_wheel_sensitivity: 1.0 },
         physical_buttons: HashSet::from([MouseButton::Left, MouseButton::Right]),
@@ -51,6 +52,7 @@ impl Game {
     fn pad_synthetic_input(&self) -> bool { self.synthetic }
     fn spectator(&self) -> bool { self.spectator }
     fn spectator_scroll(&mut self, steps: i32) { self.menu_scrolls.push(steps); }
+    fn extras_scroll(&mut self,_:f32)->bool{self.zoom_claimed}
     fn native_wheel_event(&mut self, _: f32) -> bool { self.legacy_calls += 1; self.legacy_claimed }
     fn native_mouse_scrolling(&mut self, scroll: [f64;2], accumulated: [i32;2], buttons: [bool;3],
         cursor: [f32;2], modifiers: u32, canceled: &mut bool) {
@@ -99,11 +101,11 @@ fn cancellation_consumes_steps_and_preserves_gameplay() {
 }
 #[test]
 fn source_and_legacy_gates() {
-    for gate in 0..6 {
+    for gate in 0..7 {
         let mut game = Game::new();
         match gate { 0 => game.screen = Screen::Other, 1 => game.overlay = true,
             2 => game.sleeping = Some(()), 3 => game.player = None,
-            4 => game.legacy_claimed = true, _ => game.synthetic = true }
+            4 => game.legacy_claimed = true, 5 => game.synthetic = true, _ => game.zoom_claimed = true }
         game.wheel(MouseScrollDelta::LineDelta(0.0,1.0)).unwrap();
         assert!(game.calls.is_empty());
         assert_eq!(game.selected, if gate==5 {3} else {4});

@@ -1,6 +1,7 @@
 """tools/wire_stream.py cuts a capture's serverbound play stream into client ticks: the comparison of a Horizon
 client's packets with vanilla's (tools/test_wire_stream_parity.py) is only as good as this cut."""
 from pathlib import Path
+import ast
 import importlib.util
 import struct
 import unittest
@@ -107,6 +108,51 @@ class WireStreamTest(unittest.TestCase):
         self.assertEqual(wire_stream.field_diff(diffs[0][1], diffs[0][2]),
                          ['    #0 move_player_pos.y: vanilla -60.0, Horizon -60.0000001'])
         self.assertEqual(wire_stream.compare([tick(-60.0)], [tick(-60.0)], 0), [])
+
+
+
+class ScriptCapturePolicy(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Execute the actual generator and its scenario data without importing
+        # runner modules whose names overlap this unittest discovery directory.
+        path = Path(__file__).resolve().parents[1] / 'tools' / 'test_wire_stream_parity.py'
+        tree = ast.parse(path.read_text(), filename=str(path))
+        functions = {'merge', 'every', 'taps', 'horizon_lines', 'script'}
+        data = {'PLAYER', 'BOAT_DRIVER', 'FLOOR', 'TARGET', 'PRELUDE', 'SCENARIOS'}
+        nodes = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name in functions
+                 or isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in data
+                                                        for t in node.targets)]
+        cls.runner = {}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), cls.runner)
+
+    def test_default_leaves_render_mouse_to_the_native_default(self):
+        spec = dict(ticks=2, steps={0: ['key w down']})
+        for horizon in [False, True]:
+            result = self.runner['script']('default', spec, horizon)
+            self.assertNotIn('render_mouse', result)
+            self.assertEqual(result['steps']['10'], ['key w down'])
+
+    def test_explicit_capture_policy_is_preserved_for_both_clients(self):
+        for policy in [False, True]:
+            for horizon in [False, True]:
+                result = self.runner['script']('policy', dict(ticks=2, steps={}, render_mouse=policy), horizon)
+                self.assertIs(result['render_mouse'], policy)
+
+    def test_non_boolean_capture_policy_is_rejected(self):
+        for malformed in [None, 0, 1, 'false', [], {}]:
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(ValueError, 'boolean'):
+                self.runner['script']('bad', dict(ticks=2, steps={}, render_mouse=malformed), False)
+
+    def test_only_keyboard_boats_disable_idle_render_mouse_turns(self):
+        boats = {'boat_driver', 'boat_turning_driver', 'boat_second_passenger'}
+        disabled = {name for name, spec in self.runner['SCENARIOS'].items()
+                    if spec.get('render_mouse', True) is False}
+        self.assertEqual(disabled, boats)
+        for name in boats:
+            for lines in self.runner['SCENARIOS'][name]['steps'].values():
+                self.assertTrue(all(not line.startswith('mouse ') for line in lines))
 
 
 if __name__ == '__main__':

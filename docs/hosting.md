@@ -1,5 +1,7 @@
 # Host a server
 
+> This shared guide covers hosting a server on a computer. For playing on iPhone/iPad, use the [mobile README](../README.md). Report mobile-client problems in [heyskylo/horizon-ios](https://github.com/heyskylo/horizon-ios/issues).
+
 `horizon-server` hosts a Minecraft Java Edition 26.3 server with Horizon's own game as the engine: one native
 program, no Java, one settings file, a command line, and a web panel. Vanilla 26.3 clients and Horizon clients
 can join it. This page covers what works on `main` today and says plainly what doesn't yet. The design and the
@@ -20,7 +22,7 @@ plan are in [server.md](server.md).
   takes the account's UUID when someone owns that name, as vanilla does, and that player is then refused.
 - **An offline server** (`online_mode = false`) never checks accounts: anyone who reaches it can join under
   any name. Keep it on your LAN or a tailnet (Tailscale, ZeroTier), or share it only with friends you trust.
-  A Horizon player under an offline name can join only such a server.
+  A Horizon game started without a session (no network at Play) can join only such a server.
 - **Secure chat** works as on vanilla's server: in online mode, vanilla clients and Horizon's (Nightly
   2026-11-01 and newer) sign their chat, and with `enforce-secure-profile=true` (the default) unsigned chat is
   refused. On an offline server, or for a player without a chat session, chat stays unsigned and shows as not
@@ -65,6 +67,8 @@ for Windows includes it), else against the SHA-256 GitHub publishes, and never a
 Options: `--version vX.Y.Z`, `--dir FOLDER`, `--bin FOLDER` (Windows: `-Version`, `-Dir`). Other systems,
 such as Linux on ARM, build from source: `cargo build --release -p horizon-client --bin horizon-client -p
 horizon-server` and keep both programs in one folder.
+
+On Nix and NixOS, the repository's flake builds `horizon-server` from source: [nix.md](nix.md).
 
 The Horizon launcher also installs releases. Every release folder holds `horizon-server`, so you can run it
 from there too.
@@ -233,8 +237,8 @@ the player's screen. To fill the ring, generate the world ahead of the players w
 
 The far ring goes after everything else: its chunks wait behind the ones inside `view_distance`, are paced
 by how fast each player's game takes them, and aren't read while the world's saves are behind. When the
-average tick goes over 40 ms, the ring pulls in by two chunks a second, never inside `view_distance`; after
-30 s of ticks under 25 ms, it grows back by one chunk every 5 s. What it sent is kept in memory for 5
+average tick goes over 50 ms, the ring pulls in by two chunks a second, never inside `view_distance`; after
+30 s of ticks under 45 ms, it grows back by one chunk every 5 s. What it sent is kept in memory for 5
 minutes (96 MB at most), so a player walking back isn't sent the save again.
 
 Already have a vanilla server? Run `horizon-server init` in its folder, or `horizon-server import
@@ -421,7 +425,9 @@ only. To reach it from your other devices:
 - forward the port over SSH: `ssh -L 8130:127.0.0.1:8130 your-server`, then open the link on your computer.
 
 Any other address, such as `0.0.0.0` or a public IP, is refused unless you set `allow_public = true`, and
-even then the panel warns at every start. It has no passwords to leak: whoever can read the server folder can
+even then the panel warns at every start. With `bind = "0.0.0.0:8130"` it answers on every address of this
+computer, so a LAN whose router hands out a new IP keeps working: open `http://<its LAN IP>:8130`, and the
+login link names that IP. It has no passwords to leak: whoever can read the server folder can
 make a login link, and no one else can. Never put it on the open internet.
 
 ### A bot or a tool of your own
@@ -652,7 +658,7 @@ No image is published: build one from the repository. The image holds none of Mi
 folder you prepared (step 2) read-only.
 
 ```sh
-git clone https://github.com/horizon-rust/horizon && cd horizon
+git clone https://github.com/heyskylo/horizon-ios.git horizon && cd horizon
 docker build -f packaging/server/Dockerfile -t horizon-server .
 
 docker run -d --name horizon -p 25565:25565 --stop-timeout 180 \
@@ -677,11 +683,10 @@ docker run -d --name horizon -p 25565:25565 --stop-timeout 180 \
 ## 10. How fast is it
 
 The latest bot benchmark compares Horizon with vanilla 26.3, Paper and Fabric + Lithium:
-[benchmarks/server-four-way-2026-10-19](https://github.com/horizon-rust/horizon/blob/main/benchmarks/server-four-way-2026-10-19/README.md).
+[benchmarks/server-four-way-2026-10-19](https://github.com/heyskylo/horizon-ios/blob/main/benchmarks/server-four-way-2026-10-19/README.md).
 It ran release v2026.10.19 on a 4-thread laptop CPU (i7-7500U), with 1 to 50 players walking, exploring and
-standing around spawn, the bots on another machine. All four servers did the same work. Earlier
-measurements are in [docs/server.md](https://github.com/horizon-rust/horizon/blob/main/docs/server.md). In
-short:
+standing around spawn, the bots on another machine. All four servers did the same work. Against
+Pumpkin: [performance/server-vs-pumpkin.md](performance/server-vs-pumpkin.md). In short:
 
 - **Memory:** 0.7 GB with one player and 1.1 GB with 50, against 3.4 to 4.5 GB for the Java servers
   (each with a 4 GB heap): 3.8 to 4.8 times less.

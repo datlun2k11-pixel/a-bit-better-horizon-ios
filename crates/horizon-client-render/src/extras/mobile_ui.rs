@@ -1,13 +1,32 @@
 //! Settings for the native mobile extras.
+#[cfg(not(target_os = "ios"))]
+use super::native_ios::{ZOOM_KEY, ZOOM_LEVELS};
 use super::*;
 /// The settings the Extras page shows, one per row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
+    PackBrowser,
+    Pregen,
+    /// Shared PvP & HUD page options, with their upstream translations.
+    Pvp(crate::pvp::Opt),
+    CosmeticsHideFx,
+    MusicPage,
+    CosmeticsMine,
+    CosmeticsOthers,
+    CosmeticsSolo,
+    HorizonMarks,
+    HorizonMe,
+    ReproKeys,
+    WheelCyclesSettings,
     Fullbright,
+    HideBlockParticles,
+    UiSoundReserve,
+    ChatAnimation,
+    ChatIndicator,
+    Splitscreen,
+
     DynamicLights,
     OwnNameTag,
-    /// Not on the Extras page: Graphics' Particles group shows it, as on desktop.
-    HideBlockParticles,
     Zoom,
     ZoomKey,
     ZoomLevel,
@@ -33,20 +52,12 @@ pub enum Item {
     /// Not on the Extras page: Horizon Settings shows No AI, its AI Agent page Agent Control.
     NoAi,
     AgentControl,
-    /// On the Horizon Settings page.
-    DiscordPresence,
-    /// On the AI Agent page, next to Agent Control: the F3 recording shortcuts.
-    ReproKeys,
-    /// On the Splitscreen settings page.
-    Splitscreen,
 }
 /// The Extras page: headers and items.
 pub fn rows() -> Vec<Result<Item, &'static str>> {
-    use Item::*;
-    vec![
+    use self::Item::*;
+    let mut rows = vec![
         Err("Lighting"),
-        Ok(Fullbright),
-        Ok(DynamicLights),
         Ok(OwnNameTag),
         Err("Zoom"),
         Ok(Zoom),
@@ -76,7 +87,26 @@ pub fn rows() -> Vec<Result<Item, &'static str>> {
         Ok(SortKey),
         Err("Multiplayer"),
         Ok(AutoReconnect),
-    ]
+        Ok(UiSoundReserve),
+        Ok(MusicPage),
+        Ok(PackBrowser),
+        Ok(Pregen),
+        Ok(ChatAnimation),
+        Ok(ChatIndicator),
+        Ok(WheelCyclesSettings),
+    ];
+    if horizon_cosmetics::enabled() {
+        rows.extend([
+            Err("horizon.extras.header.cosmetics"),
+            Ok(CosmeticsMine),
+            Ok(CosmeticsSolo),
+            Ok(CosmeticsOthers),
+            Ok(CosmeticsHideFx),
+            Ok(HorizonMarks),
+            Ok(HorizonMe),
+        ]);
+    }
+    rows
 }
 /// "1 block", "2 blocks", "½ block".
 fn block_count(n: f32) -> String {
@@ -94,12 +124,123 @@ fn next<T: Copy + PartialEq>(all: &[T], current: T, back: bool) -> T {
     all[if back { (i + n - 1) % n } else { (i + 1) % n }]
 }
 impl Item {
+    fn shared(self) -> Option<super::desktop_ui::Item> {
+        Some(match self {
+            Self::Pvp(option) => super::desktop_ui::Item::Pvp(option),
+            Self::PackBrowser => super::desktop_ui::Item::PackBrowser,
+            Self::Pregen => super::desktop_ui::Item::Pregen,
+            Self::CosmeticsHideFx => super::desktop_ui::Item::CosmeticsHideFx,
+            Self::MusicPage => super::desktop_ui::Item::MusicPage,
+            Self::CosmeticsMine => super::desktop_ui::Item::CosmeticsMine,
+            Self::CosmeticsOthers => super::desktop_ui::Item::CosmeticsOthers,
+            Self::CosmeticsSolo => super::desktop_ui::Item::CosmeticsSolo,
+            Self::HorizonMarks => super::desktop_ui::Item::HorizonMarks,
+            Self::HorizonMe => super::desktop_ui::Item::HorizonMe,
+            Self::ReproKeys => super::desktop_ui::Item::ReproKeys,
+            Self::WheelCyclesSettings => super::desktop_ui::Item::WheelCyclesSettings,
+            Self::Fullbright => super::desktop_ui::Item::Fullbright,
+            Self::DynamicLights => super::desktop_ui::Item::DynamicLights,
+            Self::OwnNameTag => super::desktop_ui::Item::OwnNameTag,
+            Self::AutoReconnect => super::desktop_ui::Item::AutoReconnect,
+            Self::MouseTweaks => super::desktop_ui::Item::MouseTweaks,
+            Self::MouseTweaksWheel => super::desktop_ui::Item::MouseTweaksWheel,
+            Self::Sort => super::desktop_ui::Item::Sort,
+            Self::SortKey => super::desktop_ui::Item::SortKey,
+            Self::NoAi => super::desktop_ui::Item::NoAi,
+            Self::AgentControl => super::desktop_ui::Item::AgentControl,
+            Self::HideBlockParticles => super::desktop_ui::Item::HideBlockParticles,
+            Self::UiSoundReserve => super::desktop_ui::Item::UiSoundReserve,
+            Self::ChatAnimation => super::desktop_ui::Item::ChatAnimation,
+            Self::ChatIndicator => super::desktop_ui::Item::ChatIndicator,
+            Self::Splitscreen => super::desktop_ui::Item::Splitscreen,
+            _ => return None,
+        })
+    }
+    pub fn caption_text(self) -> String {
+        self.shared()
+            .map_or_else(|| self.caption().into(), |item| item.caption_text())
+    }
+    pub fn description_text(self) -> String {
+        self.shared().map_or_else(
+            || crate::lang::get_or(self.description_key(), self.description()),
+            |item| item.description_text(),
+        )
+    }
+
+    /// Shared controls retain their upstream keys; native controls have their own keys
+    /// with English fallbacks in `description`, ready for the same language catalogs.
+    pub fn description_key(self) -> &'static str {
+        match self {
+            Item::Zoom => "horizon.extras.zoom.tooltip",
+            Item::ZoomKey => "horizon.extras.zoom_key.tooltip",
+            Item::ZoomLevel => "horizon.extras.zoom_level.tooltip",
+            Item::ZoomSmooth => "horizon.extras.zoom_smooth.tooltip",
+            Item::ZoomSensitivity => "horizon.extras.zoom_sensitivity.tooltip",
+            Item::Fps => "horizon.extras.fps.tooltip",
+            Item::FpsCorner | Item::KeystrokesCorner | Item::MinimapCorner => {
+                "horizon.extras.overlay_corner.tooltip"
+            }
+            Item::FpsLows => "horizon.extras.fps_lows.tooltip",
+            Item::Keystrokes => "horizon.extras.keystrokes.tooltip",
+            Item::KeystrokesCps => "horizon.extras.keystrokes_cps.tooltip",
+            Item::Minimap => "horizon.extras.minimap.tooltip",
+            Item::MinimapSize => "horizon.extras.minimap_size.tooltip",
+            Item::MinimapShape => "horizon.extras.minimap_shape.tooltip",
+            Item::MinimapZoom => "horizon.extras.minimap_zoom.tooltip",
+            Item::MinimapRotate => "horizon.extras.minimap_rotate.tooltip",
+
+            Item::Fullbright => "horizon.extras.fullbright.tooltip",
+            Item::DynamicLights => "horizon.extras.dynamic_lights.tooltip",
+            Item::OwnNameTag => "horizon.extras.own_name_tag.tooltip",
+            Item::HideBlockParticles => "horizon.extras.hide_block_particles.tooltip",
+            Item::AutoReconnect => "horizon.extras.auto_reconnect.tooltip",
+            Item::UiSoundReserve => "horizon.extras.ui_sound_reserve.tooltip",
+            Item::MusicPage => "horizon.extras.music_page.tooltip",
+            Item::MouseTweaks => "horizon.extras.mouse_tweaks.tooltip",
+            Item::MouseTweaksWheel => "horizon.extras.mouse_tweaks_wheel.tooltip",
+            Item::Sort => "horizon.extras.sort.tooltip",
+            Item::SortKey => "horizon.extras.sort_key.tooltip",
+            Item::NoAi => "horizon.extras.no_ai.tooltip",
+            Item::AgentControl => "horizon.extras.agent_control.tooltip",
+            Item::ReproKeys => "horizon.extras.repro_keys.tooltip",
+            Item::Splitscreen => "horizon.extras.splitscreen.tooltip",
+            Item::ChatAnimation => "horizon.extras.chat_animation.tooltip",
+            Item::ChatIndicator => "horizon.extras.chat_indicator.tooltip",
+            Item::WheelCyclesSettings => "horizon.extras.wheel_cycles_settings.tooltip",
+            Item::PackBrowser => "horizon.extras.pack_browser.tooltip",
+            Item::Pregen => "horizon.extras.pregen.tooltip",
+            Item::CosmeticsMine => "horizon.extras.cosmetics_mine.tooltip",
+            Item::CosmeticsOthers => "horizon.extras.cosmetics_others.tooltip",
+            Item::CosmeticsHideFx => "horizon.extras.cosmetics_hide_fx.tooltip",
+            Item::CosmeticsSolo => "horizon.extras.cosmetics_solo.tooltip",
+            Item::HorizonMarks => "horizon.extras.horizon_marks.tooltip",
+            Item::HorizonMe => "horizon.extras.horizon_me.tooltip",
+            Item::Pvp(o) => o.description_key(),
+        }
+    }
+
     pub fn caption(self) -> &'static str {
         match self {
+            Item::Pvp(_)
+            | Item::PackBrowser
+            | Item::Pregen
+            | Item::CosmeticsHideFx
+            | Item::MusicPage
+            | Item::CosmeticsMine
+            | Item::CosmeticsOthers
+            | Item::CosmeticsSolo
+            | Item::HorizonMarks
+            | Item::HorizonMe
+            | Item::ReproKeys
+            | Item::WheelCyclesSettings
+            | Item::HideBlockParticles
+            | Item::UiSoundReserve
+            | Item::ChatAnimation
+            | Item::ChatIndicator
+            | Item::Splitscreen => self.shared().unwrap().caption(),
             Item::Fullbright => "Fullbright",
             Item::DynamicLights => "Dynamic lights",
             Item::OwnNameTag => "Own name tag",
-            Item::HideBlockParticles => "Hide block-break particles",
             Item::Zoom => "Zoom",
             Item::ZoomKey => "Zoom key",
             Item::ZoomLevel => "Starting zoom",
@@ -122,32 +263,27 @@ impl Item {
             Item::KeystrokesCps => "Clicks per second",
             Item::NoAi => "No AI",
             Item::AgentControl => "Agent Control",
-            Item::DiscordPresence => "Discord Rich Presence",
-            Item::ReproKeys => "Recording shortcuts",
-            Item::Splitscreen => "Splitscreen",
         }
-    }
-    /// The caption in the current language (English when the key is missing).
-    pub fn caption_text(self) -> String {
-        self.caption().into()
-    }
-    /// The description in the current language (English when the key is missing).
-    pub fn description_text(self) -> String {
-        self.description().into()
     }
     /// The switch this setting belongs to: it does nothing while that is off.
     pub fn parent(self) -> Option<Item> {
-        use Item::*;
+        use self::Item::*;
         Some(match self {
+            Pvp(option) => return option.parent().map(Pvp),
+            ChatIndicator => ChatAnimation,
+            HideBlockParticles | UiSoundReserve | ChatAnimation | Splitscreen | PackBrowser
+            | Pregen | CosmeticsHideFx | MusicPage | CosmeticsMine | CosmeticsOthers
+            | CosmeticsSolo | HorizonMarks | HorizonMe | ReproKeys | WheelCyclesSettings => {
+                return None;
+            }
             ZoomKey | ZoomLevel | ZoomSmooth | ZoomSensitivity => Zoom,
             MinimapCorner | MinimapSize | MinimapShape | MinimapZoom | MinimapRotate => Minimap,
             FpsCorner | FpsLows => Fps,
             KeystrokesCorner | KeystrokesCps => Keystrokes,
             MouseTweaksWheel => MouseTweaks,
             SortKey => Sort,
-            Fullbright | DynamicLights | OwnNameTag | HideBlockParticles | Zoom | Minimap | Fps
-            | Keystrokes | MouseTweaks | Sort | AutoReconnect | NoAi | AgentControl
-            | DiscordPresence | ReproKeys | Splitscreen => {
+            Fullbright | DynamicLights | OwnNameTag | Zoom | Minimap | Fps | Keystrokes
+            | MouseTweaks | Sort | AutoReconnect | NoAi | AgentControl => {
                 return None;
             }
         })
@@ -155,6 +291,23 @@ impl Item {
     /// What the row says under its caption.
     pub fn description(self) -> &'static str {
         match self {
+            Item::Pvp(_)
+            | Item::PackBrowser
+            | Item::Pregen
+            | Item::CosmeticsHideFx
+            | Item::MusicPage
+            | Item::CosmeticsMine
+            | Item::CosmeticsOthers
+            | Item::CosmeticsSolo
+            | Item::HorizonMarks
+            | Item::HorizonMe
+            | Item::ReproKeys
+            | Item::WheelCyclesSettings
+            | Item::HideBlockParticles
+            | Item::UiSoundReserve
+            | Item::ChatAnimation
+            | Item::ChatIndicator
+            | Item::Splitscreen => self.shared().unwrap().description(),
             Item::Fullbright => "Show blocks and entities at full light, even in dark areas.",
             Item::DynamicLights => {
                 "Torches and other light sources held, dropped or on fire light the blocks around them."
@@ -174,9 +327,6 @@ impl Item {
             Item::MinimapZoom => "Blocks per pixel: smaller shows more detail, larger more land.",
             Item::MinimapRotate => "Forward is up; off keeps north up.",
             Item::OwnNameTag => "Show your own name above the player model in third person.",
-            Item::HideBlockParticles => {
-                "Hides the debris particles that burst from a broken block and crumble off the one you mine. Other particles stay."
-            }
             Item::AutoReconnect => {
                 "Rejoins a server after a lost connection or a restart, never after a kick or ban."
             }
@@ -198,17 +348,8 @@ impl Item {
             Item::NoAi => {
                 "Hides and turns off every AI feature: agent control, horizon-ctl and the MCP servers. The launcher's switch too."
             }
-            Item::DiscordPresence => {
-                "Shows Playing Horizon on your Discord profile while Discord runs: menus, single player or multiplayer, the dimension and the time played. Never a world's name or a server's address."
-            }
             Item::AgentControl => {
                 "Your own AI agent can play this game through horizon-ctl or an MCP client, on this computer only."
-            }
-            Item::ReproKeys => {
-                "F3+R starts or stops a repro recording and F3+E writes its bundle. Off by default: a recording copies the world."
-            }
-            Item::Splitscreen => {
-                "In a world, another controller can join as a new player: press A when it asks, then pick a profile and where to play."
             }
         }
     }
@@ -219,16 +360,35 @@ impl Item {
             Item::Fullbright | Item::Zoom | Item::Fps | Item::Keystrokes => Some(Cost::None),
             Item::Minimap | Item::DynamicLights => Some(Cost::Low),
             Item::AutoReconnect | Item::MouseTweaks | Item::Sort => Some(Cost::None),
+            Item::CosmeticsSolo | Item::HorizonMarks | Item::HorizonMe => {
+                self.shared().unwrap().cost()
+            }
             _ => None,
         }
     }
     /// On/off items and their value.
     pub fn switch(self, e: &Extras) -> Option<bool> {
         Some(match self {
+            Item::Pvp(_)
+            | Item::PackBrowser
+            | Item::Pregen
+            | Item::CosmeticsHideFx
+            | Item::MusicPage
+            | Item::CosmeticsMine
+            | Item::CosmeticsOthers
+            | Item::CosmeticsSolo
+            | Item::HorizonMarks
+            | Item::HorizonMe
+            | Item::ReproKeys
+            | Item::WheelCyclesSettings
+            | Item::HideBlockParticles
+            | Item::UiSoundReserve
+            | Item::ChatAnimation
+            | Item::ChatIndicator
+            | Item::Splitscreen => return self.shared().unwrap().switch(e),
             Item::Fullbright => e.fullbright,
             Item::DynamicLights => e.dynamic_lights,
             Item::OwnNameTag => e.own_name_tag,
-            Item::HideBlockParticles => e.hide_block_particles,
             Item::Zoom => e.zoom,
             Item::ZoomSmooth => e.zoom_smooth,
             Item::ZoomSensitivity => e.zoom_sensitivity,
@@ -244,15 +404,18 @@ impl Item {
             Item::Sort => e.sort,
             Item::NoAi => e.no_ai,
             Item::AgentControl => e.agent_control,
-            Item::DiscordPresence => e.discord_presence,
-            Item::ReproKeys => e.repro_keys,
-            Item::Splitscreen => e.splitscreen,
             _ => return None,
         })
     }
     /// The value of the other items, as their button shows it.
     pub fn value(self, e: &Extras) -> String {
         match self {
+            Item::Pvp(_)
+            | Item::CosmeticsMine
+            | Item::CosmeticsOthers
+            | Item::CosmeticsSolo
+            | Item::HorizonMarks
+            | Item::HorizonMe => self.shared().unwrap().value(e),
             Item::ZoomKey => crate::keybinds::display_name(&e.zoom_key).plain(),
             Item::SortKey => crate::keybinds::display_name(&e.sort_key).plain(),
             Item::ZoomLevel => format!("{}x", e.zoom_level),
@@ -275,10 +438,26 @@ impl Item {
     /// A click (`back` for the right button). The zoom key binds instead.
     pub fn cycle(self, e: &mut Extras, back: bool) {
         match self {
+            Item::Pvp(_)
+            | Item::PackBrowser
+            | Item::Pregen
+            | Item::CosmeticsHideFx
+            | Item::MusicPage
+            | Item::CosmeticsMine
+            | Item::CosmeticsOthers
+            | Item::CosmeticsSolo
+            | Item::HorizonMarks
+            | Item::HorizonMe
+            | Item::ReproKeys
+            | Item::WheelCyclesSettings
+            | Item::HideBlockParticles
+            | Item::UiSoundReserve
+            | Item::ChatAnimation
+            | Item::ChatIndicator
+            | Item::Splitscreen => self.shared().unwrap().cycle(e, back),
             Item::Fullbright => e.fullbright = !e.fullbright,
             Item::DynamicLights => e.dynamic_lights = !e.dynamic_lights,
             Item::OwnNameTag => e.own_name_tag = !e.own_name_tag,
-            Item::HideBlockParticles => e.hide_block_particles = !e.hide_block_particles,
             Item::Zoom => e.zoom = !e.zoom,
             Item::ZoomSmooth => e.zoom_smooth = !e.zoom_smooth,
             Item::ZoomSensitivity => e.zoom_sensitivity = !e.zoom_sensitivity,
@@ -306,18 +485,181 @@ impl Item {
             Item::MinimapZoom => e.minimap_zoom = next(&MINIMAP_ZOOMS, e.minimap_zoom, back),
             Item::NoAi => e.no_ai = !e.no_ai,
             Item::AgentControl => e.agent_control = !e.agent_control,
-            Item::DiscordPresence => e.discord_presence = !e.discord_presence,
-            Item::ReproKeys => e.repro_keys = !e.repro_keys,
-            Item::Splitscreen => e.splitscreen = !e.splitscreen,
             Item::ZoomKey | Item::SortKey => {}
         }
     }
     /// The key name the options screen waits on for a key item.
     pub fn key_name(self) -> Option<&'static str> {
         match self {
+            Item::Pvp(_) => self.shared().unwrap().key_name(),
             Item::ZoomKey => Some(ZOOM_KEY),
             Item::SortKey => Some(SORT_KEY),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mobile_rows_keep_native_controls_and_place_graphics_extras_only_in_quality() {
+        let mobile: Vec<_> = rows().into_iter().filter_map(Result::ok).collect();
+        for item in [
+            Item::Zoom,
+            Item::ZoomKey,
+            Item::ZoomLevel,
+            Item::ZoomSmooth,
+            Item::ZoomSensitivity,
+            Item::Fps,
+            Item::FpsCorner,
+            Item::FpsLows,
+            Item::Keystrokes,
+            Item::KeystrokesCorner,
+            Item::KeystrokesCps,
+            Item::Minimap,
+            Item::MinimapCorner,
+            Item::MinimapSize,
+            Item::MinimapShape,
+            Item::MinimapZoom,
+            Item::MinimapRotate,
+            Item::OwnNameTag,
+        ] {
+            assert_eq!(
+                mobile.iter().filter(|&&row| row == item).count(),
+                1,
+                "{item:?}"
+            );
+        }
+        for item in [
+            Item::Fullbright,
+            Item::DynamicLights,
+            Item::HideBlockParticles,
+        ] {
+            assert!(!mobile.contains(&item));
+        }
+        for extra in [
+            crate::extras::Item::Fullbright,
+            crate::extras::Item::DynamicLights,
+            crate::extras::Item::HideBlockParticles,
+        ] {
+            let pages: Vec<_> = crate::graphics_ui::rows()
+                .into_iter()
+                .flat_map(|(page, groups)| {
+                    groups.into_iter().flat_map(move |(_, rows)| {
+                        rows.into_iter().map(move |row| (page, row.item))
+                    })
+                })
+                .filter_map(|(page, item)| {
+                    (item == crate::graphics_ui::Item::Extra(extra)).then_some(page)
+                })
+                .collect();
+            assert_eq!(pages, [crate::graphics_ui::Page::Quality]);
+        }
+    }
+
+    #[test]
+    fn mobile_native_controls_still_change_and_round_trip_their_settings() {
+        let mut extras = Extras::default();
+        for item in [
+            Item::Zoom,
+            Item::ZoomLevel,
+            Item::ZoomSmooth,
+            Item::ZoomSensitivity,
+            Item::Fps,
+            Item::FpsCorner,
+            Item::FpsLows,
+            Item::Keystrokes,
+            Item::KeystrokesCorner,
+            Item::KeystrokesCps,
+            Item::Minimap,
+            Item::MinimapCorner,
+            Item::MinimapSize,
+            Item::MinimapShape,
+            Item::MinimapZoom,
+            Item::MinimapRotate,
+        ] {
+            let before = extras.clone();
+            item.cycle(&mut extras, false);
+            assert_ne!(
+                extras, before,
+                "{item:?} must still edit its native setting"
+            );
+            assert_eq!(Extras::parse(&extras.serialize()), extras, "{item:?}");
+            item.cycle(&mut extras, true);
+            assert_eq!(extras, before, "{item:?} must still cycle backwards");
+        }
+        #[cfg(target_os = "ios")]
+        assert!(extras.set_key(ZOOM_KEY, "key.keyboard.c".into()));
+        #[cfg(not(target_os = "ios"))]
+        {
+            extras.zoom_key = "key.keyboard.c".into();
+        }
+        assert_eq!(
+            Extras::parse(&extras.serialize()).zoom_key,
+            "key.keyboard.c"
+        );
+    }
+
+    #[test]
+    fn mobile_descriptions_keep_shared_keys_and_native_fallbacks() {
+        for item in rows().into_iter().filter_map(Result::ok).chain([
+            Item::Fullbright,
+            Item::DynamicLights,
+            Item::HideBlockParticles,
+        ]) {
+            assert!(!item.description().is_empty(), "{item:?}");
+            assert!(!item.description_text().is_empty(), "{item:?}");
+            if let Some(shared) = item.shared() {
+                assert_eq!(item.description_key(), shared.description_key());
+                assert_eq!(item.description_text(), shared.description_text());
+            } else {
+                assert!(
+                    item.description_key().starts_with("horizon.extras."),
+                    "{item:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mobile_cosmetic_switches_round_trip_the_service_and_singleplayer_choices() {
+        let mut extras = Extras::default();
+        // Exercise the same mobile Items the options screen dispatches, including
+        // switches absent from the old mobile adapter.
+        for item in [Item::CosmeticsSolo, Item::HorizonMarks, Item::HorizonMe] {
+            assert!(!item.caption_text().is_empty());
+            assert!(!item.description_text().is_empty());
+            assert!(item.parent().is_none());
+            item.cycle(&mut extras, false);
+        }
+        let loaded = Extras::parse(&extras.serialize());
+        assert!(loaded.cosmetics_solo);
+        assert!(!loaded.horizon_marks);
+        assert!(!loaded.horizon_listed);
+        let home = std::env::temp_dir().join(format!(
+            "horizon-mobile-cosmetic-prefs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(FILE), extras.serialize()).unwrap();
+        assert!(!horizon_cosmetics::prefs::listed(&home));
+        Item::HorizonMe.cycle(&mut extras, false);
+        std::fs::write(home.join(FILE), extras.serialize()).unwrap();
+        assert!(horizon_cosmetics::prefs::listed(&home));
+        std::fs::remove_dir_all(home).unwrap();
+        for item in [Item::CosmeticsSolo, Item::HorizonMarks, Item::HorizonMe] {
+            assert_eq!(item.switch(&loaded), item.shared().unwrap().switch(&loaded));
+            assert_eq!(item.value(&loaded), item.shared().unwrap().value(&loaded));
+        }
+        // Existing mobile-only controls keep their own policy.
+        Item::Zoom.cycle(&mut extras, false);
+        assert!(extras.zoom);
+        assert_eq!(Item::ZoomKey.key_name(), Some(ZOOM_KEY));
     }
 }

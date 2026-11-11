@@ -6,10 +6,10 @@
 //! the time left. Vanilla has no such commands: they reach operators' command trees (completions included)
 //! as a native mod's commands do (`moderation_commands`), and the game runs them itself.
 use super::{Game, chat_filter::Reply, dedicated, lan::LanHost};
-use horizon_chat_filter::{duration_text, now_millis, parse_duration};
 use horizon_client::{mod_api::NativeCommand, text::Text};
 use horizon_protocol::packets::play::{self, Clientbound as C};
 use horizon_protocol::text::translatable;
+use horizon_server_files::duration::{duration_text, now_millis, parse_duration};
 use horizon_server_files::user_lists::{BanEntry, BanList, NameAndId, format_date};
 
 /// The operator level `/tempban` needs, as `/ban`'s.
@@ -108,7 +108,12 @@ fn entry(
     millis: i64,
     reason: Option<String>,
 ) -> BanEntry<NameAndId> {
-    let mut ban = BanEntry::new(user, Some(by.to_owned()), Some(now + millis), reason);
+    let mut ban = BanEntry::new(
+        user,
+        Some(by.to_owned()),
+        Some(now.saturating_add(millis)),
+        reason,
+    );
     ban.created = now;
     ban
 }
@@ -263,7 +268,7 @@ impl Game<'_> {
                 "until": ban.expires.map(format_date),
             }),
         );
-        success_reply(&ban, millis, now + millis)
+        success_reply(&ban, millis, ban.expires.unwrap_or(i64::MAX))
     }
 }
 
@@ -373,6 +378,50 @@ mod tests {
             assert_eq!(ban.expires, Some(now + millis));
         }
     }
+    #[test]
+    fn a_representable_long_duration_cannot_wrap_the_ban_into_the_past() {
+        use horizon_server_files::user_lists::Entry;
+        let mut bans = list("long-duration");
+        let now = 1_800_000_000_000;
+        let request = parse(&["tempban", "Fay", "9223372036854775s", "reason"]).unwrap();
+        assert_eq!(request.millis, 9_223_372_036_854_775_000);
+        let ban = add_ban(
+            &mut bans,
+            user(9, "Fay"),
+            "Operator",
+            now,
+            request.millis,
+            request.reason,
+        )
+        .unwrap();
+        assert_eq!(ban.expires, Some(i64::MAX));
+        assert!(!ban.expired(i64::MAX / 2));
+        let text = std::fs::read_to_string(&bans.file).unwrap();
+        assert!(text.contains(&format_date(i64::MAX)));
+        let reply = success_reply(&ban, request.millis, ban.expires.unwrap());
+        assert_eq!(
+            reply.text().component()["with"][2],
+            serde_json::json!({"text": format_date(i64::MAX)})
+        );
+        let mut restored = BanList::new(bans.file.clone());
+        restored.load().unwrap();
+        let after = restored.get(&user(9, "Fay")).unwrap();
+        // The persisted date has vanilla's one-second precision.
+        assert_eq!(after.expires, Some(i64::MAX / 1000 * 1000));
+        assert!(!after.expired(i64::MAX / 2));
+        assert_eq!(
+            (after.source.as_str(), after.reason.as_deref()),
+            ("Operator", Some("reason"))
+        );
+        let lines = timed_bans(&restored.entries(), now);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[1].text().translation_key(),
+            Some("horizon.moderation.reason")
+        );
+        let _ = std::fs::remove_file(&bans.file);
+    }
+
     #[test]
     fn initialized_console_language_resolves_the_vanilla_message_and_duration() {
         use horizon_client::lang::{self, Language, ResourceSource};

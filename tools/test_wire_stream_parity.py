@@ -22,6 +22,11 @@ every combat extra on (horizon-extras.txt: `LEGACY_EXTRAS`), and compares their 
 changes what the player sees and hears, never what the client sends, and the 1.8 rules ("in worlds you host")
 never reach a server that isn't the player's own.
 
+Keyboard-only boat scripts explicitly use an uncaptured render mouse in vanilla too. Native boat
+clampRotation can alternate one yaw bit on Entity.turn(0, 0), so comparing an uncaptured headless
+client with a captured rendered client would depend on the latter's render-frame count. Mouse-action
+scenarios retain captured input. This aligns capture state, without changing ticks or comparisons.
+
 Horizon runs `--headless` (no window or GPU: the ticks are what it sends from); the vanilla client runs on the
 virtual screen (`vscreen`) on Linux, from the logged-in session on macOS. Every game and server here runs in fresh temporary folders (HORIZON_HOME,
 HORIZON_LAUNCHER_HOME, XDG_*), with no audio and no self-update. Needs .local (the vanilla jars and prepared
@@ -48,11 +53,16 @@ from server_pack_e2e import Game  # noqa: E402
 from test_dedicated_server_parity import Server, free_port  # noqa: E402
 
 PLAYER = 'Steve'
+BOAT_DRIVER = 'WireBoatDriver'
 PROPERTIES = {
     'online-mode': 'false', 'white-list': 'false', 'level-seed': '12345', 'level-type': 'minecraft\\:flat',
     'generate-structures': 'false', 'view-distance': '4', 'simulation-distance': '4', 'spawn-protection': '0',
     'pause-when-empty-seconds': '-1', 'gamemode': 'survival', 'difficulty': 'easy', 'spawn-monsters': 'false',
     'spawn-animals': 'false', 'enable-command-block': 'false',
+    # This isolated oracle server can run under -Xint on a loaded host.
+    # Wall-clock watchdog stalls are not wire mismatches; scenario/settle
+    # deadlines still fail a genuinely unresponsive run without accepting it.
+    'max-tick-time': '-1',
 }
 # The flat world's grass is at y -61: the player stands at -60.
 FLOOR = -61
@@ -60,6 +70,7 @@ RESET = [
     'gamerule spawn_mobs false', 'gamerule advance_time false', 'gamerule advance_weather false',
     f'fill -12 {FLOOR + 1} -12 12 {FLOOR + 12} 28 minecraft:air',
     f'fill -12 {FLOOR} -12 12 {FLOOR} 28 minecraft:grass_block',
+    'kill @e[tag=wire_boat]',
     'kill @e[type=!minecraft:player]', f'clear {PLAYER}', f'effect clear {PLAYER}', f'gamemode survival {PLAYER}',
     f'effect give {PLAYER} minecraft:saturation 1 20 true', f'effect give {PLAYER} minecraft:instant_health 1 5 true',
     f'tp {PLAYER} 0.5 {FLOOR + 1} 0.5 0 0',
@@ -172,6 +183,31 @@ SCENARIOS = {
         setup=[f'setblock 0 {FLOOR + 1} 2 minecraft:stone'],
         ticks=60, anchor='accept_teleportation',
         steps={0: ['look 0 45'], 3: ['mouse left down'], 15: ['command tp @s ~ ~ ~'], 40: ['mouse left up']}),
+    'boat_driver': dict(
+        render_mouse=False,
+        mount_setup=[f'summon minecraft:oak_boat 0.5 {FLOOR + 1} 0.5 {{Tags:["wire_boat"]}}',
+                     f'ride {PLAYER} mount @e[tag=wire_boat,limit=1]'],
+        ticks=50, steps={0: ['key w down', 'key ctrl down'], 12: ['look 30 10'],
+                         25: ['key w up', 'key ctrl up']}),
+    'boat_turning_driver': dict(
+        render_mouse=False,
+        mount_setup=[f'summon minecraft:oak_boat 0.5 {FLOOR + 1} 0.5 {{Tags:["wire_boat"]}}',
+                     f'ride {PLAYER} mount @e[tag=wire_boat,limit=1]'],
+        # A/D changes the boat's deltaRotation, while independent look
+        # changes the rider. Release all movement to compare the coast too.
+        ticks=70, steps={0: ['key w down', 'key a down'], 10: ['look 25 12'],
+                         20: ['key a up', 'key d down'], 30: ['look -20 -8'],
+                         40: ['key w up', 'key d up'], 55: ['look 15 0']}),
+    'boat_second_passenger': dict(
+        render_mouse=False,
+        # A boat prioritizes players over animal passengers. Another actual
+        # connected Player must occupy seat zero to exercise a guest's role.
+        mount_setup=[f'tp {BOAT_DRIVER} 0.5 {FLOOR + 1} 0.5 0 0',
+                     f'summon minecraft:oak_boat 0.5 {FLOOR + 1} 0.5 {{Tags:["wire_boat"]}}',
+                     f'ride {BOAT_DRIVER} mount @e[tag=wire_boat,limit=1]',
+                     f'ride {PLAYER} mount @e[tag=wire_boat,limit=1]'],
+        ticks=50, steps={0: ['key w down', 'key ctrl down'], 12: ['look 30 10'],
+                         25: ['key w up', 'key ctrl up']}),
 }
 
 
@@ -191,7 +227,16 @@ def script(name, spec, horizon):
     steps = {0: ['key 1 tap', 'key w down'], 2: ['key w up']}
     for tick, lines in spec['steps'].items():
         steps.setdefault(tick + PRELUDE, []).extend(horizon_lines(lines) if horizon else lines)
-    return {'name': name, 'ticks': spec['ticks'] + PRELUDE, 'steps': {str(k): v for k, v in sorted(steps.items())}}
+    result = {'name': name, 'ticks': spec['ticks'] + PRELUDE,
+              'steps': {str(k): v for k, v in sorted(steps.items())}}
+    if 'render_mouse' in spec:
+        if type(spec['render_mouse']) is not bool:
+            raise ValueError('render_mouse must be a boolean')
+        # A headless Horizon has no captured pointer. For keyboard-only
+        # scenarios the rendered reference must not add idle per-frame turns:
+        # native boat clamp math can toggle a yaw bit even with zero input.
+        result['render_mouse'] = spec['render_mouse']
+    return result
 
 
 class Failed(Exception):
@@ -240,7 +285,10 @@ class VanillaClient:
         command[command.index('net.minecraft.client.main.Main')] = 'dev.horizonlab.parity.VanillaTickScript'
         self.log = open(log, 'w')
         self.ready, self.done = threading.Event(), {}
-        self.process = subprocess.Popen(command, cwd=args.game_dir, env=screen_env(vanilla_client.environment()), text=True,
+        # Its window opens without the focus (SDL's hint), so it takes neither the keyboard nor the pointer of
+        # whoever is at the computer; VanillaTickScript keeps their input out once it runs.
+        env = dict(screen_env(vanilla_client.environment()), SDL_WINDOW_ACTIVATE_WHEN_SHOWN='0')
+        self.process = subprocess.Popen(command, cwd=args.game_dir, env=env, text=True,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         threading.Thread(target=self.pump, daemon=True).start()
 
@@ -287,7 +335,8 @@ class HeadlessGame(Game):
                                 HORIZON_TELEMETRY_URL='off', HORIZON_TICK_SCRIPT=scripts / 'scenario.json')
         self.base = [str(bins / 'horizon-ctl'), '--socket', str(work / 'c.sock')]
         self.log = self.home / 'logs' / 'latest.log'
-        reply = self('launch', '--game', bins / 'horizon-client', '--headless', '--resources', resources)
+        reply = self('launch', '--game', bins / 'horizon-client', '--headless',
+                     '--game-dir', self.home, '--resources', resources)
         self.pid = reply.get('pid')
 
 
@@ -352,14 +401,21 @@ def settle(counts, accepted, timeout=120):
         time.sleep(0.2)
 
 
-def play_all(client, server, scenarios, scripts, horizon, capture):
+def play_all(client, server, scenarios, scripts, horizon, capture, driver_present=False):
     counts = ClientCounts(capture)
     for name in scenarios:
         spec = SCENARIOS[name]
         # The place settles: blocks and items reach the client, the player stands still on the ground.
         # From the console `~` is the world spawn: the player teleports onto itself.
-        commands = RESET + spec.get('setup', []) + [f'tp {PLAYER} {PLAYER}']
-        accepted = counts.update().accepted + sum(c.startswith('tp ') for c in commands)
+        # Teleporting can dismount a rider: the boat setup runs after the
+        # reset's final teleport, and its real passenger packets are verified.
+        # An idle fixture player is still a colliding entity. Remove it from
+        # the measured area before every reset, including the next client's
+        # driver scenario after the previous client's passenger scenario.
+        park_driver = ([f'ride {BOAT_DRIVER} dismount',
+                        f'tp {BOAT_DRIVER} 1000.5 {FLOOR + 1} 1000.5 0 0'] if driver_present else [])
+        commands = park_driver + RESET + spec.get('setup', []) + [f'tp {PLAYER} {PLAYER}'] + spec.get('mount_setup', [])
+        accepted = counts.update().accepted + sum(c.startswith(f'tp {PLAYER} ') for c in commands)
         for command in commands:
             server.console(command)
         settle(counts, accepted)
@@ -393,9 +449,23 @@ def run(args, out):
     scripts = work / 'scripts'
     scripts.mkdir()
     server = Server(vanilla, directory, 'server')
+    driver = None
     captures = {}
     try:
         server.wait_for(r'Done \(', timeout=900)
+        # Legacy spawn-monsters/spawn-animals properties do not prevent
+        # 26.3 flat-world slime spawning. Set the native gamerule before any
+        # player loads chunks, rather than waiting for the first RESET.
+        server.console('gamerule spawn_mobs false')
+        server.wait_for(r'Game rule spawn_mobs.*false', timeout=30)
+        if 'boat_second_passenger' in args.scenarios:
+            driver_scripts = work / 'driver-scripts'
+            driver_scripts.mkdir()
+            # A separate idle player joins the isolated offline server
+            # directly, outside either tested client's capture proxy.
+            driver = HeadlessGame(Path(args.bin).resolve(), resources, work / 'boat-driver', driver_scripts)
+            driver('connect', f'127.0.0.1:{port}', BOAT_DRIVER)
+            driver('wait-for', 'loaded', '--timeout', 180)
         for who in args.clients:
             capture = out / f'{who}.jsonl'
             capture.touch()
@@ -411,7 +481,7 @@ def run(args, out):
                     if not client.ready.wait(900):
                         raise Failed('the vanilla client never got into the world')
                 time.sleep(3)
-                play_all(client, server, args.scenarios, scripts, who != 'vanilla', capture)
+                play_all(client, server, args.scenarios, scripts, who != 'vanilla', capture, driver is not None)
             finally:
                 if client:
                     if who != 'vanilla' and client.game.log.exists():
@@ -421,10 +491,19 @@ def run(args, out):
                 stop.set()
             captures[who] = capture
     finally:
-        server.stop()
-        shutil.copy(server.log_path, out / server.log_path.name)
-        if not args.keep:
-            shutil.rmtree(work, ignore_errors=True)
+        try:
+            if driver:
+                try:
+                    if driver.log.exists():
+                        shutil.copy(driver.log, out / 'boat-driver-client.log')
+                    driver('disconnect', ok=False)
+                finally:
+                    driver.quit()
+        finally:
+            server.stop()
+            shutil.copy(server.log_path, out / server.log_path.name)
+            if not args.keep:
+                shutil.rmtree(work, ignore_errors=True)
     return captures
 
 
@@ -441,21 +520,70 @@ def anchored_diffs(v, h, ticks, anchor, problems, names=('vanilla', 'Horizon')):
     return wire_stream.compare_answered(v, h, ticks, av, ah)
 
 
+def passenger_seats_at_marks(entries):
+    """Observe the server's actual passenger order at each script marker.
+
+    A successful /ride command alone proves neither receipt nor seat index.
+    Requiring the actual SetPassengers packet prevents a dismounted fixture
+    from passing the second-passenger no-control assertion vacuously.
+    """
+    me = wire_stream.self_id(entries)
+    passengers, seats = {}, []
+    for entry in entries:
+        name = entry.get('name')
+        if entry.get('state') != 'play':
+            continue
+        if entry.get('dir') == 's2c':
+            reader = wire_stream.Reader(bytes.fromhex(entry.get('data', '')))
+            if name == 'set_passengers':
+                vehicle, count = reader.varint(), reader.varint()
+                passengers[vehicle] = [reader.varint() for _ in range(count)]
+            elif name == 'remove_entities':
+                for _ in range(reader.varint()):
+                    passengers.pop(reader.varint(), None)
+            elif name in ('login', 'respawn'):
+                passengers.clear()
+        elif entry.get('dir') == 'c2s' and name == 'chat_command':
+            fields = wire_stream.decode(name, bytes.fromhex(entry.get('data', '')))
+            if fields.get('command') == 'wire-mark':
+                seats.append([(order.index(me), len(order)) for order in passengers.values() if me in order])
+    return seats
+
+
 def compare(captures, scenarios):
     """Each scenario's problems, the second client's stream against the first's (`captures` in that order)."""
     (ref, ref_name), (new, new_name) = [(who, CLIENTS[who]) for who in captures]
     runs = {}
+    seats = {}
     for who, capture in captures.items():
         entries = [e for e in net_capture.load(capture) if e.get('conn') == 1 and 'name' in e]
         found = wire_stream.scenarios(entries)
         if len(found) != len(scenarios):
             raise Failed(f'{who}: {len(found)} marked scenarios in the capture, expected {len(scenarios)}')
         runs[who] = dict(zip(scenarios, found))
+        seats[who] = dict(zip(scenarios, passenger_seats_at_marks(entries)))
     results = []
     for name in scenarios:
         v, h = runs[ref][name], runs[new][name]
         ticks = SCENARIOS[name]['ticks'] + PRELUDE
         problems = []
+        if name in ('boat_driver', 'boat_turning_driver', 'boat_second_passenger'):
+            driving = name != 'boat_second_passenger'
+            expected_seat = (0, 1) if driving else (1, 2)
+            for who, run in ((ref, v), (new, h)):
+                actual_seats = seats[who].get(name)
+                if actual_seats != [expected_seat]:
+                    problems.append(f'  {who}: fixture passenger seat {actual_seats}, expected {[expected_seat]}')
+            if problems:
+                # An invalid role is setup failure, never gameplay evidence.
+                results.append((name, problems))
+                continue
+            for who, run in ((ref, v), (new, h)):
+                sent = [packet for tick in run[:ticks + 1] for packet, _ in tick['packets']]
+                for packet in ('paddle_boat', 'move_vehicle'):
+                    present = packet in sent
+                    if present != driving:
+                        problems.append(f'  {who}: {packet} present={present}, contradicts the server passenger order')
         for i, vt, ht in anchored_diffs(v, h, ticks, SCENARIOS[name].get('anchor'), problems, (ref_name, new_name)):
             problems.append(f'  tick {i}:\n  {ref_name}:\n{wire_stream.describe(vt)}\n  {new_name}:\n'
                             f'{wire_stream.describe(ht)}')

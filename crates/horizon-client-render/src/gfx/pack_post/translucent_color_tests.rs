@@ -124,6 +124,36 @@ fn translucent_draws_sample_the_color_written_by_deferred() {
                 let expected = expected.map(|c| (c * 255.0).round() as u8);
                 let hud = HudBatch::new(SIZE);
                 for frame in 0..2 {
+                    let metadata = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Translucency fixture unused terrain metadata"),
+                        size: 32,
+                        usage: wgpu::BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    });
+                    let group = post.block_ids.as_ref().map(|(layout, ids, rects)| {
+                        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: ids.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: metadata.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: metadata.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: rects.as_entire_binding(),
+                                },
+                            ],
+                        })
+                    });
                     let pixels = gpu.render(
                         &mut post,
                         &color,
@@ -132,6 +162,9 @@ fn translucent_draws_sample_the_color_written_by_deferred() {
                         &mut |rp, list, _, _| {
                             if list == TerrainList::Translucent {
                                 rp.set_vertex_buffer(0, vertices.slice(..));
+                                if let Some(group) = &group {
+                                    rp.set_bind_group(3, group, &[]);
+                                }
                                 rp.draw(0..6, 0..1);
                             }
                         },

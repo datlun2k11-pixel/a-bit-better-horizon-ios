@@ -25,7 +25,7 @@
 //! cutout ones, so one pass over all of them draws the runs it drew before.
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{OPAQUE_LAYER, TerrainVertex};
+use super::{OPAQUE_LAYER, QuadState, TerrainSource, TerrainVertex};
 
 /// The buckets in mesh order: +X, +Z, other, +Y, -Z, -X, -Y. Seen from
 /// above (+Y, the commonest case), each pair of horizontal sides with a
@@ -241,21 +241,37 @@ fn bucket(quad: &[TerrainVertex; 4]) -> usize {
 /// cutout quads are also ordered front to back within each axis-facing
 /// bucket; quads that tie keep the mesher's order (the quad's index ends its
 /// sort key), so coplanar overlays still draw over their base.
-#[cfg(test)]
-fn sort(solid: &mut Vec<TerrainVertex>) -> Sides {
-    sort_tinted(solid, &mut Vec::new())
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sort(solid: &mut Vec<TerrainVertex>) -> Sides {
+    sort_with_metadata(solid, &mut Vec::new(), &mut Vec::new())
 }
-
-/// `sort`, moving each quad's tint in `tints` (one per quad, or none) with it.
+#[cfg(test)]
 pub fn sort_tinted(solid: &mut Vec<TerrainVertex>, tints: &mut Vec<u32>) -> Sides {
-    let grouped = GROUPED.load(Ordering::Relaxed);
-    SORT_SCRATCH.with_borrow_mut(|scratch| sort_with(solid, tints, grouped, scratch))
+    sort_sourced(solid, tints, &mut Vec::new())
+}
+// Production sorts all metadata together; compact-only sorting is a fixture helper.
+#[cfg(test)]
+pub(super) fn sort_sourced(
+    solid: &mut Vec<TerrainVertex>,
+    tints: &mut Vec<u32>,
+    sources: &mut Vec<TerrainSource>,
+) -> Sides {
+    sort_all_metadata(solid, &mut Vec::new(), tints, sources)
 }
 
 /// `sort`, with all the opaque parts first when `grouped`.
 #[cfg(test)]
 fn sort_parts(solid: &mut Vec<TerrainVertex>, grouped: bool) -> Sides {
-    SORT_SCRATCH.with_borrow_mut(|scratch| sort_with(solid, &mut Vec::new(), grouped, scratch))
+    SORT_SCRATCH.with_borrow_mut(|scratch| {
+        sort_with(
+            solid,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            grouped,
+            scratch,
+        )
+    })
 }
 
 /// `sort`'s buffers, kept by each meshing thread so sorting a mesh allocates
@@ -266,7 +282,9 @@ struct SortScratch {
     slots: Vec<u8>,
     keys: Vec<u64>,
     sorted: Vec<[TerrainVertex; 4]>,
+    states: Vec<QuadState>,
     tints: Vec<u32>,
+    sources: Vec<TerrainSource>,
 }
 thread_local! {
     static SORT_SCRATCH: std::cell::RefCell<SortScratch> = Default::default();
@@ -278,13 +296,69 @@ fn total_order_key(v: f32) -> u32 {
     (bits ^ (((bits >> 31) as u32) >> 1) as i32) as u32 ^ 0x8000_0000
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sort_with_states(solid: &mut Vec<TerrainVertex>, states: &mut Vec<QuadState>) -> Sides {
+    SORT_SCRATCH.with_borrow_mut(|scratch| {
+        sort_with(
+            solid,
+            states,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            GROUPED.load(Ordering::Relaxed),
+            scratch,
+        )
+    })
+}
+pub fn sort_with_metadata(
+    solid: &mut Vec<TerrainVertex>,
+    states: &mut Vec<QuadState>,
+    tints: &mut Vec<u32>,
+) -> Sides {
+    SORT_SCRATCH.with_borrow_mut(|scratch| {
+        sort_with(
+            solid,
+            states,
+            tints,
+            &mut Vec::new(),
+            GROUPED.load(Ordering::Relaxed),
+            scratch,
+        )
+    })
+}
+pub(super) fn sort_all_metadata(
+    solid: &mut Vec<TerrainVertex>,
+    states: &mut Vec<QuadState>,
+    tints: &mut Vec<u32>,
+    sources: &mut Vec<TerrainSource>,
+) -> Sides {
+    if !sources.is_empty() {
+        sources.resize(solid.len() / 4, TerrainSource::default());
+    }
+    SORT_SCRATCH.with_borrow_mut(|scratch| {
+        sort_with(
+            solid,
+            states,
+            tints,
+            sources,
+            GROUPED.load(Ordering::Relaxed),
+            scratch,
+        )
+    })
+}
 fn sort_with(
     solid: &mut Vec<TerrainVertex>,
+    states: &mut Vec<QuadState>,
     tints: &mut Vec<u32>,
+    sources: &mut Vec<TerrainSource>,
     grouped: bool,
     scratch: &mut SortScratch,
 ) -> Sides {
     let (quads, rest) = solid.as_chunks::<4>();
+    debug_assert!(
+        states.is_empty() || states.len() == quads.len(),
+        "one state per solid quad"
+    );
+    let keep_states = states.len() == quads.len() && !quads.is_empty();
     debug_assert!(rest.is_empty(), "solid vertices come in quads");
     let quads_len = quads.len();
     let cutout = |q: &[TerrainVertex; 4]| q[0].layer & OPAQUE_LAYER == 0;
@@ -348,11 +422,26 @@ fn sort_with(
         sorted.extend(keys.iter().map(|&k| quads[(k & 0xFF_FFFF) as usize]));
         solid.clear();
         solid.extend_from_slice(sorted.as_flattened());
+        if keep_states {
+            scratch.states.clear();
+            scratch
+                .states
+                .extend(keys.iter().map(|&k| states[(k & 0xFF_FFFF) as usize]));
+            states.clear();
+            states.extend_from_slice(&scratch.states);
+        }
         if tints.len() == quads_len {
             let sorted_tints = &mut scratch.tints;
             sorted_tints.clear();
             sorted_tints.extend(keys.iter().map(|&k| tints[(k & 0xFF_FFFF) as usize]));
             std::mem::swap(tints, sorted_tints);
+        }
+        if sources.len() == quads_len {
+            scratch.sources.clear();
+            scratch
+                .sources
+                .extend(keys.iter().map(|&k| sources[(k & 0xFF_FFFF) as usize]));
+            std::mem::swap(sources, &mut scratch.sources);
         }
     }
     Sides {
@@ -365,7 +454,9 @@ fn sort_with(
 
 #[cfg(test)]
 mod tests {
+    use super::super::QuadLighting;
     use super::*;
+    use std::collections::BTreeSet;
 
     /// The sort as it was before the integer keys: quads moved to their
     /// parts in order, then a stable sort by plane in each side bucket.
@@ -457,6 +548,25 @@ mod tests {
         .collect()
     }
 
+    /// The state of the `n`th quad of a fixture: its own id, fluid flag on
+    /// the odd ones, and an origin no other quad shares (unrelated to where
+    /// the quad is, as for a protruding model).
+    fn test_state(n: u32) -> QuadState {
+        QuadState {
+            // Unique to the quad, in every field and every vertex.
+            lighting: Some(QuadLighting {
+                tint: 0xFF00_0000 | (n * 0x0001_0101),
+                shaded_tint: 0xFF00_0000 | (n * 0x0003_0201),
+                no_directional: [0, 1, 2, 3].map(|v| ((n * 16 + v) << 24) | (n * 0x0101 + v)),
+            }),
+            ..QuadState::new(
+                100 + n,
+                [(n * 3 % 16) as i32, (15 - n) as i32, (n * 7 % 16) as i32],
+                n % 2 == 1,
+            )
+        }
+    }
+
     /// Where each bucket ends, in a mesh sorted for one pass.
     fn bucket_ends(sides: &Sides) -> [u32; 7] {
         assert!(!sides.grouped);
@@ -506,6 +616,89 @@ mod tests {
         assert_eq!(sides.planes[0], 4.0); // +X at x = 4
         assert_eq!(sides.planes[5], 3.0); // -X at x = 3
         assert_eq!(sides.planes[3], 5.0); // +Y at y = 5
+    }
+
+    #[test]
+    fn states_follow_their_quads_through_the_sort() {
+        let mut solid = cube([3.0, 4.0, 5.0], 0);
+        let mut states = Vec::new();
+        for (i, v) in solid.iter_mut().enumerate() {
+            v.layer = (i / 4) as u16;
+            if i % 4 == 0 {
+                // Distinct per quad, with the fluid flag on alternate ones.
+                states.push(test_state((i / 4) as u32));
+            }
+        }
+        let sides = sort_with_states(&mut solid, &mut states);
+        assert_eq!(bucket_ends(&sides), [1, 2, 2, 3, 4, 5, 6]);
+        let layers: Vec<u16> = solid.iter().step_by(4).map(|v| v.layer).collect();
+        assert_eq!(layers, [0, 4, 2, 5, 1, 3]);
+        assert_eq!(states.len(), layers.len());
+        for (state, layer) in states.iter().zip(layers) {
+            // The whole state, origin included, moved with its quad.
+            assert_eq!(*state, test_state(u32::from(layer)));
+            assert_eq!(state.state, 100 + u32::from(layer));
+            assert_eq!(state.fluid, layer % 2 == 1);
+            assert!(state.lighting.is_some());
+        }
+        // Every quad's lighting is distinct, so none was swapped or shared.
+        let lights: BTreeSet<[u32; 6]> = states
+            .iter()
+            .map(|s| {
+                let l = s.lighting.unwrap();
+                let n = l.no_directional;
+                [l.tint, l.shaded_tint, n[0], n[1], n[2], n[3]]
+            })
+            .collect();
+        assert_eq!(lights.len(), states.len());
+        // Differing origins: every quad of the fixture has its own.
+        let origins: BTreeSet<[u8; 3]> = states.iter().map(|s| s.block).collect();
+        assert_eq!(origins.len(), states.len());
+        // Without states the order is the same and nothing is invented.
+        let mut plain = cube([3.0, 4.0, 5.0], 0);
+        for (i, v) in plain.iter_mut().enumerate() {
+            v.layer = (i / 4) as u16;
+        }
+        let mut none = Vec::new();
+        assert_eq!(sort_with_states(&mut plain, &mut none), sides);
+        assert!(none.is_empty());
+        let plain_layers: Vec<u16> = plain.iter().step_by(4).map(|v| v.layer).collect();
+        assert_eq!(plain_layers, [0, 4, 2, 5, 1, 3]);
+    }
+
+    #[test]
+    fn tint_and_shader_metadata_stay_with_the_same_quad_in_both_layouts() {
+        for grouped in [false, true] {
+            let mut solid = cube([3.0, 4.0, 5.0], 0);
+            for (i, vertex) in solid.iter_mut().enumerate() {
+                let id = (i / 4) as u16;
+                vertex.layer = id
+                    | if id.is_multiple_of(2) {
+                        OPAQUE_LAYER
+                    } else {
+                        0
+                    };
+            }
+            let mut states: Vec<_> = (0..6).map(test_state).collect();
+            let mut tints: Vec<_> = (0..6).map(|id| 0xffabc000 + id).collect();
+            let source = |id| TerrainSource::new(id, [id as i32, 0, 0], id as u8, false);
+            let mut sources: Vec<_> = (0..6).map(source).collect();
+            sort_with(
+                &mut solid,
+                &mut states,
+                &mut tints,
+                &mut sources,
+                grouped,
+                &mut SortScratch::default(),
+            );
+            assert_eq!((solid.len(), states.len(), tints.len()), (24, 6, 6));
+            for (i, quad) in solid.as_chunks::<4>().0.iter().enumerate() {
+                let id = u32::from(quad[0].layer & !OPAQUE_LAYER);
+                assert_eq!(states[i], test_state(id));
+                assert_eq!(tints[i], 0xffabc000 + id);
+                assert_eq!(sources[i], source(id));
+            }
+        }
     }
 
     #[test]

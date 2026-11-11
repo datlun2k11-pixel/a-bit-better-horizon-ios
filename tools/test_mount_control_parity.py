@@ -25,7 +25,7 @@ def main():
     env["JAVA_TOOL_OPTIONS"] = env.get("JAVA_TOOL_OPTIONS", "") + " -Dhorizon.mountControlReference=true"
     subprocess.run([sys.executable, str(lab.ROOT / "tools/test_command_exec_parity.py"),
                     "--only", "scoreboard", "--reference-only", "--work-dir", str(work)],
-                   cwd=lab.ROOT, env=env, check=True)
+                   cwd=work, env=env, check=True)
     reference = work / "mount-control-reference.json"
     rows = json.loads(reference.read_text())
     if (len(rows) != 32 or sum(r["controlled"] for r in rows) != 4
@@ -33,9 +33,27 @@ def main():
         raise SystemExit("vanilla mount-control fixture did not cover 32 cases / four controllers")
     env["HORIZON_MOUNT_CONTROL_REFERENCE"] = str(reference)
     env["HORIZON_TEST_RESOURCES"] = os.environ.get("HORIZON_TEST_RESOURCES", str(lab.RESOURCES))
-    subprocess.run(["cargo", "test", "-p", "horizon-client", "--lib",
-                    "game::remote_vehicles::tests::steering_mount_control_matches_vanilla",
-                    "--", "--exact", "--ignored"], cwd=lab.ROOT, env=env, check=True)
+    # Build from the manifest, but run the actual Game fixture only from the
+    # fresh game folder: Cargo's normal test CWD is the source package.
+    built = subprocess.run(["cargo", "test", "--manifest-path", str(lab.ROOT / "Cargo.toml"),
+                            "--locked", "-p", "horizon-client", "--lib", "--no-run",
+                            "--message-format=json"], cwd=work, env=env, text=True,
+                           stdout=subprocess.PIPE, check=True)
+    (work / "rust-build.jsonl").write_text(built.stdout)
+    executables = []
+    for line in built.stdout.splitlines():
+        try:
+            artifact = json.loads(line)
+        except ValueError:
+            continue
+        if (artifact.get("reason") == "compiler-artifact" and artifact.get("executable")
+                and artifact.get("target", {}).get("name") == "horizon_client"
+                and artifact.get("profile", {}).get("test")):
+            executables.append(artifact["executable"])
+    if len(executables) != 1:
+        raise SystemExit(f"expected one gameplay test executable, got {executables}")
+    subprocess.run([executables[0], "game::remote_vehicles::tests::steering_mount_control_matches_vanilla",
+                    "--exact", "--ignored", "--nocapture"], cwd=work, env=env, check=True)
     print("mount control: 32 vanilla cases match; four controllers predict forward movement and send MoveVehicle")
 
 

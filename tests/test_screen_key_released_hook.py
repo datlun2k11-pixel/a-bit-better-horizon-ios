@@ -13,18 +13,22 @@ ROOT = Path(__file__).resolve().parents[1]
 class ScreenKeyReleasedHookTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
     def test_cancelled_release_still_releases_every_binding(self):
-        source = (ROOT / "crates/horizon-client/src/game.rs").read_text(encoding="utf-8")
+        source = "".join((ROOT / "crates/horizon-client/src" / path).read_text(encoding="utf-8")
+                         for path in ("game/play_input.rs", "game/key_codes.rs", "game.rs"))
         hooks = (ROOT / "crates/horizon-client/src/game/native_hooks.rs").read_text(encoding="utf-8")
         gate = method(hooks.replace("pub(super) fn", "fn"), "screen_key_released")
-        mapping = method(source, "mapped_key_event")
-        button = method(source.replace("fn keyboard_button(", "    fn keyboard_button("), "keyboard_button")
+        mapping = method(source, "mapped_key_event").replace('cfg!(target_os = "ios")', 'self.ios')
+        button = method(source.replace("pub(super) fn keyboard_button(", "    fn keyboard_button("), "keyboard_button")
         start = source.index("            if let WindowEvent::KeyboardInput", source.index("let result: Result<()> = (|| {"))
-        opening = source.index("{", source.index("&& self.screen_key_released(key)", start))
+        opening = source.index("{", source.index("self.screen_key_released(key)", start))
         end, depth = opening + 1, 1
         while depth:
             depth += (source[end] == "{") - (source[end] == "}")
             end += 1
         dispatch = source[start:end]
+        # Exercise the same release path under both platform policies on the host.
+        dispatch = dispatch.replace('cfg!(target_os = "ios")', 'self.ios')
+        dispatch = dispatch.replace('#[cfg(target_os = "ios")]', 'if self.ios')
         fixture = r"""
 use std::{cell::Cell, collections::HashSet};
 type KeyCode = i32;
@@ -44,9 +48,12 @@ enum Source { Keyboard }
 struct Bindings;
 impl Bindings { fn translate_all(&self, _: i32) -> Vec<std::result::Result<i32, i32>> { vec![Ok(10), Ok(11), Err(2)] } }
 struct Settings { keys: Bindings }
-struct Game { keys: HashSet<i32>, settings: Settings, screen: bool, title: Option<()>, modifiers: u32,
+struct Game { expected_raw: i32, ios: bool, extra_releases: usize, native_releases: usize, keys: HashSet<i32>, settings: Settings, screen: bool, title: Option<()>, modifiers: u32,
     open: bool, cancel: bool, calls: Cell<usize>, handled: usize, released: Vec<(bool, i32)> }
 impl Game {
+    fn extras_key(&mut self,_:i32,pressed:bool,repeat:bool){assert!(!pressed&&!repeat);self.extra_releases+=1;}
+    fn native_key_event(&mut self,_:i32,pressed:bool,repeat:bool){assert!(!pressed&&!repeat);self.native_releases+=1;}
+    fn dialog_open(&self) -> bool { false }
     fn screen_over_playing(&self) -> bool { false }
     fn screen_view_now(&self) -> Option<&'static str> { self.open.then_some("options") }
     fn native_screen_key_released_pre(&self, screen: &&str, name: &str, modifiers: u32, canceled: &mut bool) {
@@ -54,7 +61,7 @@ impl Game {
         self.calls.set(self.calls.get() + 1); *canceled = self.cancel;
     }
     fn mapped_key(&mut self, key: i32, pressed: bool, repeat: bool, raw: i32, _: Source) -> Result<()> {
-        assert!(!pressed && !repeat && raw == 1); self.released.push((false, key)); Ok(())
+        assert!(!pressed && !repeat && raw == self.expected_raw); self.released.push((false, key)); Ok(())
     }
     fn shared_default_acts(&self, _: i32, _: Option<&str>) -> bool { true }
     fn mouse_mapping(&mut self, button: i32, pressed: bool, _: Source) -> Result<()> {
@@ -70,6 +77,7 @@ impl Game {
 }
 #[test]
 fn release_and_screen_gates() {
+    for ios in [false,true] {
     for (open, cancel, state, key, expected_calls, handled) in [
         (true, true, ElementState::Released, PhysicalKey::Code(1), 1, 0),
         (true, false, ElementState::Released, PhysicalKey::Code(1), 1, 1),
@@ -77,20 +85,25 @@ fn release_and_screen_gates() {
         (true, true, ElementState::Pressed, PhysicalKey::Code(1), 0, 1),
         (true, true, ElementState::Released, PhysicalKey::Code(2), 0, 1),
         (true, true, ElementState::Released, PhysicalKey::Unidentified, 0, 1)] {
-        let mut game = Game { keys: HashSet::from([1]), settings: Settings { keys: Bindings }, screen: false,
+        let mut game = Game { expected_raw: match key { PhysicalKey::Code(raw) => raw, _ => 0 }, ios,extra_releases:0,native_releases:0, keys: HashSet::from([1]), settings: Settings { keys: Bindings }, screen: false,
             title: None, modifiers: 5, open, cancel, calls: Cell::new(0), handled: 0, released: vec![] };
+        let handled=if ios && state==ElementState::Released && matches!(key,PhysicalKey::Code(_)){0}else{handled};
         game.dispatch(WindowEvent::KeyboardInput { event: KeyEvent { state, physical_key: key } }).unwrap();
+        assert_eq!(game.extra_releases,usize::from(ios&&handled==0));
+        assert_eq!(game.native_releases,usize::from(ios&&handled==0));
         assert_eq!((game.calls.get(), game.handled), (expected_calls, handled));
-        if handled == 0 { assert!(!game.keys.contains(&1)); assert_eq!(game.released, [(false,10), (false,11)]); }
+        if handled == 0 { if matches!(key,PhysicalKey::Code(1)){assert!(!game.keys.contains(&1));} assert_eq!(game.released, if ios {vec![(false,10),(false,11),(true,2)]}else{vec![(false,10),(false,11)]}); }
         game.dispatch(WindowEvent::Other).unwrap();
         game.released.clear();
         game.screen = true;
+        game.expected_raw = 1;
         game.mapped_key_event(1, false, false).unwrap();
         assert_eq!(game.released, [(false,10), (false,11), (true,2)]);
         game.released.clear();
         game.title = Some(());
         game.mapped_key_event(1, false, false).unwrap();
-        assert_eq!(game.released, [(false,10), (false,11)]);
+        assert_eq!(game.released, if ios {vec![(false,10),(false,11),(true,2)]}else{vec![(false,10),(false,11)]});
+    }
     }
 }
 """.replace("GATE", gate.replace("super::glfw_modifiers", "glfw_modifiers")).replace("MAPPING", mapping).replace("DISPATCH", dispatch).replace("BUTTON", button)

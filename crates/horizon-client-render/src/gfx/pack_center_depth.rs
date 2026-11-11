@@ -470,5 +470,37 @@ mod tests {
         }
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         assert_eq!(center.collect(&device), Some(0.375));
+        // Renderer::land_frame starts these mappings after the submit thread has
+        // submitted the copied buffers. More than SLOTS frames must keep updating.
+        let threaded = super::super::submit::Queue::new(queue.clone(), true);
+        for i in 0..SLOTS + 2 {
+            let expected = (i + 1) as f32 / 8.0;
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(expected),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            center.copy(&device, &mut encoder, &depth);
+            assert!(
+                threaded
+                    .submit_later(super::super::submit::Job {
+                        encoder,
+                        surface: None,
+                        after: None
+                    })
+                    .is_ok()
+            );
+            assert!(threaded.landed().is_some());
+            center.submitted().expect("landed copy to map")();
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            assert_eq!(center.collect(&device), Some(expected));
+        }
     }
 }

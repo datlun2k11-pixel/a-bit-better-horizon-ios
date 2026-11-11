@@ -6,7 +6,26 @@
 //! resources with [`ServerPacks::active`] when it asks for a reload.
 pub mod download;
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+// Download workers can outlive a connection or a replaced manager. Never
+// recycle request identities when ServerPacks is reset or another is created.
+fn next_pack_key() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut current = NEXT.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .expect("server pack generation exhausted");
+        match NEXT.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return current,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// `ServerboundResourcePackPacket.Action`, by its protocol number.
 pub mod action {
@@ -55,7 +74,10 @@ pub fn parse_sha1(hash: &str) -> Option<String> {
 /// One pack to download (`DownloadQueue.DownloadRequest`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
+    /// The server's UUID, used for protocol reports and cache directories.
     pub id: u128,
+    /// Opaque generation of this push, independent of its reusable UUID.
+    pub key: u64,
     pub url: String,
     pub sha1: Option<String>,
 }
@@ -64,8 +86,10 @@ pub struct Request {
 /// packs that failed.
 #[derive(Debug, Default)]
 pub struct Batch {
-    pub downloaded: Vec<(u128, PathBuf)>,
-    pub failed: Vec<u128>,
+    /// (server UUID, request generation, downloaded file).
+    pub downloaded: Vec<(u128, u64, PathBuf)>,
+    /// (server UUID, request generation).
+    pub failed: Vec<(u128, u64)>,
 }
 
 /// What the game has to do after a [`ServerPacks::tick`].
@@ -112,11 +136,14 @@ impl Removal {
     }
 }
 
+/// The identity of one pack instance, independent of its wire UUID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Generation(u64);
+
 /// `ServerPackManager.ServerPackData`.
 #[derive(Debug)]
 struct Pack {
-    /// Which `ServerPackData` this is: a pushed id replaces its pack while the old
-    /// one can still be active, so a reload names its packs by this, not by `id`.
+    generation: Generation,
     key: u64,
     id: u128,
     url: String,
@@ -140,8 +167,8 @@ impl Pack {
 /// `triggerReloadIfNeeded` gives `scheduleReload`).
 #[derive(Debug)]
 struct Reload {
-    load: Vec<u64>,
-    unload: Vec<u64>,
+    load: Vec<Generation>,
+    unload: Vec<Generation>,
     /// It reloads what was active before a failed one (`isRecovery`).
     recovery: bool,
 }
@@ -150,6 +177,9 @@ struct Reload {
 #[derive(Debug)]
 pub struct ServerPacks {
     packs: Vec<Pack>,
+    next_generation: u64,
+    /// The native download queue completes batches in request order. Retain each batch's
+    /// pack identities even after replacement/disconnect removes those packs from `packs`.
     prompt: Prompt,
     reload: Option<Reload>,
     /// `registerForUpdate`: something changed, [`Self::tick`] again.
@@ -158,22 +188,29 @@ pub struct ServerPacks {
     /// statuses are only logged, as for a local world.
     reporting: bool,
     replies: Vec<(u128, i32)>,
-    next_key: u64,
 }
 impl Default for ServerPacks {
     fn default() -> Self {
         Self {
             packs: Vec::new(),
+            next_generation: 0,
             prompt: Prompt::Pending,
             reload: None,
             update: false,
             reporting: false,
             replies: Vec::new(),
-            next_key: 0,
         }
     }
 }
 impl ServerPacks {
+    fn generation(&mut self) -> Generation {
+        let generation = Generation(self.next_generation);
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("resource pack generation overflow");
+        generation
+    }
     fn report(&mut self, id: u128, status: i32) {
         log::debug!("Horizon: server pack {id:032x} changed status to {status}");
         if self.reporting {
@@ -221,9 +258,10 @@ impl ServerPacks {
         for pack in self.packs.iter_mut().filter(|p| p.id == id) {
             pack.remove(Removal::ServerReplaced);
         }
-        self.next_key += 1;
+        let generation = self.generation();
         self.packs.push(Pack {
-            key: self.next_key,
+            key: next_pack_key(),
+            generation,
             id,
             url: url.to_owned(),
             sha1,
@@ -248,9 +286,10 @@ impl ServerPacks {
         for pack in self.packs.iter_mut().filter(|p| p.id == id) {
             pack.remove(Removal::ServerReplaced);
         }
-        self.next_key += 1;
+        let generation = self.generation();
         self.packs.push(Pack {
-            key: self.next_key,
+            key: next_pack_key(),
+            generation,
             id,
             // Never downloaded: the file is already on disk.
             url: String::new(),
@@ -319,6 +358,7 @@ impl ServerPacks {
                 pack.download = Download::Pending;
                 out.download.push(Request {
                     id: pack.id,
+                    key: pack.key,
                     url: pack.url.clone(),
                     sha1: pack.sha1.clone(),
                 });
@@ -355,12 +395,12 @@ impl ServerPacks {
             let wanted = pack.accepted && pack.download == Download::Done && !pack.removed();
             match pack.activation {
                 Activation::Inactive if wanted => {
-                    load.push(pack.key);
+                    load.push(pack.generation);
                     changed = true;
                 }
-                Activation::Active if wanted => load.push(pack.key),
+                Activation::Active if wanted => load.push(pack.generation),
                 Activation::Active => {
-                    unload.push(pack.key);
+                    unload.push(pack.generation);
                     changed = true;
                 }
                 _ => {}
@@ -370,8 +410,8 @@ impl ServerPacks {
             return None;
         }
         for pack in &mut self.packs {
-            let loading = load.contains(&pack.key) && pack.activation != Activation::Active;
-            if loading || unload.contains(&pack.key) {
+            let loading = load.contains(&pack.generation) && pack.activation != Activation::Active;
+            if loading || unload.contains(&pack.generation) {
                 pack.activation = Activation::Pending;
             }
         }
@@ -384,24 +424,36 @@ impl ServerPacks {
         Some(paths)
     }
     /// The packs to load (`PackReloadConfig.Callbacks.packsToLoad`), bottom first.
-    fn paths(&self, keys: &[u64]) -> Vec<(u128, PathBuf)> {
-        keys.iter()
-            .filter_map(|key| {
-                let pack = self.packs.iter().find(|p| p.key == *key)?;
+    fn paths(&self, generations: &[Generation]) -> Vec<(u128, PathBuf)> {
+        generations
+            .iter()
+            .filter_map(|generation| {
+                let pack = self.packs.iter().find(|p| p.generation == *generation)?;
                 Some((pack.id, pack.path.clone()?))
             })
             .collect()
     }
 
-    /// `ServerPackManager.onDownload`.
+    /// `ServerPackManager.onDownload`. Each callback carries its original request key,
+    /// so replacements, reconnects and out-of-order results cannot target a newer pack.
     pub fn downloaded(&mut self, batch: Batch) {
-        if !batch.failed.is_empty() {
+        let current_failure = batch.failed.iter().any(|&(id, key)| {
+            self.packs.iter().any(|pack| {
+                pack.id == id
+                    && pack.key == key
+                    && !pack.removed()
+                    && pack.download == Download::Pending
+            })
+        });
+        // A failure from a removed/replaced pack or previous connection must
+        // not discard the next connection's unrelated pending downloads.
+        if current_failure {
             for pack in self
                 .packs
                 .iter_mut()
                 .filter(|p| p.activation != Activation::Active)
             {
-                pack.remove(if batch.failed.contains(&pack.id) {
+                pack.remove(if batch.failed.contains(&(pack.id, pack.key)) {
                     Removal::DownloadFailed
                 } else {
                     Removal::Discarded
@@ -409,12 +461,10 @@ impl ServerPacks {
             }
         }
         let mut done = Vec::new();
-        for (id, path) in batch.downloaded {
-            if let Some(pack) = self
-                .packs
-                .iter_mut()
-                .find(|p| p.id == id && p.download == Download::Pending)
-            {
+        for (id, key, path) in batch.downloaded {
+            if let Some(pack) = self.packs.iter_mut().find(|p| {
+                p.id == id && p.key == key && !p.removed() && p.download == Download::Pending
+            }) {
                 pack.download = Download::Done;
                 pack.path = Some(path);
                 if !pack.removed() {
@@ -438,12 +488,12 @@ impl ServerPacks {
         if ok {
             let mut applied = Vec::new();
             for pack in &mut self.packs {
-                if reload.load.contains(&pack.key) {
+                if reload.load.contains(&pack.generation) {
                     pack.activation = Activation::Active;
                     if pack.removal.is_none() {
                         applied.push(pack.id);
                     }
-                } else if reload.unload.contains(&pack.key) {
+                } else if reload.unload.contains(&pack.generation) {
                     pack.activation = Activation::Inactive;
                 }
             }
@@ -469,7 +519,7 @@ impl ServerPacks {
                     pack.activation = Activation::Inactive;
                     pack.remove(Removal::ActivationFailed);
                 }
-                Activation::Active => reload.load.push(pack.key),
+                Activation::Active => reload.load.push(pack.generation),
             }
         }
         reload.recovery = true;
@@ -484,9 +534,13 @@ mod tests {
     use super::*;
     use action::*;
 
-    fn ok(id: u128) -> Batch {
+    fn ok(request: &Request) -> Batch {
         Batch {
-            downloaded: vec![(id, PathBuf::from(format!("/p/{id}")))],
+            downloaded: vec![(
+                request.id,
+                request.key,
+                PathBuf::from(format!("/p/{}", request.id)),
+            )],
             failed: vec![],
         }
     }
@@ -520,7 +574,7 @@ mod tests {
         sp.connect(Prompt::Allowed);
         sp.push(1, "http://a/p.zip", None);
         let mut loaded = Vec::new();
-        settle(&mut sp, &mut |r| ok(r[0].id), &mut |p| {
+        settle(&mut sp, &mut |r| ok(&r[0]), &mut |p| {
             loaded = p.to_vec();
             true
         });
@@ -554,9 +608,9 @@ mod tests {
         sp.push(2, "http://a/dead.zip", None);
         settle(
             &mut sp,
-            &mut |_| Batch {
-                downloaded: vec![(1, PathBuf::from("/p/1"))],
-                failed: vec![2],
+            &mut |requests| Batch {
+                downloaded: vec![(requests[0].id, requests[0].key, PathBuf::from("/p/1"))],
+                failed: vec![(requests[1].id, requests[1].key)],
             },
             &mut |_| unreachable!(),
         );
@@ -577,7 +631,7 @@ mod tests {
         sp.connect(Prompt::Allowed);
         sp.push(1, "http://a/p.zip", None);
         let mut reloads = Vec::new();
-        settle(&mut sp, &mut |r| ok(r[0].id), &mut |p| {
+        settle(&mut sp, &mut |r| ok(&r[0]), &mut |p| {
             reloads.push(p.to_vec());
             reloads.len() > 1
         });
@@ -605,7 +659,7 @@ mod tests {
             &mut |r| Batch {
                 downloaded: r
                     .iter()
-                    .map(|q| (q.id, PathBuf::from(format!("/p/{}", q.id))))
+                    .map(|q| (q.id, q.key, PathBuf::from(format!("/p/{}", q.id))))
                     .collect(),
                 failed: vec![],
             },
@@ -634,11 +688,241 @@ mod tests {
             &mut sp,
             &mut |r| {
                 urls.extend(r.iter().map(|q| q.url.clone()));
-                ok(1)
+                ok(&r[0])
             },
             &mut |_| true,
         );
         assert_eq!(urls, ["http://a/new.zip"]);
+    }
+
+    fn local_active(sp: &mut ServerPacks, id: u128, path: &str) {
+        sp.push_local(id, PathBuf::from(path));
+        settle(sp, &mut |_| unreachable!(), &mut |_| true);
+        sp.take_replies();
+    }
+
+    #[test]
+    fn replacing_an_active_uuid_loads_the_new_path_and_pop_unloads_it() {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        local_active(&mut sp, 1, "/p/old");
+        sp.push_local(1, PathBuf::from("/p/new"));
+        assert_eq!(sp.tick().reload, Some(vec![(1, PathBuf::from("/p/new"))]));
+        assert_eq!(sp.reloaded(true), None);
+        assert_eq!(sp.tick().reload, None);
+        assert_eq!(sp.packs.len(), 1);
+        assert_eq!(sp.packs[0].path, Some(PathBuf::from("/p/new")));
+        assert_eq!(sp.packs[0].activation, Activation::Active);
+        assert_eq!(sp.take_replies(), [(1, ACCEPTED), (1, SUCCESSFULLY_LOADED)]);
+        sp.pop(1);
+        assert_eq!(sp.tick().reload, Some(vec![]));
+        sp.reloaded(true);
+        sp.tick();
+        assert!(sp.packs.is_empty());
+        assert!(sp.take_replies().is_empty());
+    }
+
+    #[test]
+    fn a_pending_reload_cannot_activate_a_later_generation_with_the_same_uuid() {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        local_active(&mut sp, 1, "/p/first");
+        sp.push_local(1, PathBuf::from("/p/second"));
+        assert_eq!(
+            sp.tick().reload,
+            Some(vec![(1, PathBuf::from("/p/second"))])
+        );
+        sp.push_local(1, PathBuf::from("/p/third"));
+        assert_eq!(sp.tick().reload, None);
+        assert_eq!(sp.reloaded(true), None);
+        let newest = sp.packs.iter().find(|p| !p.removed()).unwrap();
+        assert_eq!(newest.path, Some(PathBuf::from("/p/third")));
+        assert_eq!(newest.activation, Activation::Inactive);
+        assert_eq!(sp.take_replies(), [(1, ACCEPTED), (1, ACCEPTED)]);
+        assert_eq!(sp.tick().reload, Some(vec![(1, PathBuf::from("/p/third"))]));
+        sp.reloaded(true);
+        sp.tick();
+        assert_eq!(sp.take_replies(), [(1, SUCCESSFULLY_LOADED)]);
+        assert_eq!(sp.packs.len(), 1);
+        assert_eq!(sp.packs[0].path, Some(PathBuf::from("/p/third")));
+    }
+
+    #[test]
+    fn a_replaced_download_result_only_completes_its_requested_generation() {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        sp.push(1, "https://example.com/old.zip", None);
+        let old = sp.tick().download.remove(0);
+        assert_eq!(old.url, "https://example.com/old.zip");
+        sp.push(1, "https://example.com/new.zip", None);
+        let new = sp.tick().download.remove(0);
+        assert_eq!(new.url, "https://example.com/new.zip");
+        assert_eq!(sp.packs.len(), 1); // The removed old download has already been forgotten.
+        sp.downloaded(Batch {
+            downloaded: vec![(old.id, old.key, PathBuf::from("/p/old"))],
+            failed: vec![],
+        });
+        assert_eq!(sp.packs[0].path, None);
+        assert_eq!(sp.packs[0].download, Download::Pending);
+        assert_eq!(sp.take_replies(), [(1, ACCEPTED), (1, ACCEPTED)]);
+        assert_eq!(sp.tick().reload, None);
+        sp.downloaded(Batch {
+            downloaded: vec![(new.id, new.key, PathBuf::from("/p/new"))],
+            failed: vec![],
+        });
+        assert_eq!(sp.tick().reload, Some(vec![(1, PathBuf::from("/p/new"))]));
+        sp.reloaded(true);
+        sp.tick();
+        assert_eq!(
+            sp.take_replies(),
+            [(1, DOWNLOADED), (1, SUCCESSFULLY_LOADED)]
+        );
+    }
+
+    #[test]
+    fn disconnect_keeps_download_batch_identity_until_the_old_result_arrives() {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        sp.push(0, "https://example.com/first-server.zip", None);
+        let old = sp.tick().download.remove(0);
+        sp.disconnect();
+        sp.tick();
+        assert!(sp.packs.is_empty());
+        sp.connect(Prompt::Allowed);
+        sp.push(0, "https://example.com/second-server.zip", None);
+        let new = sp.tick().download.remove(0);
+        sp.downloaded(Batch {
+            downloaded: vec![(old.id, old.key, PathBuf::from("/p/first-server"))],
+            failed: vec![],
+        });
+        assert_eq!(sp.tick().reload, None);
+        assert_eq!(sp.packs[0].path, None);
+        assert_eq!(sp.take_replies(), [(0, ACCEPTED)]);
+        sp.downloaded(Batch {
+            downloaded: vec![(new.id, new.key, PathBuf::from("/p/second-server"))],
+            failed: vec![],
+        });
+        assert_eq!(
+            sp.tick().reload,
+            Some(vec![(new.id, PathBuf::from("/p/second-server"))])
+        );
+        sp.reloaded(true);
+        sp.tick();
+        assert_eq!(
+            sp.take_replies(),
+            [(0, DOWNLOADED), (0, SUCCESSFULLY_LOADED)]
+        );
+        sp.disconnect();
+        settle(&mut sp, &mut |_| unreachable!(), &mut |paths| {
+            assert!(paths.is_empty());
+            true
+        });
+        assert!(sp.packs.is_empty());
+        assert!(sp.take_replies().is_empty());
+    }
+
+    #[test]
+    fn a_failed_replacement_recovers_only_the_other_previously_active_pack() {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        local_active(&mut sp, 1, "/p/old");
+        local_active(&mut sp, 2, "/p/kept");
+        sp.push_local(1, PathBuf::from("/p/broken"));
+        assert_eq!(
+            sp.tick().reload,
+            Some(vec![
+                (2, PathBuf::from("/p/kept")),
+                (1, PathBuf::from("/p/broken"))
+            ])
+        );
+        assert_eq!(
+            sp.reloaded(false),
+            Some(vec![(2, PathBuf::from("/p/kept"))])
+        );
+        assert_eq!(sp.reloaded(true), None);
+        sp.tick();
+        assert_eq!(
+            sp.take_replies(),
+            [(1, ACCEPTED), (2, SUCCESSFULLY_LOADED), (1, FAILED_RELOAD)]
+        );
+        assert_eq!(sp.packs.len(), 1);
+        assert_eq!(sp.packs[0].id, 2);
+        assert_eq!(sp.packs[0].activation, Activation::Active);
+        assert_eq!(sp.packs[0].path, Some(PathBuf::from("/p/kept")));
+    }
+
+    #[test]
+    fn a_current_failed_batch_discards_inactive_packs_but_obsolete_failure_does_not() {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        sp.push(1, "https://example.com/old.zip", None);
+        let old = sp.tick().download.remove(0);
+        sp.push(1, "https://example.com/new.zip", None);
+        sp.push_local(2, PathBuf::from("/p/not-active"));
+        let new = sp.tick().download.remove(0);
+        sp.take_replies();
+        sp.downloaded(Batch {
+            downloaded: vec![],
+            failed: vec![(old.id, old.key)],
+        });
+        assert_eq!(sp.tick().reload, None);
+        assert!(sp.take_replies().is_empty());
+        assert_eq!(sp.packs.len(), 2);
+        assert!(
+            sp.packs
+                .iter()
+                .any(|p| p.key == new.key && p.download == Download::Pending)
+        );
+        sp.downloaded(Batch {
+            downloaded: vec![],
+            failed: vec![(new.id, new.key)],
+        });
+        assert_eq!(sp.tick().reload, None);
+        assert_eq!(sp.take_replies(), [(1, FAILED_DOWNLOAD), (2, DISCARDED)]);
+        assert!(sp.packs.is_empty());
+        // A late success cannot resurrect this failed generation.
+        sp.downloaded(ok(&new));
+        sp.tick();
+        assert!(sp.packs.is_empty());
+        assert!(sp.take_replies().is_empty());
+    }
+
+    #[test]
+    fn an_old_failed_batch_after_reconnect_does_not_fail_the_new_servers_pack() {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        sp.push(0, "https://example.com/old-server.zip", None);
+        let old = sp.tick().download.remove(0);
+        sp.disconnect();
+        sp.tick();
+        sp.connect(Prompt::Allowed);
+        sp.push(0, "https://example.com/new-server.zip", None);
+        let new = sp.tick().download.remove(0);
+        sp.take_replies();
+        sp.downloaded(Batch {
+            downloaded: vec![],
+            failed: vec![(old.id, old.key)],
+        });
+        assert_eq!(sp.tick().reload, None);
+        assert!(sp.take_replies().is_empty());
+        assert_eq!(sp.packs.len(), 1);
+        assert_eq!(sp.packs[0].key, new.key);
+        assert_eq!(sp.packs[0].download, Download::Pending);
+        sp.downloaded(Batch {
+            downloaded: vec![(new.id, new.key, PathBuf::from("/p/new-server"))],
+            failed: vec![],
+        });
+        assert_eq!(
+            sp.tick().reload,
+            Some(vec![(0, PathBuf::from("/p/new-server"))])
+        );
+        sp.reloaded(true);
+        sp.tick();
+        assert_eq!(
+            sp.take_replies(),
+            [(0, DOWNLOADED), (0, SUCCESSFULLY_LOADED)]
+        );
+        assert_eq!(sp.packs[0].path, Some(PathBuf::from("/p/new-server")));
     }
 
     #[test]
@@ -646,15 +930,117 @@ mod tests {
         let mut sp = ServerPacks::default();
         sp.connect(Prompt::Allowed);
         sp.push(1, "http://a/old.zip", None);
-        settle(&mut sp, &mut |r| ok(r[0].id), &mut |_| true);
+        settle(&mut sp, &mut |r| ok(&r[0]), &mut |_| true);
         // The server pushes the same id again while the first is active.
         sp.push(1, "http://a/new.zip", None);
         let mut reloads = Vec::new();
-        settle(&mut sp, &mut |r| ok(r[0].id), &mut |p| {
+        settle(&mut sp, &mut |r| ok(&r[0]), &mut |p| {
             reloads.push(p.to_vec());
             true
         });
         assert_eq!(reloads, [[(1, PathBuf::from("/p/1"))]]);
+    }
+
+    fn stale_completion_does_not_touch_new_pack(reconnect: bool, reset: bool, failed: bool) {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        sp.push(1, "http://old/pack.zip", None);
+        let old = sp.tick().download.remove(0);
+        // Keep the original request alive while the replacement/new server
+        // starts another download under exactly the same protocol UUID.
+        if reset {
+            sp = ServerPacks::default();
+            sp.connect(Prompt::Allowed);
+        } else if reconnect {
+            sp.disconnect();
+            sp.tick();
+            sp.connect(Prompt::Allowed);
+        }
+        sp.push(1, "http://new/pack.zip", None);
+        let new = sp.tick().download.remove(0);
+        assert_ne!(old.key, new.key);
+        sp.take_replies();
+        let stale = if failed {
+            Batch {
+                downloaded: Vec::new(),
+                failed: vec![(old.id, old.key)],
+            }
+        } else {
+            Batch {
+                downloaded: vec![(old.id, old.key, PathBuf::from("/old-bytes"))],
+                failed: Vec::new(),
+            }
+        };
+        sp.downloaded(stale);
+        assert!(
+            sp.take_replies().is_empty(),
+            "stale result was reported for the new pack"
+        );
+        assert_eq!(
+            sp.tick(),
+            Tick::default(),
+            "stale bytes reloaded or the new download restarted"
+        );
+        assert!(
+            sp.packs
+                .iter()
+                .any(|p| p.key == new.key && p.download == Download::Pending && !p.removed())
+        );
+        sp.downloaded(Batch {
+            downloaded: vec![(new.id, new.key, PathBuf::from("/new-bytes"))],
+            failed: Vec::new(),
+        });
+        assert_eq!(
+            sp.tick().reload,
+            Some(vec![(new.id, PathBuf::from("/new-bytes"))])
+        );
+        assert!(sp.reloaded(true).is_none());
+        assert_eq!(
+            sp.take_replies(),
+            [(new.id, DOWNLOADED), (new.id, SUCCESSFULLY_LOADED)]
+        );
+        assert_eq!(sp.tick(), Tick::default());
+    }
+
+    #[test]
+    fn stale_download_success_and_failure_cannot_complete_a_replacement() {
+        for failed in [false, true] {
+            stale_completion_does_not_touch_new_pack(false, false, failed);
+        }
+    }
+
+    #[test]
+    fn stale_download_success_and_failure_cannot_affect_a_new_connection() {
+        for failed in [false, true] {
+            stale_completion_does_not_touch_new_pack(true, false, failed);
+        }
+    }
+
+    #[test]
+    fn resetting_the_manager_never_recycles_pending_request_generations() {
+        for failed in [false, true] {
+            stale_completion_does_not_touch_new_pack(false, true, failed);
+        }
+    }
+
+    #[test]
+    fn stale_failure_does_not_discard_a_current_success_in_the_same_batch() {
+        let mut sp = ServerPacks::default();
+        sp.connect(Prompt::Allowed);
+        sp.push(1, "http://old/a.zip", None);
+        let old = sp.tick().download.remove(0);
+        sp.push(1, "http://new/b.zip", None);
+        let new = sp.tick().download.remove(0);
+        sp.take_replies();
+        sp.downloaded(Batch {
+            downloaded: vec![(new.id, new.key, PathBuf::from("/new"))],
+            failed: vec![(old.id, old.key)],
+        });
+        assert_eq!(
+            sp.tick().reload,
+            Some(vec![(new.id, PathBuf::from("/new"))])
+        );
+        assert_eq!(sp.take_replies(), [(new.id, DOWNLOADED)]);
     }
 
     #[test]

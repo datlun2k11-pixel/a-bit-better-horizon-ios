@@ -37,7 +37,7 @@ const INTRUSION_QUIET: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum InputOrigin {
-    /// The window's own events: someone at this computer's keyboard, mouse or pad.
+    /// The window's own events: someone at this computer's keyboard, mouse, touchscreen or pad.
     User,
     /// The control socket: `horizon-ctl`, an MCP client, or a script.
     Agent,
@@ -109,6 +109,14 @@ pub(super) enum TraceKind {
         x: f64,
         y: f64,
     },
+    /// The original finger event in physical window coordinates. Pointer
+    /// events translated from it are not recorded twice.
+    Touch {
+        id: u64,
+        phase: String,
+        x: f64,
+        y: f64,
+    },
     Pad {
         button: String,
         action: String,
@@ -127,6 +135,7 @@ impl TraceKind {
             TraceKind::Wheel { .. } => "wheel",
             TraceKind::Cursor { .. } => "cursor",
             TraceKind::Motion { .. } => "motion",
+            TraceKind::Touch { .. } => "touch",
             TraceKind::Pad { .. } => "pad",
             TraceKind::Command { .. } => "command",
         }
@@ -436,7 +445,10 @@ impl Game<'_> {
     /// Keep the window events that are input. Agent-made window events are left
     /// out: the control-socket line that caused them is recorded instead.
     pub(super) fn trace_window_event(&mut self, origin: InputOrigin, event: &WindowEvent) {
-        if origin == InputOrigin::Agent || !self.tracing_input() {
+        if origin == InputOrigin::Agent
+            || (origin == InputOrigin::Game && self.touch_synthetic_input())
+            || !self.tracing_input()
+        {
             return;
         }
         match event {
@@ -486,6 +498,23 @@ impl Game<'_> {
                     MouseScrollDelta::PixelDelta(p) => (p.x, p.y, false),
                 };
                 self.note_input(origin, TraceKind::Wheel { x, y, lines });
+            }
+            WindowEvent::Touch(touch) => {
+                let phase = match touch.phase {
+                    winit::event::TouchPhase::Started => "started",
+                    winit::event::TouchPhase::Moved => "moved",
+                    winit::event::TouchPhase::Ended => "ended",
+                    winit::event::TouchPhase::Cancelled => "cancelled",
+                };
+                self.note_input(
+                    origin,
+                    TraceKind::Touch {
+                        id: touch.id,
+                        phase: phase.to_owned(),
+                        x: touch.location.x,
+                        y: touch.location.y,
+                    },
+                );
             }
             // GUI clicks land where the pointer is; in the world the pointer is
             // grabbed and turns the view through `device_event` instead.

@@ -75,8 +75,15 @@ fn target(id: i32) -> Option<InteractTarget> {
 }
 
 #[test]
-#[ignore = "private prepared resources; process-wide mods, run this test alone"]
+#[ignore = "private prepared resources in HORIZON_TEST_RESOURCES"]
 fn actual_item_interact_mob_fallback_priority_and_filters() {
+    crate::mod_api::in_own_process(
+        "game::item_interact_mob_tests::actual_item_interact_mob_fallback_priority_and_filters",
+        actual_item_interact_mob_fallback_priority_and_filters_in_own_process,
+    );
+}
+
+fn actual_item_interact_mob_fallback_priority_and_filters_in_own_process() {
     let root = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
     let settings = Settings::default();
     let loaded = load_resources(
@@ -114,7 +121,7 @@ fn actual_item_interact_mob_fallback_priority_and_filters() {
     game.world
         .chunks
         .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
     game.yaw = 0.0;
     game.pitch = 0.0;
     game.selected = 0;

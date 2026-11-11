@@ -53,6 +53,28 @@ impl Gpu {
         world: World<'_>,
         inputs: horizon_shaders::GameInputs,
     ) -> PackPost {
+        self.load_expected(files, world, inputs, false)
+    }
+
+    /// A valid source pair whose pipeline must fail on the requested target.
+    /// This explicitly checks the failure is after translation, and that neither
+    /// terrain half survives the renderer's split-coupling guard.
+    pub(super) fn load_gpu_rejected(
+        &self,
+        files: Vec<(String, String)>,
+        world: World<'_>,
+        inputs: horizon_shaders::GameInputs,
+    ) -> PackPost {
+        self.load_expected(files, world, inputs, true)
+    }
+
+    fn load_expected(
+        &self,
+        files: Vec<(String, String)>,
+        world: World<'_>,
+        inputs: horizon_shaders::GameInputs,
+        gpu_rejection: bool,
+    ) -> PackPost {
         use std::io::{Cursor, Write};
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, contents) in files {
@@ -72,6 +94,17 @@ impl Gpu {
         let (properties, _) = horizon_shaders::read_properties(&pack, &mut macros);
         let post = horizon_shaders::load_post(&pack, "", &properties, &macros, &inputs);
         assert!(
+            post.complete,
+            "fixture source must translate: {:?}",
+            post.notes
+        );
+        if gpu_rejection {
+            assert!(
+                post.terrain.is_some() && post.terrain_cutout.is_some(),
+                "both terrain sources must reach GPU pipeline creation"
+            );
+        }
+        assert!(
             post.programs.iter().any(|p| p.name == "final"),
             "{:?}",
             post.notes
@@ -83,6 +116,7 @@ impl Gpu {
             post,
             T::Rgba8Unorm,
             world,
+            &Default::default(),
         )
         .expect("the pack runs");
         assert!(
@@ -90,6 +124,16 @@ impl Gpu {
             "{:?}",
             built.notes
         );
+        if gpu_rejection {
+            assert!(!built.complete, "GPU-incompatible fixture unexpectedly ran");
+            assert!(
+                built.terrain.is_none() && built.terrain_cutout.is_none(),
+                "a failed split pipeline must remove both terrain passes: {:?}",
+                built.notes
+            );
+        } else {
+            assert!(built.complete, "incomplete fixture: {:?}", built.notes);
+        }
         built
     }
     pub(super) fn clear(
@@ -135,6 +179,7 @@ impl Gpu {
         frame: &Frame<'_>,
         terrain: &mut TerrainDraw<'_>,
     ) -> Vec<[u8; 4]> {
+        super::wait_resize(post, &self.device, &self.queue, SIZE);
         let screen = self.texture(T::Rgba8Unorm);
         let stride = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let read = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -144,19 +189,23 @@ impl Gpu {
             mapped_at_creation: false,
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        post.run(
-            &self.device,
-            &self.queue,
-            &mut encoder,
-            color,
-            depth,
-            &screen,
-            frame,
-            &Default::default(),
-            SIZE,
-            SIZE,
-            &[],
-            terrain,
+        assert_eq!(
+            post.run(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                color,
+                depth,
+                &screen,
+                frame,
+                &Default::default(),
+                SIZE,
+                SIZE,
+                &[],
+                terrain,
+            )
+            .unwrap(),
+            ResizeState::Ready
         );
         encoder.copy_texture_to_buffer(
             screen.texture().as_image_copy(),
@@ -320,10 +369,11 @@ fn check(sampler: &str, stage: Stage, scene: Scene, expected: [u8; 4]) {
     let terrain = !matches!(scene, Scene::World);
     let hand = matches!(scene, Scene::Terrain { hand: true, .. });
     let water = matches!(scene, Scene::Terrain { water: true, .. } | Scene::WaterOnly);
-    let inputs=horizon_shaders::GameInputs {
-        terrain:terrain.then(|| horizon_shaders::GbuffersInputs { declarations:"layout(location=0)in vec3 fixture_position;\n".into(),body:"hz_Vertex=vec4(fixture_position,1.0);hz_Color=vec4(1.0);hz_MultiTexCoord0=vec4(0.0);hz_MultiTexCoord1=vec4(240.0);hz_MultiTexCoord2=vec4(240.0);hz_Normal=vec3(0.0,0.0,1.0);\n".into(),attributes:vec![],after:String::new(),alpha_test:None,item_id_declared:false,far_depth:false }),
+    let mut inputs=horizon_shaders::GameInputs {
+        terrain:terrain.then(|| horizon_shaders::GbuffersInputs { declarations:"layout(location=0)in vec3 fixture_position;\n".into(),body:"hz_Vertex=vec4(fixture_position,1.0);hz_Color=vec4(1.0);hz_MultiTexCoord0=vec4(0.0);hz_MultiTexCoord1=vec4(240.0);hz_MultiTexCoord2=vec4(240.0);hz_Normal=vec3(0.0,0.0,1.0);\n".into(),attributes:vec![],after:String::new(),terrain_lighting:None,item_id_declared:false,alpha_test:None,far_depth:false,paged_maps:false,water_mask:false,water_patches:false }),
         hand:hand.then(crate::gfx::pack_hand::inputs),..Default::default()
     };
+    inputs.entities = inputs.terrain.clone();
     let mut post = gpu.load(
         shaders(sampler, stage, scene),
         World {
@@ -414,8 +464,43 @@ fn check(sampler: &str, stage: Stage, scene: Scene, expected: [u8; 4]) {
     if hand {
         frame.hand = &quad;
     }
+    // These synthetic vertices do not read source metadata, but the shared terrain
+    // pipeline layout still requires its bind group, as production supplies per page.
+    let metadata = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Depth fixture unused metadata"),
+        size: 32,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let group = post.block_ids.as_ref().map(|(layout, ids, rects)| {
+        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: metadata.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: metadata.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: rects.as_entire_binding(),
+                },
+            ],
+        })
+    });
     let actual = gpu.render(&mut post, &color, &depth, &frame, &mut |rp, list, _, _| {
         if list == TerrainList::Solid || (water && list == TerrainList::Translucent) {
+            if let Some(group) = &group {
+                rp.set_bind_group(3, group, &[]);
+            }
             rp.set_vertex_buffer(0, vertices.slice(..));
             rp.draw(0..6, 0..1);
         }
@@ -593,6 +678,7 @@ pub(super) fn fixture_frame(hud: &HudBatch) -> Frame<'_> {
         skybox: false,
         end_sky: false,
         end_sky_sprite: None,
+        boss_world_fog: false,
         environment_fog: None,
         water_fog: [0.0; 3],
         fog: None,
@@ -714,14 +800,22 @@ fn shadow_depth_map_reads(
                 .into(),
             attributes: vec![],
             after: String::new(),
+            terrain_lighting: None,
             alpha_test: None,
             item_id_declared: false,
             far_depth: false,
+            paged_maps: false,
+            water_mask: false,
+            water_patches: false,
         }),
         ..Default::default()
     };
     let settings = format!("const int shadowMapResolution = 16;\n{nearest}\n");
     let files = vec![
+        (
+            "shaders.properties".into(),
+            "shadowEntities=false\nshadowBlockEntities=false\n".into(),
+        ),
         ("final.vsh".to_string(), VERTEX.to_string()),
         (
             "final.fsh".into(),
@@ -771,9 +865,13 @@ fn shadow_depth_map_reads(
         });
     let hud = HudBatch::new(SIZE);
     let frame = fixture_frame(&hud);
+    let terrain_group = unused_terrain_group(&post, &gpu.device);
     Some(
         gpu.render(&mut post, &color, &depth, &frame, &mut |rp, list, _, _| {
             if list == TerrainList::ShadowSolid {
+                if let Some(group) = &terrain_group {
+                    rp.set_bind_group(3, group, &[]);
+                }
                 rp.set_vertex_buffer(0, vertices.slice(..));
                 rp.draw(0..6, 0..1);
             }

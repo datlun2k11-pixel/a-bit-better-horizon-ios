@@ -67,7 +67,7 @@ def differential(name, oracle, probe, make_input, scope, sources=(), expected_li
     oracle_path = lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity' / (oracle + '.java')
     all_sources = [Path(__file__).resolve(), lab.ROOT / 'tools/oracle_harness.py', lab.ROOT / 'tools/test_rust_parity.py',
                    lab.ROOT / 'tools/lab.py', oracle_path, lab.ROOT / 'Cargo.toml', lab.ROOT / 'Cargo.lock',
-                   lab.ROOT / 'crates/horizon-client/Cargo.toml', lab.ROOT / 'crates/horizon-client/src/lib.rs',
+                   lab.ROOT / 'crates/horizon-client-lib/Cargo.toml', lab.ROOT / 'crates/horizon-client/src/client_lib.rs',
                    lab.ROOT / f'crates/horizon-client/examples/probe/{probe}.rs', *map(Path, sources)]
     tested = base.source_hashes(all_sources)
     input_path, units = make_input(build)

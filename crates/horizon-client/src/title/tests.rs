@@ -100,13 +100,61 @@ impl Drop for Fixture {
     }
 }
 
+/// Join a Friend needs a resolver; these tests stand one in (`net::JOINS_FRIENDS_IN_TEST`).
+fn with_resolver() -> Fixture {
+    crate::net::JOINS_FRIENDS_IN_TEST.set(true);
+    Fixture::new()
+}
+
+#[test]
+fn without_a_resolver_the_friends_icon_is_inactive_and_opens_nothing() {
+    crate::net::JOINS_FRIENDS_IN_TEST.set(false);
+    let mut f = Fixture::new();
+    let icons: Vec<_> = f
+        .title
+        .buttons(480.0, 262.0)
+        .into_iter()
+        .filter(|b| b.icon.is_some())
+        .map(|b| (b.label.clone(), b.enabled, b.x))
+        .collect();
+    // Same place and look as with one, only greyed; Language and Accessibility stay active.
+    let friends = icons.iter().find(|(label, ..)| label == "Friends").unwrap();
+    assert!(!friends.1);
+    assert!(
+        icons
+            .iter()
+            .filter(|(label, ..)| label != "Friends")
+            .all(|(_, on, _)| *on)
+    );
+    assert_eq!(f.click("Friends"), Action::None);
+    assert!(matches!(f.title.mode, Mode::Main));
+    crate::net::JOINS_FRIENDS_IN_TEST.set(true);
+    let with: Vec<_> = f
+        .title
+        .buttons(480.0, 262.0)
+        .into_iter()
+        .filter(|b| b.icon.is_some())
+        .map(|b| (b.label.clone(), b.x, b.y))
+        .collect();
+    assert_eq!(
+        with.iter()
+            .map(|(l, x, _)| (l.clone(), *x))
+            .collect::<Vec<_>>(),
+        icons
+            .iter()
+            .map(|(l, _, x)| (l.clone(), *x))
+            .collect::<Vec<_>>()
+    );
+    crate::net::JOINS_FRIENDS_IN_TEST.set(false);
+}
+
 mod multiplayer_parent_navigation {
     use super::*;
     use crate::multiplayer::{Outcome, Screen};
 
     #[test]
     fn friend_cancel_returns_to_title() {
-        let mut f = Fixture::new();
+        let mut f = with_resolver();
         f.click("Friends");
         assert!(matches!(
             f.title.mode,
@@ -118,7 +166,7 @@ mod multiplayer_parent_navigation {
 
     #[test]
     fn friend_escape_returns_to_title() {
-        let mut f = Fixture::new();
+        let mut f = with_resolver();
         f.click("Friends");
         assert!(matches!(
             f.title.mode,
@@ -224,6 +272,7 @@ fn direct_connection_remembers_the_address_on_cancel_escape_and_join() {
         Action::Connect {
             address: "localhost:25569".into(),
             lan: false,
+            realm: false,
         }
     );
     assert_eq!(f.title.last_server, "localhost:25569");
@@ -680,10 +729,54 @@ fn a_world_folder_holding_a_link_is_not_opened() {
 
 #[cfg(unix)]
 #[test]
+fn world_link_warning_respects_the_vanilla_allowlist() {
+    let mut f = Fixture::new();
+    f.world("World", "World");
+    let outside = f.root.join("permitted");
+    fs::create_dir_all(&outside).unwrap();
+    let link = f.title.saves.join("World/link");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    assert_eq!(
+        world_management::symlinks(&f.title.saves, "World").unwrap(),
+        vec![link]
+    );
+    fs::write(
+        f.title.saves.join("allowed_symlinks.txt"),
+        outside.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        world_management::symlinks(&f.title.saves, "World")
+            .unwrap()
+            .is_empty()
+    );
+    f.select();
+    let _ = f.click("Play Selected World");
+    assert!(!matches!(
+        f.title.mode,
+        Mode::Error {
+            alert: Some(Alert::Symlink),
+            ..
+        }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn backup_rejects_symlinks_and_removes_incomplete_archive() {
     let f = Fixture::new();
     f.world("World", "World");
     std::os::unix::fs::symlink(f.root.join("outside"), f.title.saves.join("World/link")).unwrap();
+    assert!(world_management::backup(&f.title.saves, "World").is_err());
+    // Access validation refuses an untrusted link before reserving an archive.
+    assert!(!f.root.join("backups").exists());
+    // Permit it at the access layer to retain coverage of the archive writer's
+    // own link refusal and cleanup after an output file has been created.
+    fs::write(
+        f.title.saves.join("allowed_symlinks.txt"),
+        f.root.join("outside").to_string_lossy().as_bytes(),
+    )
+    .unwrap();
     assert!(world_management::backup(&f.title.saves, "World").is_err());
     assert_eq!(fs::read_dir(f.root.join("backups")).unwrap().count(), 0);
 }
@@ -983,6 +1076,101 @@ fn a_world_open_elsewhere_stays_closed_behind_a_toast() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn playing_a_world_rejects_lock_links_before_touching_the_target() {
+    let mut f = Fixture::new();
+    f.world("World", "World");
+    let target = f.root.join("sentinel");
+    fs::write(&target, b"keep me").unwrap();
+    std::os::unix::fs::symlink(&target, f.title.saves.join("World/session.lock")).unwrap();
+    let world = list_worlds(&f.title.saves).remove(0);
+    assert_eq!(f.title.play(world), Action::None);
+    assert_eq!(fs::read(&target).unwrap(), b"keep me");
+    assert_eq!(
+        fs::read_link(f.title.saves.join("World/session.lock")).unwrap(),
+        target
+    );
+    // Forbidden links now have their own vanilla warning screen. This
+    // validation still happens before opening (and writing) session.lock.
+    assert!(f.title.toast.is_none());
+    assert!(matches!(
+        f.title.mode,
+        Mode::Error {
+            alert: Some(Alert::Symlink),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn recovery_does_not_replace_data_of_a_locked_world() {
+    let mut f = Fixture::new();
+    f.world("World", "World");
+    f.world("World", "World");
+    let dir = f.title.saves.join("World");
+    fs::write(dir.join("level.dat"), b"broken").unwrap();
+    let world = list_worlds(&f.title.saves).remove(0);
+    let _lock = crate::save::SessionLock::acquire(&dir).unwrap();
+    f.title.attempt_restore(world);
+    assert_eq!(fs::read(dir.join("level.dat")).unwrap(), b"broken");
+    assert!(matches!(
+        f.title.toast,
+        Some((_, WorldToast::AccessFailure(_)))
+    ));
+}
+
+#[test]
+fn metadata_edits_and_backups_refuse_another_instances_world_lock() {
+    let f = Fixture::new();
+    f.world("World", "Original name");
+    let dir = f.title.saves.join("World");
+    fs::write(dir.join("icon.png"), b"icon fixture").unwrap();
+    let original = fs::read(dir.join("level.dat")).unwrap();
+    let lock = crate::save::SessionLock::acquire(&dir).unwrap();
+    assert!(world_management::rename(&f.title.saves, "World", "Changed").is_err());
+    assert!(world_management::reset_icon(&f.title.saves, "World").is_err());
+    assert!(world_management::backup(&f.title.saves, "World").is_err());
+    assert_eq!(fs::read(dir.join("level.dat")).unwrap(), original);
+    assert_eq!(fs::read(dir.join("icon.png")).unwrap(), b"icon fixture");
+    assert!(!world_management::backups_path(&f.title.saves).exists());
+    drop(lock);
+    world_management::rename(&f.title.saves, "World", "Changed").unwrap();
+    world_management::reset_icon(&f.title.saves, "World").unwrap();
+    assert!(world_management::backup(&f.title.saves, "World").unwrap() > 0);
+    assert!(!crate::save::SessionLock::is_locked(&dir));
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_access_rejects_a_lock_symlink_before_touching_its_target() {
+    let f = Fixture::new();
+    f.world("World", "World");
+    let dir = f.title.saves.join("World");
+    fs::write(dir.join("icon.png"), b"icon fixture").unwrap();
+    let target = f.root.join("sentinel");
+    fs::write(&target, b"keep me").unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("session.lock")).unwrap();
+    assert!(world_management::rename(&f.title.saves, "World", "Changed").is_err());
+    assert!(world_management::reset_icon(&f.title.saves, "World").is_err());
+    assert!(world_management::backup(&f.title.saves, "World").is_err());
+    assert_eq!(fs::read(target).unwrap(), b"keep me");
+    assert_eq!(fs::read(dir.join("icon.png")).unwrap(), b"icon fixture");
+}
+
+#[test]
+fn optimization_keeps_the_world_locked_until_the_worker_is_closed() {
+    let mut f = Fixture::new();
+    f.world("World", "World");
+    let world = list_worlds(&f.title.saves).remove(0);
+    let dir = f.title.saves.join("World");
+    f.title.begin_optimize(world, false);
+    assert!(f.title.optimize.is_some());
+    assert!(crate::save::SessionLock::is_locked(&dir));
+    f.title.end_optimize(false);
+    assert!(!crate::save::SessionLock::is_locked(&dir));
+}
+
 #[test]
 fn clicking_a_world_icon_joins_it_at_once() {
     let mut f = Fixture::new();
@@ -1118,6 +1306,128 @@ fn hovered_buttons_ask_for_the_hand_or_not_allowed() {
     f.world("A", "Alpha");
     f.title.enter_singleplayer();
     assert_eq!(cursor_over(&f.title, Some("Edit")), Cursor::NotAllowed);
+}
+
+/// 26.3's en_us strings for the buttons' tooltips, standing in for the
+/// prepared resources.
+struct TooltipStrings;
+impl crate::lang::ResourceSource for TooltipStrings {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        (path == "assets/minecraft/lang/en_us.json").then(|| {
+            br#"{
+                "gui.friends.open.tooltip": "Friends",
+                "options.language.tooltip": "Change Language",
+                "options.accessibility.tooltip": "Accessibility Settings"
+            }"#
+            .to_vec()
+        })
+    }
+}
+
+/// Draws `title` at 480 x 262 in English with the pointer at `mouse`: the
+/// frame's tooltip as the narrator gets it, and what was drawn.
+fn draw_hovered(
+    title: &Title,
+    atlas: &crate::hud::HudAtlas,
+    mouse: (f32, f32),
+    frame: &mut u64,
+) -> (Option<String>, Vec<crate::hud::HudVertex>) {
+    crate::widgets::end_frame(*frame);
+    let _ = crate::widgets::take_last_narration();
+    let mut batch = HudBatch::new([480, 262]);
+    let english = crate::lang::Language::load(&[&TooltipStrings], "en_us");
+    crate::lang::scoped(english, || title.draw(atlas, &mut batch, mouse, true));
+    crate::widgets::end_frame(*frame + 1);
+    *frame += 2;
+    (
+        crate::widgets::take_last_narration().tooltip,
+        batch.vertices,
+    )
+}
+
+/// The middle of the button `id` at 480 x 262.
+fn button_middle(title: &Title, id: u8) -> (f32, f32) {
+    let buttons = title.buttons(480.0, 262.0);
+    let b = buttons.iter().find(|b| b.id == id).unwrap();
+    (b.x + b.w / 2.0, b.y + 10.0)
+}
+
+/// The icon row's buttons carry vanilla's tooltips (`CommonButtons.language`,
+/// `accessibility`, `FriendsButton`), shown while the pointer is on one, beside
+/// it as `MenuTooltipPositioner` puts them (#12067).
+#[test]
+fn icon_buttons_show_their_tooltip_while_hovered() {
+    let f = Fixture::new();
+    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    crate::widgets::set_narrating(true);
+    let mut frame = 12_067_000;
+    let (none, plain) = draw_hovered(&f.title, &atlas, (0.0, 0.0), &mut frame);
+    assert_eq!(none, None);
+    // The icons sit at y 185, 20 high. Over the middle of one (y 195),
+    // MenuTooltipPositioner puts the text 12 right of the pointer and at
+    // 195 + 3 + round(lerp(13 / 20, 17, 5)) = 198 + 9 = 207.
+    for (id, text, top_left) in [
+        (5, "Friends", (228.0, 207.0)),
+        (6, "Change Language", (252.0, 207.0)),
+        (7, "Accessibility Settings", (276.0, 207.0)),
+    ] {
+        let mouse = button_middle(&f.title, id);
+        let (tooltip, drawn) = draw_hovered(&f.title, &atlas, mouse, &mut frame);
+        assert_eq!(tooltip.as_deref(), Some(text), "icon button {id}");
+        // The test atlas has no widget or tooltip sprites, so everything past
+        // the plain frame's vertices is the tooltip's text.
+        assert!(
+            drawn.len() > plain.len(),
+            "icon button {id} drew no tooltip"
+        );
+        let tail = &drawn[plain.len()..];
+        let min_x = tail.iter().map(|v| v.pos[0]).fold(f32::MAX, f32::min);
+        let min_y = tail.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+        assert_eq!((min_x, min_y), top_left, "icon button {id}");
+    }
+    // A text button without a tooltip shows none.
+    let singleplayer = button_middle(&f.title, 1);
+    assert_eq!(
+        draw_hovered(&f.title, &atlas, singleplayer, &mut frame).0,
+        None
+    );
+    crate::widgets::set_narrating(false);
+}
+
+/// `AccessibilityOnboardingScreen.init` builds its Accessibility Settings...
+/// and Language... buttons with the same `CommonButtons`, tooltips and all.
+#[test]
+fn onboarding_common_buttons_show_their_tooltip_while_hovered() {
+    let mut f = Fixture::new();
+    f.title.start_onboarding();
+    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    crate::widgets::set_narrating(true);
+    let mut frame = 12_067_100;
+    // The first frame also wraps the message the buttons are laid out under.
+    let (none, plain) = draw_hovered(&f.title, &atlas, (0.0, 0.0), &mut frame);
+    assert_eq!(none, None);
+    for (id, text) in [
+        (onboarding::ACCESSIBILITY, "Accessibility Settings"),
+        (onboarding::LANGUAGE, "Change Language"),
+    ] {
+        let mouse = button_middle(&f.title, id);
+        let (tooltip, drawn) = draw_hovered(&f.title, &atlas, mouse, &mut frame);
+        assert_eq!(tooltip.as_deref(), Some(text), "onboarding button {id}");
+        assert!(
+            drawn.len() > plain.len(),
+            "onboarding button {id} drew no tooltip"
+        );
+    }
+    for id in [
+        onboarding::NARRATOR,
+        onboarding::SOUNDS,
+        onboarding::CONTINUE,
+    ] {
+        let mouse = button_middle(&f.title, id);
+        let (tooltip, _) = draw_hovered(&f.title, &atlas, mouse, &mut frame);
+        assert_eq!(tooltip, None, "onboarding button {id}");
+    }
+    crate::widgets::set_narrating(false);
 }
 
 #[test]
@@ -2600,6 +2910,213 @@ fn the_multiplayer_screens_have_their_own_ids() {
 }
 
 #[test]
+fn realms_roster_scroll_routes_mouse_touch_and_controller_wheels_to_the_same_list() {
+    let mut f = Fixture::new();
+    f.title.mode = Mode::Realms(crate::realms::players_fixture(100));
+    let size = (800.0, 240.0);
+    let at = (400.0, 61.0);
+    // Pointer wheels and touch's synthetic line wheel both use scroll_worlds;
+    // controller step/stick wheels delegate to it too.
+    f.title.scroll_worlds(-1.0, at, size);
+    f.title.step_scroll(-1.0, at, size);
+    crate::widgets::scroll_area([250.0, 60.0, 300.0, 112.0], 0.0, 97.0);
+    crate::widgets::end_frame(u64::MAX);
+    f.title.stick_scroll(-1.0, (0.0, 0.0), size);
+    let buttons = f.title.buttons(size.0, size.1);
+    let remove = buttons.iter().find(|b| b.id == 101).unwrap();
+    f.title
+        .click(remove.x + remove.w / 2.0, remove.y + 10.0, size);
+    assert!(
+        matches!(&f.title.mode, Mode::Realms(screen) if matches!(&screen.subscreen, crate::realms::SubScreen::Popup(crate::realms::Popup::Uninvite { player, .. }) if player.name == "Player003")),
+        "the mouse, step and hidden-pointer stick must all reach the same list: {:?}",
+        f.title.mode,
+    );
+}
+
+#[test]
+fn a_realms_click_targets_the_painted_uuid_when_title_rechecks_hitboxes() {
+    let mut f = Fixture::new();
+    f.title.mode = Mode::Realms(crate::realms::players_fixture(100));
+    let size = (800.0, 240.0);
+    f.title.scroll_worlds(-50.0, (400.0, 61.0), size);
+    let buttons = f.title.buttons(size.0, size.1);
+    let remove = buttons.iter().find(|b| b.id == 101).unwrap();
+    let Mode::Realms(screen) = &mut f.title.mode else {
+        unreachable!()
+    };
+    let crate::realms::SubScreen::Configure {
+        detail: Some(Ok(detail)),
+        ..
+    } = &mut screen.subscreen
+    else {
+        unreachable!()
+    };
+    detail.players.swap(50, 51);
+    // Title.click recomputes button rectangles as part of ordinary hit testing.
+    // That query must not change which UUID was drawn under this rectangle.
+    f.title
+        .click(remove.x + remove.w / 2.0, remove.y + 10.0, size);
+    assert!(
+        matches!(&f.title.mode, Mode::Realms(screen) if matches!(&screen.subscreen, crate::realms::SubScreen::Popup(crate::realms::Popup::Uninvite { player, .. }) if player.name == "Player050")),
+        "a hit query retargeted an action after the roster refreshed: {:?}",
+        f.title.mode,
+    );
+}
+
+#[test]
+fn realms_https_workers_stay_owned_after_title_release_and_cancel_stalled_tls() {
+    use std::{
+        io::Read,
+        net::{Shutdown, TcpListener},
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("https://{}", listener.local_addr().unwrap());
+    let (entered, ready) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut bytes = [0; 8192];
+        let n = socket.read(&mut bytes).unwrap();
+        entered.send((socket.try_clone().unwrap(), n)).unwrap();
+        // A genuine TLS handshake read waits here: no ServerHello is sent.
+        // The test owns this peer too, so a failed assertion cannot leave it
+        // parked indefinitely on another process or a production endpoint.
+        let mut rest = Vec::new();
+        let _ = socket.read_to_end(&mut rest);
+    });
+    let mut f = Fixture::new();
+    let handle = f.title.realms_workers.work_handle();
+    let cancellation = f.title.realms_workers.cancellation();
+    let session =
+        horizon_client_render::auth::AuthSession::new("Fixture", 7, "controlled-realms-token");
+    let client = crate::realms::client::RealmsClient::new(&base, &base, &session)
+        .with_cancellation(cancellation.clone());
+    let job = f.title.realms_workers.spawn(move || client.list_worlds());
+    f.title.mode = Mode::Realms(crate::realms::Screen::with_workers(
+        f.title.realms_workers.clone(),
+    ));
+    let Mode::Realms(screen) = &mut f.title.mode else {
+        unreachable!()
+    };
+    screen.state = crate::realms::FetchState::Loading(job.clone());
+    let (cleanup, hello_bytes) = ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(hello_bytes > 0);
+    assert_eq!(cancellation.attached_sockets(), 1);
+    let start = Instant::now();
+    drop(f);
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "title release blocked on HTTPS"
+    );
+    assert!(
+        !cancellation.cancelled(),
+        "normal title retirement must preserve an operation already requested"
+    );
+    assert!(
+        !handle.poll(),
+        "a dropped UI future does not mean its IO producer stopped"
+    );
+    assert!(job.lock().unwrap().is_none());
+
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(2);
+    let mut stopped = handle.shutdown();
+    while !stopped && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+        stopped = handle.shutdown();
+    }
+    let latency = start.elapsed();
+    // Always clean up the controlled peer, even if cancellation regresses.
+    // This cleanup is deliberately after recording the shutdown result.
+    let _ = cleanup.shutdown(Shutdown::Both);
+    peer.join().unwrap();
+    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    while !handle.shutdown() && Instant::now() < cleanup_deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        stopped,
+        "stalled TLS was not interrupted before peer cleanup"
+    );
+    assert!(latency < Duration::from_secs(2));
+    assert_eq!(cancellation.attached_sockets(), 0);
+    assert!(matches!(
+        job.lock().unwrap().take(),
+        Some(Err(crate::realms::client::RealmsError::Cancelled))
+    ));
+    eprintln!(
+        "managed Realms stalled-TLS shutdown: {} ms",
+        latency.as_millis()
+    );
+}
+
+#[test]
+fn leaving_realms_normally_preserves_a_requested_controlled_http_operation() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (entered, ready) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let mut bytes = [0; 4096];
+            let n = socket.read(&mut bytes).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&bytes[..n]);
+        }
+        entered.send(()).unwrap();
+        wait.recv_timeout(Duration::from_secs(3)).unwrap();
+        socket.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"servers\":[{\"id\":7,\"name\":\"Controlled\"}]}").unwrap();
+    });
+    let mut f = Fixture::new();
+    let handle = f.title.realms_workers.work_handle();
+    let cancellation = f.title.realms_workers.cancellation();
+    let session =
+        horizon_client_render::auth::AuthSession::new("Fixture", 7, "controlled-realms-token");
+    let client = crate::realms::client::RealmsClient::new(&base, &base, &session)
+        .with_cancellation(cancellation.clone());
+    let job = f.title.realms_workers.spawn(move || client.list_worlds());
+    f.title.mode = Mode::Realms(crate::realms::Screen::with_workers(
+        f.title.realms_workers.clone(),
+    ));
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    f.title.mode = Mode::Main;
+    assert!(!cancellation.cancelled());
+    assert!(job.lock().unwrap().is_none());
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while job.lock().unwrap().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let result = job.lock().unwrap().take().unwrap().unwrap();
+    assert_eq!(result[0].id, 7);
+    peer.join().unwrap();
+    drop(f);
+    while !handle.poll() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!cancellation.cancelled());
+}
+
+#[test]
 fn native_field_visitor_excludes_preparing_and_game_rule_editors() {
     let mut f = Fixture::new();
     f.title.mode = Mode::Multiplayer(crate::multiplayer::Screen::Direct {
@@ -2623,4 +3140,67 @@ fn native_field_visitor_excludes_preparing_and_game_rule_editors() {
         f.title
             .edit_focused_text_field(|field| assert_eq!(field.value, "safe"))
     );
+}
+
+/// `RealmsCreateWorldFlow.createWorld`: the reset screen's Generate New World tile opens
+/// Create New World; its Create uploads instead of making a local world.
+#[test]
+fn a_realms_new_world_uploads_instead_of_creating_locally() {
+    let mut f = Fixture::new();
+    f.title.mode = Mode::Create {
+        name: "New World".into(),
+        seed: String::new(),
+        creative: false,
+        focus: 0,
+        options: WorldOptions::default(),
+    };
+    f.title.realms_create = Some(crate::realms::CreateWorldRequest {
+        server: crate::realms::client::RealmServer::default(),
+        slot: 1,
+        kind: crate::realms::ResetKind::Empty,
+        creation: None,
+    });
+    let action = f.title.create_or_upload();
+    assert!(matches!(action, Action::None), "no local world is entered");
+    assert!(f.title.realms_create.is_none());
+    // Without the account's session the upload cannot start: the failure the service's
+    // refusal would show, over the reset screen.
+    let Mode::Realms(screen) = &f.title.mode else {
+        panic!("the upload is a Realms screen");
+    };
+    assert!(matches!(
+        screen.subscreen,
+        crate::realms::SubScreen::Error { .. }
+    ));
+    assert!(!f.title.saves.join("New World").exists());
+    let _ = fs::remove_dir_all(&f.root);
+}
+
+/// `CreateWorldScreen.openFresh`'s cancel for the tile: the screen the reset screen was
+/// opened from (the configuration screen), not the world list.
+#[test]
+fn cancelling_a_realms_new_world_returns_to_the_realm() {
+    let mut f = Fixture::new();
+    f.title.mode = Mode::Create {
+        name: "New World".into(),
+        seed: String::new(),
+        creative: false,
+        focus: 0,
+        options: WorldOptions::default(),
+    };
+    f.title.realms_create = Some(crate::realms::CreateWorldRequest {
+        server: crate::realms::client::RealmServer::default(),
+        slot: 1,
+        kind: crate::realms::ResetKind::Empty,
+        creation: None,
+    });
+    f.title.cancel_create();
+    let Mode::Realms(screen) = &f.title.mode else {
+        panic!("the reset's Realm returns");
+    };
+    assert!(matches!(
+        screen.subscreen,
+        crate::realms::SubScreen::Configure { .. }
+    ));
+    let _ = fs::remove_dir_all(&f.root);
 }

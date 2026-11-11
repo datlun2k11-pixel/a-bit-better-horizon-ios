@@ -42,7 +42,7 @@ fn warning_dispatch_uses_neutral_at_tick_four() {
     ));
     std::fs::create_dir_all(&scratch).unwrap();
     game.world_root = scratch.clone();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 100.0, 4.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(4.5, 100.0, 4.5)).unwrap());
 
     const WARNING: &str = "minecraft:block.trial_spawner.about_to_spawn_item";
     let center = [6.5, 102.5, 4.5];

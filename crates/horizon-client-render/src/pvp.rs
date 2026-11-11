@@ -267,7 +267,12 @@ impl ViewWeather {
 /// world's), at that time.
 pub fn view_day_time(world: i64, fixed: Option<ViewTime>) -> i64 {
     match fixed {
-        Some(t) => world.div_euclid(24000) * 24000 + t.day_time(),
+        Some(t) => {
+            // The day's start may lie outside i64 even when the selected
+            // time fits. If that time cannot fit, retain the actual clock.
+            let time = i128::from(world).div_euclid(24000) * 24000 + i128::from(t.day_time());
+            i64::try_from(time).unwrap_or(world)
+        }
         None => world,
     }
 }
@@ -534,16 +539,31 @@ impl Hit {
 pub struct Frame {
     /// The block outline's stroke ([`Outline::stroke`]).
     pub outline: Option<(u32, f32)>,
-    /// The hurt overlay texel ([`Hit::texel`]), 0 for vanilla's.
+    /// The hurt overlay texel ([`Hit::texel`]); zero is also valid opaque black.
     pub hurt_texel: u32,
+    /// Select the custom texel independently of its RGBA value.
+    pub custom_hit: bool,
     /// The glint's colour ([`Tweaks::glint_texel`]), 0 for vanilla's.
     pub glint: u32,
+}
+impl Frame {
+    /// Shared shader slots: light count, hurt texel, glint tint, hurt enable.
+    /// Opaque black is a valid zero hurt texel, independent of the glint setting.
+    pub fn colour_uniform(&self, light_count: u32) -> [u32; 4] {
+        [
+            light_count,
+            self.hurt_texel,
+            self.glint,
+            u32::from(self.custom_hit),
+        ]
+    }
 }
 impl Pvp {
     pub fn frame(&self) -> Frame {
         Frame {
             outline: self.outline.stroke(),
             hurt_texel: self.hit.texel(),
+            custom_hit: self.hit.custom,
             glint: self.tweaks.glint_texel(),
         }
     }
@@ -1513,6 +1533,10 @@ impl Opt {
 }
 
 #[cfg(test)]
+#[path = "pvp_gpu_tests.rs"]
+mod gpu_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1717,6 +1741,24 @@ mod tests {
             9 * 24000 + 18000
         );
         assert_eq!(view_day_time(-100, Some(ViewTime::Noon)), -24000 + 6000);
+    }
+
+    #[test]
+    fn a_fixed_time_handles_the_complete_signed_clock_range() {
+        assert_eq!(view_day_time(i64::MIN, None), i64::MIN);
+        assert_eq!(view_day_time(i64::MAX, None), i64::MAX);
+        // The day's start is below i64::MIN, but midnight itself is representable.
+        assert_eq!(
+            view_day_time(i64::MIN, Some(ViewTime::Midnight)),
+            -9_223_372_036_854_774_000
+        );
+        assert_eq!(
+            view_day_time(i64::MAX, Some(ViewTime::Noon)),
+            9_223_372_036_854_774_000
+        );
+        // A chosen time outside the clock's range retains the actual clock, never wraps days.
+        assert_eq!(view_day_time(i64::MIN, Some(ViewTime::Morning)), i64::MIN);
+        assert_eq!(view_day_time(i64::MAX, Some(ViewTime::Midnight)), i64::MAX);
     }
 
     #[test]

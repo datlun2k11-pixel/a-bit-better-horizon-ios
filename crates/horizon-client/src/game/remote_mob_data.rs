@@ -19,6 +19,9 @@ use horizon_world::registry::BlockStateId;
 fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin, local_entity: i32) {
     let species = m.species();
     let baby = super::lan::baby_index(species);
+    if matches!(&*m.kind.id, "minecraft:player" | "minecraft:mannequin") {
+        super::remote::avatar_animation::apply(m, values);
+    }
     if &*m.kind.id == "minecraft:player" {
         player_poses(m, values);
     }
@@ -176,11 +179,11 @@ fn apply(m: &mut Mob, values: &[(u8, i32, Value)], builtin: &Builtin, local_enti
                 m.extra.size = (*size).clamp(1, 127);
             }
             // SulfurCube.MAX_FUSE: onSyncedDataUpdated copies it into the fuse
-            // the client ticks for swell / white flash (#4548).
-            (Species::SulfurCube, 20, Value::Int(fuse)) => {
-                m.extra.counter2 = (*fuse).max(0) + 1;
+            // the client ticks for swell / white flash (#4548); -1 is not primed.
+            (Species::SulfurCube, 19, Value::Int(fuse)) => {
+                m.extra.counter2 = (*fuse).max(-1) + 1;
             }
-            (Species::SulfurCube, 19, Value::Bool(from_bucket)) => {
+            (Species::SulfurCube, 20, Value::Bool(from_bucket)) => {
                 m.extra.scratch[3] = i32::from(*from_bucket);
             }
             // Phantom.ID_SIZE: `updatePhantomSizeInfo` grows its box and bite,
@@ -423,8 +426,6 @@ fn apply_registry_data(
 fn player_poses(m: &mut Mob, values: &[(u8, i32, Value)]) {
     for (index, _, value) in values {
         match (*index, value) {
-            (0, Value::Byte(flags)) => m.extra.fall_flying = flags & -128 != 0,
-            (6, Value::Id(pose)) => m.extra.synced_pose = (*pose).clamp(0, 17) as u8,
             (8, Value::Byte(flags)) => m.extra.auto_spin_attack = flags & 4 != 0,
             // LivingEntity.DATA_ARROW_COUNT_ID and DATA_STINGER_COUNT_ID.
             (12, Value::Int(count)) => m.extra.arrow_count = *count,
@@ -1334,6 +1335,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs prepared resources in .local/horizon-client/26.3"]
+    fn mannequin_shared_metadata_reaches_living_avatar_animation() {
+        let mut m = mob("minecraft:mannequin").expect("prepared mannequin facts and models");
+        apply(
+            &mut m,
+            &[(0, s::BYTE, Value::Byte(-128)), (6, s::POSE, Value::Id(1))],
+        );
+        assert!(m.extra.fall_flying);
+        assert_eq!(m.extra.synced_pose, 1);
+        super::super::remote::avatar_animation::tick(&mut m, false, true);
+        assert_eq!(m.extra.fall_fly_ticks, 1);
+        assert!(m.extra.elytra.angles[0] > 0.0);
+        apply(
+            &mut m,
+            &[(0, s::BYTE, Value::Byte(0)), (6, s::POSE, Value::Id(3))],
+        );
+        super::super::remote::avatar_animation::tick(&mut m, false, true);
+        assert_eq!(m.extra.fall_fly_ticks, 0);
+        assert_eq!(m.extra.swim.amount, 0.09);
+        assert_eq!(m.extra.shoulder_parrots, [None, None]);
+    }
+
+    #[test]
     fn a_mannequin_exists_and_takes_its_profile() {
         let Some(mut m) = mob("minecraft:mannequin") else {
             return;
@@ -1421,19 +1445,26 @@ mod tests {
         }
     }
 
-    /// #4548: SulfurCube.MAX_FUSE copies into the fuse the client ticks for swell.
+    /// #4548: SulfurCube.MAX_FUSE (19, after AbstractCubeMob.ID_SIZE) copies into
+    /// the fuse the client ticks for swell; its default, -1, is not primed
+    /// (`isPrimed`: fuse >= 0). FROM_BUCKET is 20 (#13721).
     #[test]
     fn sulfur_cube_max_fuse_sets_the_client_fuse() {
+        use horizon_client::mobs::sulfur_cube::{fuse, primed};
         let Some(mut m) = mob("minecraft:sulfur_cube") else {
             return;
         };
         assert_eq!(m.extra.counter2, 0);
-        apply(&mut m, &[(20, s::INT, Value::Int(40))]);
-        assert_eq!(horizon_client::mobs::sulfur_cube::fuse(&m), 40);
-        assert!(horizon_client::mobs::sulfur_cube::primed(&m));
-        apply(&mut m, &[(20, s::INT, Value::Int(0))]);
+        apply(&mut m, &[(19, s::INT, Value::Int(40))]);
+        assert_eq!(fuse(&m), 40);
+        assert!(primed(&m));
+        apply(&mut m, &[(19, s::INT, Value::Int(0))]);
         // Last fuse tick: still primed at 0 until the server removes it.
-        assert_eq!(horizon_client::mobs::sulfur_cube::fuse(&m), 0);
+        assert_eq!(fuse(&m), 0);
+        apply(&mut m, &[(19, s::INT, Value::Int(-1))]);
+        assert!(!primed(&m));
+        apply(&mut m, &[(20, s::BOOLEAN, Value::Bool(true))]);
+        assert!(!primed(&m));
     }
 
     /// `Pig.onSyncedDataUpdated` and `Strider.onSyncedDataUpdated`: a synced

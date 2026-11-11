@@ -1,38 +1,43 @@
 name: ios
 # The game for iPhone and iPad, and nothing else: the Rust game cross-compiled for aarch64-apple-ios, wrapped by
-# packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa. No tests run here. Every build —
-# a commit's CI run, a pull request, or the 06:00 America/New_York nightly schedule — replaces the .ipa on the single
-# `ios-nightly` pre-release, which always carries the newest build and names the commit it was made from in its notes.
+# packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa. No tests run here. The .ipa is then posted to Discord when the repository secret
+# DISCORD_IPA_WEBHOOK is set.
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish an unsigned release (main branch only)
+        type: boolean
+        default: false
   pull_request:
     branches: [main]
-  schedule:
-    # 06:00 New York, whether Eastern Daylight or Standard time (GitHub cron evaluates in UTC).
-    - cron: '11 10 * * *'
 permissions:
-  contents: write      # creating/updating the ios-nightly pre-release and its assets
+  contents: read
 concurrency:
   group: ios-${{ github.sha }}
   cancel-in-progress: false
 env:
   HORIZON_TELEMETRY_URL: "off"
   IOS_TARGET: aarch64-apple-ios
+  # Public application ID embedded in the official Horizon launcher release.
+  HORIZON_MSA_CLIENT_ID: "331e08f8-172d-43b9-835a-3108c2fcdbf3"
   # `--release` with the `fast` profile's codegen: the release profile's single codegen unit and LTO cost minutes
   # and the unsigned bundle is a test build.
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_INCREMENTAL: "0"
   # The app's own minimum (project.yml); rustc and cc read it, and the Xcode step's Cargo phase sees the same.
-  IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+  IPHONEOS_DEPLOYMENT_TARGET: "16.0"
 
 jobs:
   ipa:
     # The native launcher uses the iOS 26 SDK (Liquid Glass). macos-15 defaults to Xcode 16.4.
     # MAC_RUNNER remains available for a maintainer-provided runner with Xcode 26 or newer.
-    runs-on: ${{ github.event_name == 'pull_request' && 'macos-26' || vars.MAC_RUNNER || 'macos-26' }}
+    # Standard Intel PR runners avoid the ARM hosted-pool capacity queue.
+    # Both Rust and Xcode still explicitly target ARM64 iOS below.
+    runs-on: ${{ github.event_name == 'pull_request' && 'macos-26-intel' || vars.MAC_RUNNER || 'macos-26' }}
     timeout-minutes: 90
     defaults:
       run:
@@ -51,15 +56,11 @@ jobs:
         with:
           shared-key: ios-${{ env.IOS_TARGET }}
       - name: Build the game
-        # The Microsoft sign-in app (msa.rs): a repository variable overrides the built-in one; unset, it stays.
-        env:
-          HORIZON_MSA_CLIENT_ID: ${{ vars.HORIZON_MSA_CLIENT_ID }}
+        # The public Microsoft sign-in app is shared by the Rust executable and native launcher.
         # The defaults minus `controllers` (GameController reads pads), with `audio`: project.yml's Cargo phase
         # uses the same flags, so HORIZON_GAME_PREBUILT below finds this build.
-        run: cargo build --release --locked --target "$IOS_TARGET" -p horizon-client --no-default-features --features audio
+        run: cargo build --release --locked --target "$IOS_TARGET" -p horizon-official --no-default-features --features audio,horizon-extras
       - name: Bundle it
-        env:
-          HORIZON_MSA_CLIENT_ID: ${{ vars.HORIZON_MSA_CLIENT_ID }}
         run: |
           set -euo pipefail
           command -v xcodegen >/dev/null || brew install xcodegen
@@ -70,15 +71,9 @@ jobs:
             DEBUG_INFORMATION_FORMAT=dwarf \
             CONFIGURATION_BUILD_DIR="$PWD/build-ios" \
             build > xcode-game-build.log 2>&1 || { tail -60 xcode-game-build.log; exit 1; }
-          python3 - <<'PYCONFIG'
-          import os, plistlib
-          path = 'build-ios/HorizonGame.app/Info.plist'
-          with open(path, 'rb') as file:
-              info = plistlib.load(file)
-          info['HorizonMSAClientID'] = os.environ.get('HORIZON_MSA_CLIENT_ID', '')
-          with open(path, 'wb') as file:
-              plistlib.dump(info, file)
-          PYCONFIG
+          python3 tools/ci/ios_release.py --stamp-app build-ios/HorizonGame.app \
+            --run-number "$GITHUB_RUN_NUMBER" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --expect-commit "$GITHUB_SHA" --client-id "$HORIZON_MSA_CLIENT_ID"
           rm -rf game-xcode && mkdir -p game-xcode/Payload
           cp -a build-ios/HorizonGame.app game-xcode/Payload/
           ( cd game-xcode && zip -qry ../Horizon-game-unsigned.ipa Payload )
@@ -90,53 +85,73 @@ jobs:
           path: xcode-game-build.log
           retention-days: 7
           if-no-files-found: ignore
-      - name: Check the distributable contains no prepared assets
-        run: |
-          python3 - <<'PYASSETS'
-          import zipfile
-          with zipfile.ZipFile('Horizon-game-unsigned.ipa') as ipa:
-              if any('horizon-resources.json' in name for name in ipa.namelist()):
-                  raise SystemExit('::error::the .ipa carries prepared vanilla assets; refusing to publish it')
-          PYASSETS
+      - name: Audit the unsigned distributable
+        run: python3 tools/ci/ios_release.py Horizon-game-unsigned.ipa --expect-commit "$GITHUB_SHA" --run-number "$GITHUB_RUN_NUMBER" --run-attempt "$GITHUB_RUN_ATTEMPT"
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-ios-game
           path: Horizon-game-unsigned.ipa
           retention-days: 7
           if-no-files-found: error
-      - name: Publish on the ios-nightly pre-release
-        # The one place people try the newest iOS build: every CI build (a commit on main, a pull request, or the
-        # 06:00 New York schedule) replaces the .ipa on this single pre-release. Its notes always name the newest
-        # commit built and uploaded here. Forks have no releases to publish to.
-        if: github.repository == 'datlun2k11-pixel/a-bit-better-horizon-ios'
+      - name: Send the .ipa to Discord
+        # Delivery is optional: the IPA is already available in the run's artifacts.
+        continue-on-error: true
+        if: github.event_name != 'pull_request' && env.DISCORD_IPA_WEBHOOK != ''
+        env:
+          DISCORD_IPA_WEBHOOK: ${{ secrets.DISCORD_IPA_WEBHOOK }}
+        run: |
+          set -uo pipefail
+          content=$(printf '%s\n' \
+            "**Horizon for iPhone and iPad, run #${GITHUB_RUN_NUMBER}**" \
+            "\`${GITHUB_REF_NAME}@${GITHUB_SHA::7}\`: an unsigned .ipa, with no assets" \
+            "🤖 Posted by \`.github/workflows/ios.yml\`, not by a person.")
+          response=$(mktemp)
+          trap 'rm -f "$response"' EXIT
+          if ! code=$(curl --connect-timeout 15 --max-time 120 -sS -o "$response" -w '%{http_code}' -X POST "$DISCORD_IPA_WEBHOOK" \
+            -F "content=$content" -F "file=@Horizon-game-unsigned.ipa;type=application/octet-stream"); then
+            echo "::warning::Could not reach Discord. The IPA is available in this run's artifacts."
+            exit 0
+          fi
+          case "$code" in
+            2*) echo "Posted the .ipa to Discord (HTTP $code)." ;;
+            404)
+              echo "::warning::Discord webhook no longer exists (HTTP 404). Replace the DISCORD_IPA_WEBHOOK repository secret. Download the IPA from this run's artifacts."
+              ;;
+            *)
+              echo "::warning::Discord delivery failed (HTTP $code). The IPA is available in this run's artifacts."
+              ;;
+          esac
+
+  release:
+    needs: ipa
+    # Never grant publication privileges to PRs or builds of arbitrary branches.
+    if: >-
+      github.repository == 'heyskylo/horizon-ios' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: horizon-ios-game
+          path: ipa-artifact
+      - name: Prepare versioned IPA and checksum
+        id: asset
+        run: |
+          python3 tools/ci/ios_release.py ipa-artifact/Horizon-game-unsigned.ipa \
+            --expect-commit "$GITHUB_SHA" --run-number "$GITHUB_RUN_NUMBER" --run-attempt "$GITHUB_RUN_ATTEMPT" --output-dir release-assets >> "$GITHUB_OUTPUT"
+      - name: Publish unsigned release
         env:
           GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-          REF_NAME: ${{ github.event.pull_request.head.ref || github.ref_name }}
-        run: |
-          set -euo pipefail
-          date=$(date -u +%Y-%m-%d)
-          {
-            echo "## Horizon iOS Nightly — unsigned test build"
-            echo
-            echo "> [!WARNING]"
-            echo "> This build has **not been reviewed or tested carefully**. It is an unsigned nightly for trying out"
-            echo "> the newest changes on iPhone and iPad; expect bugs and install it at your own risk."
-            echo
-            echo "**Latest commit built and uploaded:** \`${COMMIT}\` (\`${REF_NAME}\`, $date)"
-            echo
-            echo "Download \`Horizon-game-unsigned.ipa\` below and install it with your developer tooling (AltStore,"
-            echo "Sideloadly, Xcode, …): the .ipa is unsigned, so it must be re-signed for your own device."
-          } > notes.md
-          # Recreate the release rather than edit it. GitHub's Releases page orders everything below the
-          # one "Latest" release by each release's created_at, and no API call can change that date: a
-          # release edited in place keeps its original date and sinks below every newer release. Deleted
-          # and created again, it is the newest release object, so the nightly stays at the top of the list.
-          # A prerelease can never take the "Latest" slot itself. `--target main` keeps the recreated tag
-          # pointing at main even when a pull request's build publishes it. The tag page is briefly gone
-          # between the two commands; the tag name, and so the release URL people bookmark, never changes.
-          gh release delete ios-nightly --yes --cleanup-tag 2>/dev/null || true
-          gh release create ios-nightly --prerelease --latest=false --target main \
-            --title "iOS Nightly · $date · ${COMMIT:0:7}" \
-            --notes-file notes.md \
-            Horizon-game-unsigned.ipa
+          GH_REPO: ${{ github.repository }}
+          IPA: ${{ steps.asset.outputs.ipa }}
+          CHECKSUM: ${{ steps.asset.outputs.checksum }}
+          VERSION: ${{ steps.asset.outputs.version }}
+          BUILD: ${{ steps.asset.outputs.build }}
+        run: bash tools/ci/publish-ios-release.sh

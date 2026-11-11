@@ -325,6 +325,51 @@ fn a_review_protects_published_files() {
 }
 
 #[test]
+fn a_version_taken_down_by_hash_may_leave_its_entry() {
+    // A lost signing key: the next version comes under a new key, and the old one is dropped.
+    let base: Entry = toml::from_str(&hud_entry()).unwrap();
+    let old = base.versions[0].clone();
+    let mut rotated = base.clone();
+    rotated.versions[0].version = "0.2.0".into();
+    rotated.versions[0].sha256 = HPACK.into();
+    let down = |id: &str, sha256: &str| Revoked {
+        id: id.into(),
+        sha256: Some(sha256.into()),
+        reason: "signed with a lost key".into(),
+        date: "2026-11-09".into(),
+    };
+    let one = std::slice::from_ref(&base);
+    let next = std::slice::from_ref(&rotated);
+
+    let r = review_with_revoked(one, next, &[down("coords_hud", &old.sha256)], "ludovic111");
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n == "coords_hud 0.1.0: leaves the entry, taken down in revoked.toml"),
+        "{r:?}"
+    );
+    // Not taken down, another project's take-down, or a take-down of every version
+    // without a hash: still refused.
+    for revoked in [
+        vec![],
+        vec![down("other_mod", &old.sha256)],
+        vec![Revoked {
+            sha256: None,
+            ..down("coords_hud", "")
+        }],
+    ] {
+        let r = review_with_revoked(one, next, &revoked, "ludovic111");
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("coords_hud 0.1.0: removed")),
+            "{revoked:?}: {r:?}"
+        );
+    }
+}
+
+#[test]
 fn a_review_refuses_following_a_repository() {
     let pinned: Entry = toml::from_str(COZY).unwrap();
     let follows: Entry = toml::from_str(COZY_REPO).unwrap();
@@ -395,6 +440,31 @@ fn a_mod_may_turn_native_once() {
         r.errors.iter().any(|e| e.contains("kind can't change")),
         "{r:?}"
     );
+}
+
+#[test]
+fn a_new_icon_is_a_new_address() {
+    let s = Scratch::new("icon-address");
+    let icon = |s: &Scratch| {
+        s.build()
+            .unwrap()
+            .project("coords_hud")
+            .unwrap()
+            .icon
+            .clone()
+            .unwrap()
+    };
+    let before = icon(&s);
+    let (path, version) = before.split_once("?v=").unwrap();
+    assert_eq!(
+        path,
+        "https://horizon-rust.github.io/horizon-mods/icons/coords_hud.png"
+    );
+    assert_eq!(version.len(), 12, "{before}");
+    assert_eq!(icon(&s), before, "the same icon keeps its address");
+    s.write_bytes("icons/coords_hud.png", &png(256, 256));
+    let after = icon(&s);
+    assert!(after.starts_with(path) && after != before, "{after}");
 }
 
 #[test]
@@ -558,4 +628,126 @@ fn a_project_listed_by_its_repository_takes_its_versions_from_releases() {
             .iter()
             .any(|e| e.contains("owner/name"))
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_images_cannot_read_outside_the_checkout() {
+    let s = Scratch::new("outside-image");
+    let repo = s.0.join("repo");
+    let files = s.0.join("files");
+    let src = Sources {
+        registry: &repo,
+        files: &files,
+        release: super::super::FILE_HOST,
+        site: "https://registry.test/",
+        generated: String::new(),
+    };
+    let outside = s.0.join("outside.png");
+    std::fs::write(&outside, png(128, 128)).unwrap();
+    let icon = repo.join("icons/coords_hud.png");
+    std::fs::remove_file(&icon).unwrap();
+    std::os::unix::fs::symlink(&outside, &icon).unwrap();
+    let mut errors = Vec::new();
+    assert!(
+        image(
+            &src,
+            "coords_hud",
+            "icons/coords_hud.png",
+            "icons/",
+            &mut errors
+        )
+        .is_none()
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("outside the registry checkout")),
+        "{errors:?}"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), png(128, 128));
+}
+
+#[test]
+fn local_images_keep_their_formats_and_actual_size_limits() {
+    let s = Scratch::new("bounded-images");
+    let repo = s.0.join("repo");
+    let files = s.0.join("files");
+    let src = Sources {
+        registry: &repo,
+        files: &files,
+        release: super::super::FILE_HOST,
+        site: "https://registry.test/",
+        generated: String::new(),
+    };
+    let mut errors = Vec::new();
+    assert_eq!(
+        image(
+            &src,
+            "coords_hud",
+            "icons/coords_hud.png",
+            "icons/",
+            &mut errors
+        ),
+        Some("https://registry.test/icons/coords_hud.png".into())
+    );
+    s.write_bytes("screenshots/coords_hud/1.png", &png(1280, 720));
+    assert_eq!(
+        image(
+            &src,
+            "coords_hud",
+            "screenshots/coords_hud/1.png",
+            "screenshots/coords_hud/",
+            &mut errors
+        ),
+        Some("https://registry.test/screenshots/coords_hud/1.png".into())
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    let exact = vec![0; MAX_ICON as usize];
+    assert_eq!(
+        bounded_image_bytes(&exact[..], "growing.png", MAX_ICON).unwrap(),
+        exact
+    );
+    let too_large = vec![0; MAX_ICON as usize + 1];
+    assert!(bounded_image_bytes(&too_large[..], "growing.png", MAX_ICON).is_err());
+    s.write_bytes("icons/coords_hud.png", &too_large);
+    assert!(
+        image(
+            &src,
+            "coords_hud",
+            "icons/coords_hud.png",
+            "icons/",
+            &mut errors
+        )
+        .is_none()
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("over 256 KiB")),
+        "{errors:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_image_is_rejected_without_waiting_for_a_writer() {
+    let s = Scratch::new("fifo-image");
+    let repo = s.0.join("repo");
+    let fifo = repo.join("icons/pipe.png");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = send.send(image_bytes(&repo, "icons/pipe.png", MAX_ICON));
+    });
+    let error = receive
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("checking an image must not block opening a FIFO")
+        .unwrap_err();
+    worker.join().unwrap();
+    assert!(error.contains("not a regular image file"), "{error}");
 }

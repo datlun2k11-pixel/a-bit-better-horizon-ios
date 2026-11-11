@@ -2641,6 +2641,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-addresses"
+version = "0.1.0"
+
+[[package]]
 name = "horizon-bench"
 version = "0.2.7"
 dependencies = [
@@ -2657,11 +2661,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-dnssd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "horizon-cosmetics"
 version = "0.1.0"
 dependencies = [
  "base64",
  "glam",
+ "horizon-addresses",
  "png 0.18.1",
  "serde",
  "serde_json",
@@ -2675,13 +2687,18 @@ dependencies = [
  "chacha20poly1305",
  "getrandom 0.3.4",
  "hkdf",
+ "horizon-addresses",
  "if-addrs",
  "serde",
  "serde_json",
  "sha2",
- "socket2",
+ "socket2 0.6.5",
  "spake2",
 ]
+
+[[package]]
+name = "horizon-hooks"
+version = "0.1.0"
 
 [[package]]
 name = "horizon-launcher"
@@ -2696,23 +2713,21 @@ dependencies = [
  "flate2",
  "futures-lite",
  "getrandom 0.3.4",
+ "glam",
  "gpui-fast",
  "gpui-fast-platform",
  "horizon-bench",
- "horizon-core",
  "horizon-cosmetics",
  "horizon-friends",
  "horizon-mcp",
  "horizon-mod-api-gen",
  "horizon-mods",
+ "horizon-platform",
  "horizon-port-pack",
- "horizon-prepare",
- "horizon-protocol",
  "horizon-release-sign",
  "horizon-shader-api",
  "horizon-telemetry",
  "horizon-theme",
- "horizon-world",
  "image",
  "keyring",
  "libc",
@@ -2777,6 +2792,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-platform"
+version = "0.1.0"
+dependencies = [
+ "horizon-core",
+ "horizon-hooks",
+ "horizon-prepare",
+ "horizon-protocol",
+ "horizon-system",
+ "horizon-world",
+]
+
+[[package]]
 name = "horizon-port-pack"
 version = "0.2.7"
 dependencies = [
@@ -2809,12 +2836,14 @@ dependencies = [
  "flate2",
  "getrandom 0.3.4",
  "horizon-core",
+ "horizon-dnssd",
  "horizon-world",
  "ipconfig",
  "log",
  "serde_json",
  "sha1",
  "sha2",
+ "socket2 0.5.10",
 ]
 
 [[package]]
@@ -2840,10 +2869,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-system"
+version = "0.1.0"
+
+[[package]]
 name = "horizon-telemetry"
 version = "0.2.7"
 dependencies = [
  "getrandom 0.3.4",
+ "horizon-addresses",
+ "horizon-platform",
  "ruzstd",
  "serde",
  "serde_json",
@@ -3167,7 +3202,7 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d40460c0ce33d6ce4b0630ad68ff63d6661961c48b6dba35e5a4d81cfb48222"
 dependencies = [
- "socket2",
+ "socket2 0.6.5",
  "widestring",
  "windows-registry",
  "windows-result 0.4.1",
@@ -5468,6 +5503,16 @@ dependencies = [
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
@@ -5856,9 +5901,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "pin-project-lite",
 ]

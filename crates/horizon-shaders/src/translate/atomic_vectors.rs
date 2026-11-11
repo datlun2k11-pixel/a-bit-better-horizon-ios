@@ -561,7 +561,6 @@ pub(super) fn rewrite(pp: &Preprocessed) -> Option<Preprocessed> {
         i = end + 1;
     }
     Some(Preprocessed {
-        macros: pp.macros.clone(),
         code: out.concat(),
         lines: pp.lines.clone(),
         files: pp.files.clone(),
@@ -570,6 +569,7 @@ pub(super) fn rewrite(pp: &Preprocessed) -> Option<Preprocessed> {
         comments: pp.comments.clone(),
         diagnostics: pp.diagnostics.clone(),
         warnings: pp.warnings.clone(),
+        macros: pp.macros.clone(),
     })
 }
 
@@ -614,6 +614,7 @@ mod tests {
             comments: Vec::new(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
+            macros: Default::default(),
         };
         let out = rewrite(&pp).expect("rewritten").code;
         assert_eq!(out.lines().count(), code.lines().count(), "{out}");
@@ -660,6 +661,7 @@ mod tests {
             comments: Vec::new(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
+            macros: Default::default(),
         };
         assert!(rewrite(&pp("shared ivec4 v;\nvoid f() { v.x = 1; }\n")).is_none());
         assert!(rewrite(&pp("shared int n;\nvoid f() { atomicAdd(n, 1); }\n")).is_none());
@@ -703,6 +705,7 @@ mod tests {
     #[test]
     fn a_struct_type_used_elsewhere_keeps_its_members() {
         let pp = Preprocessed {
+            macros: Default::default(),
             code: "shared struct S { ivec3 lo; } sh;\nvoid f(S s) { atomicMin(sh.lo.x, 1); }\n"
                 .to_owned(),
             lines: Vec::new(),

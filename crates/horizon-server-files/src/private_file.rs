@@ -20,17 +20,22 @@ pub fn write_private(path: &Path, text: impl AsRef<[u8]>) -> io::Result<()> {
         std::process::id(),
         WRITES.fetch_add(1, Ordering::Relaxed)
     ));
+    write_through_temp(path, &tmp, text.as_ref())
+}
+
+fn write_through_temp(path: &Path, tmp: &Path, text: &[u8]) -> io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let written = options.open(&tmp).and_then(|mut file| {
-        file.write_all(text.as_ref())?;
-        file.sync_all()
-    });
-    let result = written.and_then(|()| std::fs::rename(&tmp, path));
+    // A collision is not ours to clean up. Only remove a temporary file after
+    // this process successfully created it (including after a later write error).
+    let mut file = options.open(tmp)?;
+    let written = file.write_all(text).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written.and_then(|()| std::fs::rename(tmp, path));
     if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
     }
     result
 }
@@ -55,6 +60,34 @@ mod tests {
         write_private(&path, "two").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_existing_temporary_file_is_not_removed() {
+        let dir = scratch("collision");
+        let path = dir.join("api.json");
+        let temporary = dir.join("existing.tmp");
+        std::fs::write(&path, "old token").unwrap();
+        std::fs::write(&temporary, "unrelated existing file").unwrap();
+        assert!(write_through_temp(&path, &temporary, b"new token").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old token");
+        assert_eq!(
+            std::fs::read_to_string(&temporary).unwrap(),
+            "unrelated existing file"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_replace_removes_only_the_temporary_file_we_created() {
+        let dir = scratch("failed-replace");
+        let path = dir.join("not-a-file");
+        let temporary = dir.join("owned.tmp");
+        std::fs::create_dir(&path).unwrap();
+        assert!(write_through_temp(&path, &temporary, b"secret").is_err());
+        assert!(!temporary.exists());
+        assert!(path.is_dir());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -54,6 +54,7 @@ mod hud;
 pub(super) mod launcher;
 mod pads;
 mod players;
+mod retired;
 mod setup;
 mod windows;
 
@@ -76,7 +77,7 @@ impl Game<'_> {
     /// An error stops the event loop, as ever, but not in another splitscreen player's game:
     /// that player drops out (`Split::drop_out`), the others play on.
     pub(in crate::game) fn exit_on_error(&self, event_loop: &dyn super::event_loop::EventLoopCtl) {
-        if !self.options.split_guest {
+        if !self.options.split_guest && !self.splitscreen.guest {
             event_loop.exit();
         }
     }
@@ -107,6 +108,12 @@ struct Guest<'a> {
 pub(super) struct Split<'a> {
     pub(super) host: Game<'a>,
     guests: Vec<Guest<'a>>,
+    /// Departed clients keep their worker owners until shutdown can join without waiting.
+    #[allow(clippy::vec_box)] // Game stays boxed: moving it can exhaust the iOS stack.
+    retired_guests: Vec<Box<Game<'a>>>,
+    /// The run's `--offscreen`: no window is shown, splitscreen's included, and P1 draws
+    /// offscreen again when it is alone (`options.offscreen` is set while others play).
+    offscreen: bool,
     /// `HORIZON_SPLIT=N`: players still to add once P1 is in a world.
     test_players: usize,
     /// `HORIZON_SPLIT` is set: splitscreen is on for this run, without touching the saved switch.
@@ -141,8 +148,6 @@ pub(super) struct Split<'a> {
     cursor: PhysicalPosition<f64>,
     limiter: horizon_client::window::FramerateLimiter,
     clock: horizon_client::window::SystemClock,
-    /// P1's resources, shared by the other players' games for the process's lifetime.
-    res: Option<&'static Arc<super::Resources>>,
     /// Whose game runs now (0 = P1), and P1's buttons while another's does.
     turn: usize,
     host_widgets: widgets::Saved,
@@ -175,9 +180,12 @@ impl<'a> Split<'a> {
             .as_ref()
             .and_then(|n| n.parse::<usize>().ok())
             .map_or(0, |n| n.clamp(1, MAX_PLAYERS) - 1);
+        let offscreen = host.options.offscreen;
         Self {
             host,
             guests: Vec::new(),
+            retired_guests: Vec::new(),
+            offscreen,
             test_players,
             forced: split.is_some(),
             surfaces: Vec::new(),
@@ -201,7 +209,6 @@ impl<'a> Split<'a> {
             cursor: PhysicalPosition::new(0.0, 0.0),
             limiter: horizon_client::window::FramerateLimiter::new(0),
             clock: Default::default(),
-            res: None,
             turn: 0,
             host_widgets: Default::default(),
             accounts: launcher::accounts(),
@@ -215,6 +222,61 @@ impl<'a> Split<'a> {
             offers: Vec::new(),
             lost: Vec::new(),
         }
+    }
+
+    /// Drain every additional client's workers before returning to the launcher.
+    /// Polling keeps UIKit responsive; once ready, no guest keeps game resources or a
+    /// controller/compositor alive after the host is replaced by the launcher.
+    pub(super) fn stop_guests(&mut self) -> bool {
+        let mut stopped = self.poll_retired_guests();
+        for guest in &mut self.guests {
+            stopped &= retired::workers_stopped(&mut guest.game);
+        }
+        if let Some(guest) = &mut self.host.splitscreen_guest {
+            stopped &= retired::workers_stopped(guest);
+        }
+        if !stopped {
+            return false;
+        }
+        for k in (0..self.guests.len()).rev() {
+            self.turn(k + 1);
+            self.guests[k].game.shut_down();
+            self.remove_guest(k);
+        }
+        self.turn(0);
+        self.host.stop_splitscreen();
+        self.stop_routing();
+        if let Some(main) = self.surfaces.first() {
+            main.window.set_visible(true);
+            self.host.window = Some(main.window.clone());
+            self.host.options.offscreen = false;
+        }
+        self.host.options.paced_by_split = false;
+        self.host.view_at = [0, 0];
+        self.host.keyboard_mouse = true;
+        self.surfaces.clear();
+        self.applied.clear();
+        self.order.clear();
+        self.windows.truncate(1);
+        self.p1_window = 1;
+        self.window1_shown = true;
+        self.focus = 0;
+        true
+    }
+
+    /// AirPlay owns its display and phone surfaces; the desktop compositor must
+    /// not take either surface or its controller reader at the same time.
+    fn desktop_split_available(&self) -> bool {
+        // Query the native display before this frame's render, so attaching AirPlay
+        // retires the desktop compositor before Game::sync_airplay redirects it.
+        let display = horizon_airplay::screen(
+            !horizon_ios_launcher::covered(),
+            self.host.splitscreen.active,
+        );
+        display.is_none()
+            && !self.host.on_airplay()
+            && !self.host.splitscreen.active
+            && self.host.splitscreen.request != Some(true)
     }
 
     fn players(&self) -> usize {
@@ -256,6 +318,8 @@ impl<'a> Split<'a> {
                 .get(i.wrapping_sub(1))
                 .map(|g| g.options.clone()),
         );
+        let seat = self.guests.get(i.wrapping_sub(1)).map_or(1, |g| g.seat);
+        horizon_hooks::engine::set_seat(seat - 1);
         self.turn = i;
     }
 
@@ -358,6 +422,9 @@ impl<'a> Split<'a> {
     /// on its window; the world is meshed again for the new renderer.
     #[inline(never)]
     fn enable(&mut self) -> Result<()> {
+        if !self.desktop_split_available() {
+            return Err("AirPlay is using the game's display".into());
+        }
         let window = self.host.window.clone().ok_or("no window")?;
         let mut old = self.host.renderer.take().ok_or("no renderer")?;
         old.release_surface();
@@ -373,8 +440,9 @@ impl<'a> Split<'a> {
             None,
             api,
             batching,
-            self.host.settings.horizon.wide_frame(),
+            &self.host.settings.horizon,
             shader_pack,
+            old.display_reading(),
             (
                 self.host.settings.file.int("textureFiltering"),
                 self.host.settings.file.int("maxAnisotropyBit"),
@@ -399,9 +467,8 @@ impl<'a> Split<'a> {
             }
         };
         self.host.renderer = Some(renderer);
-        // The new atlas has no downloaded skins: queue them again, as after device loss.
-        self.host.skin_slots.forget();
-        self.host.split_window = !self.host.options.offscreen;
+        self.host.forget_atlas_slots();
+        self.host.split_window = !self.offscreen;
         self.host.options.offscreen = true;
         self.host.options.paced_by_split = true;
         // The new renderer takes the old one's present mode, settings and all: P1's again.
@@ -440,7 +507,7 @@ impl<'a> Split<'a> {
             return Ok(());
         };
         let window = main.window.clone();
-        window.set_visible(true);
+        window.set_visible(windows::window_shown(true, self.offscreen));
         self.window1_shown = true;
         self.host.window = Some(window.clone());
         let old = self.host.renderer.take().ok_or("no renderer")?;
@@ -450,15 +517,16 @@ impl<'a> Split<'a> {
         let shader_pack = super::shader_packs::picked_pack_shape(&self.host.settings);
         let built = build_renderer(
             window.clone(),
-            false,
+            self.offscreen,
             &self.host.pack,
             &self.host.gui,
             Some(&old),
             None,
             api,
             batching,
-            self.host.settings.horizon.wide_frame(),
+            &self.host.settings.horizon,
             shader_pack,
+            old.display_reading(),
             (
                 self.host.settings.file.int("textureFiltering"),
                 self.host.settings.file.int("maxAnisotropyBit"),
@@ -476,8 +544,8 @@ impl<'a> Split<'a> {
         };
         drop(old);
         self.host.renderer = Some(renderer);
-        self.host.skin_slots.forget();
-        self.host.options.offscreen = false;
+        self.host.forget_atlas_slots();
+        self.host.options.offscreen = self.offscreen;
         self.host.split_window = false;
         self.host.options.paced_by_split = false;
         // Alone again: the pointer is P1's, its view the whole window.
@@ -566,7 +634,10 @@ impl<'a> Split<'a> {
                 .filter_map(|(r, v)| Some((r.as_ref()?.offscreen_frame()?, v.1)))
                 .collect();
             surface.compositor.set_vsync(vsync && k == paced);
-            surface.compositor.present(&frames);
+            // Wayland shows a window once something is presented on it.
+            if windows::presents(self.offscreen) {
+                surface.compositor.present(&frames);
+            }
         }
         let presented = Instant::now();
         // One player's CPU work overlapped the GPU drawing another's.
@@ -726,7 +797,9 @@ impl ApplicationHandler for Split<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let on = self.host.settings.extras.splitscreen || self.forced;
+        self.poll_retired_guests();
+        let on = self.desktop_split_available()
+            && (self.host.settings.extras.splitscreen || self.forced);
         // Only splitscreen places windows on monitors. Listing them is a round trip to the
         // window server (macOS: 0.1-0.3 ms, more on a busy machine), so not every frame.
         if (on || !self.surfaces.is_empty())
@@ -824,6 +897,16 @@ impl ApplicationHandler for Split<'_> {
                 }
             }
         }
+        // The native iOS controller bridge exposes input only; it has no
+        // rumble output capability yet. Desktop hardware keeps its output.
+        #[cfg(not(target_os = "ios"))]
+        {
+            self.pads
+                .play_rumbles(&mut self.host.pad, self.p1_pad.owner);
+            for g in &mut self.guests {
+                self.pads.play_rumbles(&mut g.game.pad, g.pad);
+            }
+        }
         self.turn(0);
         let rendered = Instant::now();
         let presented = self.present();
@@ -853,7 +936,8 @@ impl ApplicationHandler for Split<'_> {
             ))
             .and_then(|s| s.window.current_monitor()?.refresh_rate_millihertz())
             .map_or(60, |mhz| mhz.div_ceil(1000) as i32);
-        if !(self.host.settings.vsync && limit >= refresh_hz) {
+        // Offscreen, nothing presents: no display paces the frames.
+        if !(self.host.settings.vsync && limit >= refresh_hz && windows::presents(self.offscreen)) {
             horizon_client::window::end_frame(&mut self.limiter, limit, &mut self.clock);
         }
     }
@@ -900,10 +984,8 @@ impl Game<'_> {
         self.drag_button = None;
         self.modifiers = Default::default();
         // A press this player's pad holds goes on, as for its keys.
-        self.left = self
-            .pad
-            .holds_action(&self.settings.controller, "key.attack");
-        self.right = self.pad.holds_action(&self.settings.controller, "key.use");
+        self.left = self.pad.holds_action("key.attack");
+        self.right = self.pad.holds_action("key.use");
         self.inventory_mouse_release(false);
         self.inventory_mouse_release(true);
         self.inventory_pick_release();

@@ -15,6 +15,15 @@ use horizon_shaders::{
 #[test]
 #[ignore = "needs HORIZON_TEST_SHADER_PACKS"]
 fn real_packs_read() {
+    let test_macros = || {
+        let mut macros = Macros::standard();
+        if std::env::var_os("HORIZON_TEST_SHADER_EXTENDED").is_some() {
+            macros.undef("MC_OS_MAC");
+            macros.define("MC_OS_OTHER", "");
+        }
+        macros
+    };
+
     let dir = std::env::var_os("HORIZON_TEST_SHADER_PACKS").expect("HORIZON_TEST_SHADER_PACKS");
     let dir = Path::new(&dir);
     let mut found = discover(dir);
@@ -30,8 +39,8 @@ fn real_packs_read() {
             let start = Instant::now();
             let pack = Pack::open(&f.path).unwrap();
             // The macros the game reads the pack's programs with: the standard set, the renderer's
-            // (at Mipmap Levels 4), then the features the pack turns on.
-            let mut macros = Macros::standard();
+            // (at Mipmap Levels 4), then the supported-feature diagnostics (without another loader's identity macros).
+            let mut macros = test_macros();
             macros.define_renderer(4);
             let (shaders, feature_notes) = horizon_shaders::read_properties(&pack, &mut macros);
             let ids: Vec<Properties> = ["block", "item", "entity", "dimension"]
@@ -219,7 +228,12 @@ fn real_packs_read() {
                 if std::env::var_os("SUBGROUPS").is_some() {
                     macros.define("MC_GL_KHR_shader_subgroup_arithmetic", "");
                 }
-                for note in &feature_notes {
+                let shaders = Properties::from_pack(&pack, &folder, &macros).in_dimension(id);
+                for note in feature_notes
+                    .iter()
+                    .cloned()
+                    .chain(Macros::feature_notes(&shaders))
+                {
                     println!("    {note}");
                 }
                 let post = load_post(&pack, &folder, &shaders, &macros, &inputs);

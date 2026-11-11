@@ -98,7 +98,7 @@ impl Game<'_> {
     pub(super) fn native_entity_name(&self, entity: EntityRef) -> Option<String> {
         let t = self.native_entity_target(entity)?;
         if let Some(r) = &self.remote {
-            let id = i32::try_from(entity.id()).ok()?;
+            let id = entity.id() as i32;
             if let Some((_, Some(name))) = r.level_player(id) {
                 return Some(name.to_owned());
             }

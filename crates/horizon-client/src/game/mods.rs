@@ -7,7 +7,12 @@ use horizon_client::{
     mod_list::{self, Installed},
     text::Text,
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
+pub(super) mod catalog;
+mod content;
+pub(crate) use catalog::PreparedContent;
+use catalog::{Catalog, Selection};
+type CatalogJob = super::mod_browser::OwnedJob<Result<Arc<Catalog>, String>>;
 
 #[derive(Default)]
 pub(super) struct ModsState {
@@ -17,20 +22,78 @@ pub(super) struct ModsState {
     stopped: Vec<String>,
     /// Browse mods' worker (`mod_browser`).
     pub(super) jobs: super::mod_browser::Jobs,
-    /// The content mods the loaded resources were built with: a switch the
-    /// game can apply live moves it to the player's choice (`switch_mods`).
-    pub(super) applied: Option<std::collections::BTreeSet<String>>,
-    /// A live switch's resource reload is running: when it applied, the server
-    /// reloads its data from the new root. Its start, for the log.
-    pub(super) live: Option<std::time::Instant>,
-    /// The content mods installed, and those of them with only assets and
-    /// data (`mod_content::live_switch`): they switch with a world open.
-    content_ids: std::collections::BTreeSet<String>,
-    live_ids: std::collections::BTreeSet<String>,
+    pub(super) content: Option<Arc<PreparedContent>>,
+    pub(super) transaction: Option<super::packs::transaction::Transaction>,
+    catalog: Option<Arc<Catalog>>,
+    catalog_job: Option<CatalogJob>,
+    refresh_again: bool,
+    pending: Option<Selection>,
+    live: Option<std::time::Instant>,
     /// The server's data comes from a root a live switch built, not the one
     /// `res` was loaded from: the world tables are built from it even with no
     /// data pack (`build_world_tables`).
     pub(super) data_switched: bool,
+}
+
+impl ModsState {
+    pub(super) fn with_content(content: Option<Arc<PreparedContent>>) -> Self {
+        let data_switched = content.as_ref().is_some_and(|content| content.data_changed);
+        let catalog = content.as_ref().map(|content| content.catalog.clone());
+        Self {
+            content,
+            catalog,
+            data_switched,
+            ..Self::default()
+        }
+    }
+}
+
+/// Resource loading may fall back to vanilla after a rejected pack. Record
+/// what actually loaded while retaining catalogue metadata for a later retry.
+pub(super) fn content_for_loaded_root(
+    root: &std::path::Path,
+    requested: Arc<PreparedContent>,
+) -> horizon_client::Result<Arc<PreparedContent>> {
+    if root == requested.root {
+        return Ok(requested);
+    }
+    let mut enabled = requested.selection.enabled.clone();
+    enabled.retain(|id| {
+        !requested.catalog.entries.contains_key(id) && !requested.catalog.invalid.contains(id)
+    });
+    Ok(Arc::new(PreparedContent {
+        root: root.to_owned(),
+        catalog: requested.catalog.clone(),
+        selection: Selection {
+            enabled,
+            ..Selection::default()
+        },
+        lease: horizon_assets::root_lease::RootLease::acquire(root)?,
+        data_changed: false,
+    }))
+}
+
+pub(super) fn prepare_content(
+    root: &std::path::Path,
+    enabled: &std::collections::BTreeSet<String>,
+    disabled: &std::collections::BTreeSet<String>,
+    dev: &[PathBuf],
+) -> horizon_client::Result<Arc<PreparedContent>> {
+    let home = Game::game_dir();
+    horizon_client::mod_registry::with_content_snapshot(&home, || {
+        let catalog = catalog::read(&home, dev, &Default::default())?;
+        let selected = Selection::wanted(&catalog.wanted_ids(enabled, disabled), &catalog);
+        content::build(root, &home, &selected, catalog, false).map_err(|error| error.to_string())
+    })?
+    .map_err(Into::into)
+}
+
+pub(super) fn rebuild_content(
+    root: &std::path::Path,
+    selection: &Selection,
+    catalog: Arc<Catalog>,
+) -> horizon_client::Result<Arc<PreparedContent>> {
+    content::build(root, &Game::game_dir(), selection, catalog, true)
 }
 
 /// Freeze native component IDs before reading content or opening a connection.
@@ -85,119 +148,6 @@ pub(super) fn register_layer_definitions() {
     let mut layers = Vec::new();
     Game::native_layer_definitions(&mut layers);
     horizon_client::mobs::model_layers::register(layers);
-}
-
-/// `root` with the content mods that are on layered over it
-/// (docs/modpacks.md): their blocks, items, data and assets. Read once at
-/// start, before the resources load; a mod whose content is refused is left
-/// out here and its row on the Mods page says why.
-pub(super) fn content_root(
-    root: &std::path::Path,
-    enabled: &std::collections::BTreeSet<String>,
-    dev: &[std::path::PathBuf],
-) -> std::path::PathBuf {
-    use horizon_client::mod_content::{self, ContentMod};
-    use horizon_mods::{Capability, Content, Package};
-    let here = std::env::current_dir().unwrap_or_default();
-    let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
-    paths.retain(|p| !dev.contains(p));
-    paths.extend(dev.iter().cloned());
-    let mut known = None;
-    let mut mods: Vec<ContentMod> = Vec::new();
-    // The first load's list stays (`set_local`): a reload does not hash the files again.
-    let announce = !horizon_protocol::mod_list::is_set();
-    let mut announced = Vec::new();
-    for path in &paths {
-        let Ok(package) = Package::read(path) else {
-            continue;
-        };
-        let m = &package.manifest;
-        let on = enabled.contains(&m.id) || dev.contains(path);
-        if !on
-            || !m.capabilities.contains(&Capability::Registries)
-            || mods.iter().any(|c| c.id == m.id)
-        {
-            continue;
-        }
-        // The items this mod's native code declares may be a file item's crafting remainder.
-        let declared: Vec<String> = native_declared()
-            .1
-            .iter()
-            .filter(|i| i.id.split_once(':').is_some_and(|(ns, _)| ns == m.id))
-            .map(|i| i.id.clone())
-            .collect();
-        let content = match Content::read_declaring(path, m, &declared) {
-            Ok(content) => content,
-            Err(e) => {
-                log::warn!("Horizon: mod {} content not loaded: {e}", m.id);
-                continue;
-            }
-        };
-        let known = match &mut known {
-            Some(types) => types,
-            None => match mod_content::known_components(root) {
-                Ok(types) => known.insert(types),
-                Err(e) => {
-                    log::warn!("Horizon: content mods not loaded: {e}");
-                    register_mob_effects(&[]);
-                    return root.to_owned();
-                }
-            },
-        };
-        let candidate = ContentMod {
-            id: m.id.clone(),
-            content,
-        };
-        match mod_content::accept_mod(&mut mods, candidate, known) {
-            Ok(_) if announce => announced.push(announced_entry(m, path)),
-            Ok(_) => {}
-            Err(e) => log::warn!("Horizon: mod {} content not loaded: {e}", m.id),
-        }
-    }
-    let (blocks, items) = native_declared();
-    if !blocks.is_empty() || !items.is_empty() {
-        if known.is_none() {
-            match mod_content::known_components(root) {
-                Ok(types) => known = Some(types),
-                Err(e) => log::warn!("Horizon: native mods' blocks and items not loaded: {e}"),
-            }
-        }
-        if let Some(known) = &known {
-            for e in mod_content::accept_declared(&mut mods, blocks, items, known) {
-                log::warn!("Horizon: {e}");
-            }
-            // A file item's remainder named a code-declared item that was refused: that mod
-            // alone is left out, not every content mod through the overlay's check.
-            for e in mod_content::drop_dangling_remainders(&mut mods) {
-                log::warn!("Horizon: {e}");
-            }
-        }
-    }
-    match mod_content::resource_root(root, &mods, &here.join(".horizon-cache")) {
-        Ok(out) => {
-            if announce {
-                horizon_protocol::mod_list::set_local(announced);
-            }
-            if out != root {
-                log::info!(
-                    "Horizon: content from {} mod(s) in {}",
-                    mods.len(),
-                    out.display()
-                );
-            }
-            register_mob_effects(&mods);
-            register_entity_types(&mods);
-            register_menu_types(&mods);
-            out
-        }
-        Err(e) => {
-            log::warn!("Horizon: content mods not loaded: {e}");
-            register_mob_effects(&[]);
-            register_entity_types(&[]);
-            register_menu_types(&[]);
-            root.to_owned()
-        }
-    }
 }
 
 /// A loaded mod as a server tells joining clients (`horizon_protocol::mod_list`): its manifest's
@@ -284,7 +234,23 @@ fn register_menu_types(mods: &[horizon_client::mod_content::ContentMod]) {
     let menus = horizon_client::mod_content::menu_types(mods);
     let set = containers::register_mod_menu_types(menus.iter().map(|m| {
         let results = m.results.iter().map(|&r| usize::from(r)).collect();
-        (m.id.clone(), m.slots.into(), m.data_slots.into(), results)
+        let crafting = m.crafting.map(|c| containers::ModCrafting {
+            grid: c.grid.into(),
+            size: c.size.into(),
+            result: c.result.into(),
+        });
+        let links = m.links.map(|l| containers::ModLinks {
+            from: l.from.into(),
+            count: l.count.into(),
+        });
+        (
+            m.id.clone(),
+            m.slots.into(),
+            m.data_slots.into(),
+            results,
+            crafting,
+            links,
+        )
     }));
     if !set
         && containers::mod_menu_types()
@@ -307,13 +273,17 @@ fn build_lists_mods(built: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the game playing was built with native mods: the launcher writes their ids into
-/// [`BUILD_INFO`] beside the executable, and a release or Nightly has no such file.
+/// Whether the game playing was built with native mods: horizon-mixins applied bundles to its
+/// source (`HORIZON_MIXIN_MODS`, set by the build script from the record it leaves, as with a mod
+/// author's own build that has no [`BUILD_INFO`]), trait mods are installed, or the launcher wrote
+/// their ids into [`BUILD_INFO`] beside the executable. A release or Nightly has none of them.
 pub(super) fn built_with_native_mods() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| std::fs::read_to_string(exe.with_file_name(BUILD_INFO)).ok())
-        .is_some_and(|built| build_lists_mods(&built))
+    option_env!("HORIZON_MIXIN_MODS").is_some_and(|mods| !mods.is_empty())
+        || !crate::mod_api::mods().is_empty()
+        || std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::read_to_string(exe.with_file_name(BUILD_INFO)).ok())
+            .is_some_and(|built| build_lists_mods(&built))
 }
 
 /// The native mods the launcher built this game with, `id version, id version`, for the crash
@@ -330,29 +300,6 @@ fn native_mods_detail(built: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
     (!list.is_empty()).then_some(list)
-}
-
-/// Notes a content mod's id, and whether its files can switch with a world
-/// open (`mod_content::live_switch`).
-fn live_switch_of(
-    path: &std::path::Path,
-    package: &horizon_mods::Package,
-    content_ids: &mut std::collections::BTreeSet<String>,
-    live_ids: &mut std::collections::BTreeSet<String>,
-) {
-    let id = &package.manifest.id;
-    content_ids.insert(id.clone());
-    let content = horizon_mods::Content::read(path, &package.manifest);
-    match content
-        .as_ref()
-        .map(horizon_client::mod_content::live_switch)
-    {
-        Ok(Ok(())) if package.wasm.is_none() => {
-            live_ids.insert(id.clone());
-        }
-        Ok(Err(why)) => log::debug!("Horizon: mod {id} switches on a restart: {why}"),
-        _ => {}
-    }
 }
 
 /// A row for each native mod the launcher installed in `dir` (`<id>.hnmod`) that this game wasn't
@@ -403,60 +350,78 @@ impl Game<'_> {
     /// mods don't run any more: their rows say so, and the player hears it once in the chat
     /// (`tell_native_now`).
     pub(super) fn start_mods(&mut self) {
-        let dir = Self::game_dir().join(mod_list::DIR);
-        let mut paths = horizon_mods::find(&dir);
-        paths.retain(|p| !self.mods.dev.contains(p));
-        paths.extend(self.mods.dev.iter().cloned());
-        let (mut content_ids, mut live_ids) = Default::default();
-        self.settings.mods.installed = paths
-            .iter()
-            .map(|path| {
-                let file = path.file_name().unwrap_or_default().to_string_lossy();
-                let package = match horizon_mods::Package::read(path) {
-                    Ok(package) => package,
-                    Err(e) => {
-                        return Installed {
-                            id: String::new(),
-                            title: file.into_owned(),
-                            description: String::new(),
-                            problem: Some(format!("Can't be read: {e}")),
-                            dev: false,
-                            native: None,
-                        };
-                    }
-                };
-                let m = &package.manifest;
-                let problem = package.wasm.is_some().then(|| STOPPED.to_owned());
-                live_switch_of(path, &package, &mut content_ids, &mut live_ids);
-                Installed {
-                    id: m.id.clone(),
-                    title: format!("{} {}", m.name, m.version),
-                    description: m.description.clone(),
-                    problem,
-                    dev: self.mods.dev.contains(path),
-                    native: None,
-                }
-            })
-            .collect();
-        (self.mods.content_ids, self.mods.live_ids) = (content_ids, live_ids);
-        self.ui.options.mods_live = self.mods_live_now();
-        if self.mods.applied.is_none() {
-            self.mods.applied = Some(self.settings.mods.enabled.clone());
+        if let Some(content) = &self.mods.content {
+            self.mods.catalog = Some(content.catalog.clone());
+            self.publish_mod_catalog();
         }
-        // A mod with a native version built in says so instead, and isn't news.
+        self.sync_native_switches();
+        if self.options.execution_role.is_client() {
+            self.refresh_mod_catalog();
+        }
+    }
+
+    fn refresh_mod_catalog(&mut self) {
+        if self.mods.catalog_job.is_some() {
+            self.mods.refresh_again = true;
+            return;
+        }
+        let home = Self::game_dir();
+        let dev = self.mods.dev.clone();
+        match super::mod_browser::OwnedJob::spawn("mod-catalogue", move |cancel| {
+            let _access =
+                horizon_client::import::acquire_home_access(&home).map_err(|e| e.to_string())?;
+            horizon_client::mod_registry::with_content_snapshot_managed(&home, &cancel, || {
+                catalog::read(&home, &dev, &cancel)
+            })
+            .map_err(|e| e.to_string())?
+        }) {
+            Ok(job) => self.mods.catalog_job = Some(job),
+            Err(error) => log::warn!("Horizon: mod catalogue refresh failed: {error}"),
+        }
+    }
+
+    pub(super) fn poll_mod_catalog(&mut self) {
+        let Some(job) = &self.mods.catalog_job else {
+            return;
+        };
+        let result = match job.poll() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("mod catalogue worker stopped".into())
+            }
+        };
+        self.mods.catalog_job = None;
+        if self.mods.refresh_again {
+            self.mods.refresh_again = false;
+            self.refresh_mod_catalog();
+            return;
+        }
+        match result {
+            Ok(catalog) => {
+                self.mods.catalog = Some(catalog);
+                self.publish_mod_catalog();
+                self.switch_mods();
+            }
+            Err(error) => log::warn!("Horizon: mod catalogue not refreshed: {error}"),
+        }
+    }
+
+    fn publish_mod_catalog(&mut self) {
+        let Some(catalog) = self.mods.catalog.clone() else {
+            return;
+        };
+        self.settings.mods.installed = catalog.rows.clone();
         self.list_native_mods();
         self.sync_native_switches();
-        let built = std::env::current_exe()
-            .ok()
-            .and_then(|exe| std::fs::read_to_string(exe.with_file_name(BUILD_INFO)).ok())
-            .unwrap_or_default();
-        let built_mods = native_mods_detail(&built);
-        let built_with_mods = built_mods.is_some();
-        if let Some(list) = built_mods {
-            horizon_client::crash::set_detail("Native Mods", list);
+        self.ui.options.mods_live = self.mods_live_now();
+        let detail = native_mods_detail(&catalog.built);
+        if let Some(list) = &detail {
+            horizon_client::crash::set_detail("Native Mods", list.clone());
         }
         horizon_client::gfx::native_render::set_mods_built_in(
-            built_with_mods
+            detail.is_some()
+                || built_with_native_mods()
                 || self
                     .settings
                     .mods
@@ -464,116 +429,105 @@ impl Game<'_> {
                     .iter()
                     .any(|m| m.native.is_some()),
         );
-        let native_dir = Self::game_dir().join(mod_list::NATIVE_DIR);
-        let unbuilt = not_built(&native_dir, &built, &self.settings.mods.installed);
-        self.settings.mods.installed.extend(unbuilt);
-        let installed = &self.settings.mods.installed;
-        self.mods.stopped = installed
+        self.mods.stopped = self
+            .settings
+            .mods
+            .installed
             .iter()
             .filter(|row| row.problem.as_deref() == Some(STOPPED))
             .map(|row| row.title.clone())
             .collect();
     }
-    /// The content mods the Mods page lets the player switch with a world
-    /// open: in single player and on an open LAN world, those with only
-    /// assets and data; none on another server, which owns its data.
+
     pub(super) fn mods_live_now(&self) -> std::collections::BTreeSet<String> {
-        match self.integrated.is_some() || self.remote.is_none() {
-            true => self.mods.live_ids.clone(),
-            false => Default::default(),
+        if self.integrated.is_none() && self.remote.is_some() {
+            return Default::default();
         }
-    }
-    /// The content mods the resources load with: the ones applied, which a
-    /// switch that needs a restart doesn't change.
-    pub(super) fn applied_mods(&self) -> std::collections::BTreeSet<String> {
         self.mods
-            .applied
-            .clone()
-            .unwrap_or_else(|| self.settings.mods.enabled.clone())
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| entry.live)
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
-    /// The player turned content mods on or off (Options > Mods, or an
-    /// install from Browse Mods): those with only assets and data apply now
-    /// (docs/design/mod-hotload.md), through the resource reload and then the
-    /// server's data reload (`mods_reloaded`); those that add blocks, items or
-    /// worldgen wait for a restart, and the Mods page says so.
+
+    pub(super) fn requested_mod_selection(&self) -> (Selection, Arc<Catalog>) {
+        if self.remote.is_some()
+            && self.integrated.is_none()
+            && let Some(content) = &self.mods.content
+        {
+            return (content.selection.clone(), content.catalog.clone());
+        }
+        let catalog = self.mods.catalog.clone().unwrap_or_default();
+        let selection = self
+            .mods
+            .pending
+            .clone()
+            .or_else(|| {
+                self.mods
+                    .content
+                    .as_ref()
+                    .map(|content| content.selection.clone())
+            })
+            .unwrap_or_default();
+        (selection, catalog)
+    }
+
     pub(super) fn switch_mods(&mut self) {
-        let Some(applied) = self.mods.applied.clone() else {
+        let (Some(applied), Some(catalog)) = (&self.mods.content, &self.mods.catalog) else {
             return;
         };
-        let wanted = self.settings.mods.enabled.clone();
-        if applied == wanted {
-            return;
-        }
-        // Native mods' `mod.<id>` lines follow the player's choice as they are
-        // (`sync_native_switches`); a content mod with blocks, items or
-        // worldgen keeps the state it loaded with until a restart.
-        let content = &self.mods.content_ids;
-        let mut next = wanted.clone();
-        let mut waiting = Vec::new();
-        for id in applied.symmetric_difference(&wanted) {
-            if !content.contains(id) || self.mods.live_ids.contains(id) {
-                continue;
-            }
-            log::info!("Horizon: mod {id} needs a restart to switch");
-            waiting.push(id.clone());
-            if applied.contains(id) {
-                next.insert(id.clone());
-            } else {
-                next.remove(id);
-            }
-        }
-        self.ui.options.mods_note = (!waiting.is_empty())
-            .then(|| lang::tr("horizon.mods.switch.restart", &[&waiting.join(", ")]));
-        let changed = applied
-            .symmetric_difference(&next)
-            .any(|id| content.contains(id));
-        if !changed {
-            self.mods.applied = Some(next);
-            return;
-        }
-        log::info!(
-            "Horizon: content mods switched live: {:?} -> {:?}",
-            applied,
-            next
+        let plan = catalog::switch_plan(
+            &applied.selection,
+            &catalog.wanted_ids(&self.settings.mods.enabled, &self.settings.mods.disabled),
+            catalog,
+            self.integrated.is_some() || self.remote.is_none(),
         );
-        self.mods.applied = Some(next);
+        self.ui.options.mods_note = (!plan.waiting.is_empty()).then(|| {
+            lang::tr(
+                "horizon.mods.switch.restart",
+                &[&plan.waiting.into_iter().collect::<Vec<_>>().join(", ")],
+            )
+        });
+        if self.mods.pending.as_ref() == Some(&plan.next) {
+            return;
+        }
+        if plan.next == applied.selection && self.mods.pending.is_none() {
+            return;
+        }
+        self.mods.pending = Some(plan.next);
         self.mods.live = Some(std::time::Instant::now());
         self.reload_packs();
     }
-    /// A live switch's resources applied: the server reloads its data packs
-    /// from the new root, as `/reload` does (recipes, tags, loot tables,
-    /// advancements, functions), and sends them to its players.
-    pub(super) fn mods_reloaded(&mut self, applied: bool) {
-        let Some(started) = self.mods.live.take() else {
-            return;
-        };
-        let resources_ms = started.elapsed().as_millis();
-        if !applied {
+
+    /// Only a successfully installed resource generation becomes applied.
+    pub(super) fn mods_reloaded(&mut self, success: bool) {
+        if !success {
             return;
         }
-        let root = self.options.resources.clone();
-        let enabled = self.applied_mods();
-        let reload = move |g: &mut Game<'_>| {
-            let at = std::time::Instant::now();
-            g.options.resources = root;
-            g.settings.mods.enabled = enabled.clone();
-            g.mods.applied = Some(enabled);
-            g.mods.data_switched = true;
-            if g.world_root.as_os_str().is_empty() {
-                return;
-            }
-            g.reload_datapacks(true);
-            log::info!(
-                "Horizon: content mods switched live: server data reloaded in {} ms",
-                at.elapsed().as_millis()
-            );
+        let Some(content) = self.pack.content.clone() else {
+            return;
         };
-        log::info!("Horizon: content mods switched live: resources reloaded in {resources_ms} ms");
-        if let Some(server) = &self.integrated {
-            server.post(reload);
-        } else if self.remote.is_none() {
-            reload(self);
+        self.mods.content = Some(content.clone());
+        self.mods.data_switched |= self.mods.live.is_some();
+        if self.mods.pending.as_ref() == Some(&content.selection) {
+            self.mods.pending = None;
+            self.mods.live = None;
         }
+    }
+
+    pub(super) fn shutdown_mod_catalog(&mut self) -> bool {
+        self.mods.transaction = None;
+        self.mods
+            .catalog_job
+            .as_ref()
+            .is_none_or(|job| job.shutdown())
     }
     /// Trait mods follow the player's switches at once
     /// (`mod_api::set_mod_on`): the next dispatch skips a mod turned off.
@@ -723,6 +677,57 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    #[ignore = "prepared resources: run explicitly for native content"]
+    fn built_native_sound_content_reaches_the_resource_root_and_obeys_disable() {
+        let base = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let scratch =
+            std::env::temp_dir().join(format!("horizon-native-content-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let version = scratch.join("version");
+        let home = scratch.join("game");
+        std::fs::create_dir_all(&home).unwrap();
+        let content = version.join("native-content/soundproof");
+        std::fs::create_dir_all(content.join("assets/soundproof/sounds")).unwrap();
+        std::fs::write(content.join("horizon-mod.toml"), "id=\"soundproof\"\nname=\"Sound proof\"\nversion=\"1\"\napi=\"0.2\"\ncapabilities=[\"registries\"]\n").unwrap();
+        std::fs::write(
+            content.join("assets/soundproof/sounds.json"),
+            r#"{"proof":{"sounds":["soundproof:proof"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            content.join("assets/soundproof/sounds/proof.ogg"),
+            b"synthetic existence marker; no audio decode",
+        )
+        .unwrap();
+        let legacy = home.join(mod_list::DIR).join("soundproof");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::copy(
+            content.join("horizon-mod.toml"),
+            legacy.join("horizon-mod.toml"),
+        )
+        .unwrap();
+        let enabled = ["soundproof".to_owned()].into();
+        let empty = Default::default();
+        let catalog =
+            catalog::read_at(&home, &[], &Default::default(), Some(&version), |_| {}).unwrap();
+        let build = |enabled, disabled| {
+            let selection = Selection::wanted(&catalog.wanted_ids(enabled, disabled), &catalog);
+            content::build(&base, &home, &selection, catalog.clone(), false).unwrap()
+        };
+        let loaded = build(&empty, &empty);
+        let root = &loaded.root;
+        assert_ne!(*root, base);
+        let sounds = horizon_client::sound_events::SoundRegistry::load(&root);
+        assert!(!sounds.tracks("soundproof:proof").is_empty());
+        let disabled = ["soundproof".to_owned()].into();
+        let off = build(&enabled, &disabled).root.clone();
+        assert_eq!(off, base, "disabled native mods contribute no assets");
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     /// A content mod's living type is a mob of its template's species under
     /// its own id, with its own attributes: it saves its id with every field
     /// its template's class saves, loads back as itself, and rolls its own
@@ -822,6 +827,109 @@ mod tests {
             (loaded.kind.id.as_str(), loaded.species()),
             ("ruby:merchant", Species::WanderingTrader)
         );
+    }
+
+    /// Content classification belongs to the immutable generation, not a mutable
+    /// folder's mtime. A developer edit is reflected by the next catalogue, while
+    /// an already installed generation retains its original live-switch verdict.
+    #[test]
+    fn a_mods_live_switch_verdict_follows_its_pinned_generation() {
+        let dir = std::env::temp_dir().join(format!("horizon-verdict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ruby = dir.join("ruby");
+        std::fs::create_dir_all(ruby.join("assets/ruby/lang")).unwrap();
+        std::fs::create_dir_all(ruby.join("data/ruby")).unwrap();
+        std::fs::write(ruby.join("assets/ruby/lang/en_us.json"), "{}").unwrap();
+        std::fs::write(
+            ruby.join("horizon-mod.toml"),
+            r#"id = "ruby"
+name = "Ruby"
+version = "0.1.0"
+api = "0.2"
+side = "both"
+capabilities = ["registries"]
+"#,
+        )
+        .unwrap();
+        let read =
+            || catalog::read(&dir, std::slice::from_ref(&ruby), &Default::default()).unwrap();
+        let original = read();
+        let original_entry = original.entries["ruby"].clone();
+        assert!(original_entry.live);
+        let enabled = std::collections::BTreeSet::from(["ruby".into()]);
+        let running = Selection::wanted(&enabled, &original);
+        let unchanged = read();
+        assert_eq!(unchanged.entries["ruby"].revision, original_entry.revision);
+        assert!(
+            catalog::switch_plan(&running, &enabled, &unchanged, true)
+                .waiting
+                .is_empty()
+        );
+        let worldgen = ruby.join("data/ruby/worldgen/configured_feature");
+        std::fs::create_dir_all(&worldgen).unwrap();
+        std::fs::write(worldgen.join("ore.json"), "{}").unwrap();
+        let edited = read();
+        assert!(!edited.entries["ruby"].live);
+        assert_ne!(edited.entries["ruby"].revision, original_entry.revision);
+        assert!(
+            original_entry.live,
+            "the running snapshot keeps its original classification"
+        );
+        assert!(
+            !original_entry
+                .source
+                .join("data/ruby/worldgen/configured_feature/ore.json")
+                .exists()
+        );
+        let plan = catalog::switch_plan(&running, &enabled, &edited, true);
+        assert_eq!(plan.waiting, enabled);
+        assert_eq!(plan.next, running, "worldgen changes wait for restart");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The mods read on threads at once come back in the order given, each with its own
+    /// files, and a refused mod's error stays with that mod alone.
+    #[test]
+    fn pinned_mods_keep_their_order_and_their_own_errors() {
+        let dir = std::env::temp_dir().join(format!("horizon-read-at-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths: Vec<PathBuf> = (0..12).map(|i| dir.join(format!("m{i}"))).collect();
+        for (i, path) in paths.iter().enumerate() {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(
+                path.join("horizon-mod.toml"),
+                format!(
+                    "id = \"m{i}\"\nname = \"M\"\nversion = \"0.1.0\"\napi = \"0.2\"\n\
+                     side = \"both\"\ncapabilities = [\"registries\"]\n"
+                ),
+            )
+            .unwrap();
+            // Mod i has i + 1 language files; mod 5 also writes into another mod's namespace.
+            let lang = path.join(format!("assets/m{i}/lang"));
+            std::fs::create_dir_all(&lang).unwrap();
+            for n in 0..=i {
+                std::fs::write(lang.join(format!("l{n}.json")), "{}").unwrap();
+            }
+            if i == 5 {
+                std::fs::create_dir_all(path.join("assets/m0/lang")).unwrap();
+                std::fs::write(path.join("assets/m0/lang/x.json"), "{}").unwrap();
+            }
+        }
+        let catalog = catalog::read_at(&dir, &paths, &Default::default(), None, |_| {}).unwrap();
+        let expected: Vec<_> = (0..12)
+            .filter(|i| *i != 5)
+            .map(|i| format!("m{i}"))
+            .collect();
+        assert_eq!(catalog.order, expected);
+        assert!(catalog.invalid.contains("m5"));
+        for (i, path) in paths.iter().enumerate().filter(|(i, _)| *i != 5) {
+            let entry = &catalog.entries[&format!("m{i}")];
+            assert_ne!(&entry.source, path);
+            let package = horizon_mods::Package::read(&entry.source).unwrap();
+            let content = horizon_mods::Content::read(&entry.source, &package.manifest).unwrap();
+            assert_eq!(content.files.len(), i + 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Only a build whose `native-mods.json` lists a mod counts as built with mods.
@@ -961,6 +1069,8 @@ mod tests {
             sound_play: |_, _, _, _| {},
             living_heal: |_, _, _| {},
             player_chat: |_, _, _, _, _| {},
+            player_chat_v2: |_, _, _, _, _, _| {},
+            chat_decorate: |_, _, _, _| {},
             living_breathe: |_, _, _, _, _| {},
             living_drown: |_, _, _, _, _, _| {},
             living_fall: |_, _, _, _, _| {},
@@ -971,6 +1081,7 @@ mod tests {
             ingredient: |_, _, _| {},
             ingredient_test: |_, _, _, _| {},
             log_line: |_, _, _, _| {},
+            living_death_message: |_, _, _| {},
             handshake: |_, _, _, _, _| {},
         });
         assert!(installed.is_ok());

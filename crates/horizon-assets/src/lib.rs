@@ -9,8 +9,10 @@ pub mod item_model;
 mod json;
 pub mod math;
 pub mod model;
+pub mod namespaces;
 pub mod obj;
 pub mod palette;
 pub mod resolve;
+pub mod root_lease;
 
 pub use json::DecodeError;

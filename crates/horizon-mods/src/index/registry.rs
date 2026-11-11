@@ -11,7 +11,10 @@ use super::{
     File, Index, Kind, Project, Revoked, SCHEMA, Version, hex64, inspect, page as rules, valid_id,
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 /// The folder of entries in the registry repository.
 pub const ENTRIES: &str = "mods";
@@ -410,7 +413,9 @@ pub fn project(entry: &Entry, src: &Sources) -> Result<Project, Vec<String>> {
 
 /// An icon (`folder` = `icons/`) or a screenshot (`screenshots/<id>/`) as the index lists it: an
 /// `https://` address as it is, or a file in the registry repository checked and served from the
-/// registry's site.
+/// registry's site. An icon's address ends in `?v=` and the start of its SHA-256, so a new icon
+/// is a new address: the launcher keeps images by address for a week, and would go on showing
+/// the old one.
 fn image(
     src: &Sources,
     id: &str,
@@ -434,27 +439,52 @@ fn image(
     } else {
         rules::MAX_SCREENSHOT
     };
-    let checked = std::fs::metadata(src.registry.join(path))
-        .map_err(|e| format!("{path}: {e}"))
-        .and_then(|m| {
-            if m.len() > max {
-                return Err(format!("{path} is over {} KiB", max >> 10));
-            }
-            let bytes =
-                std::fs::read(src.registry.join(path)).map_err(|e| format!("{path}: {e}"))?;
-            if icon {
-                rules::check_icon(&bytes).map_err(|e| format!("{path}: {e}"))
-            } else {
-                rules::check_screenshot(name, &bytes)
-            }
-        });
+    let checked = image_bytes(src.registry, path, max).and_then(|bytes| {
+        if icon {
+            rules::check_icon(&bytes).map_err(|e| format!("{path}: {e}"))?;
+            Ok(format!("?v={}", &super::sha256(&bytes)[..12]))
+        } else {
+            rules::check_screenshot(name, &bytes).map(|()| String::new())
+        }
+    });
     match checked {
-        Ok(()) => Some(format!("{}{path}", src.site)),
+        Ok(version) => Some(format!("{}{path}{version}", src.site)),
         Err(e) => {
             errors.push(format!("{id}: {e}"));
             None
         }
     }
+}
+
+/// A local image must be a regular file inside the checkout, including
+/// symlink targets. Bound the actual read too: the file may grow after stat.
+fn image_bytes(root: &Path, path: &str, max: u64) -> Result<Vec<u8>, String> {
+    let root = std::fs::canonicalize(root).map_err(|e| format!("{path}: {e}"))?;
+    let source = std::fs::canonicalize(root.join(path)).map_err(|e| format!("{path}: {e}"))?;
+    if !source.starts_with(&root) {
+        return Err(format!("{path} is outside the registry checkout"));
+    }
+    let metadata = std::fs::metadata(&source).map_err(|e| format!("{path}: {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{path} is not a regular image file"));
+    }
+    if metadata.len() > max {
+        return Err(format!("{path} is over {} KiB", max >> 10));
+    }
+    let file = std::fs::File::open(source).map_err(|e| format!("{path}: {e}"))?;
+    bounded_image_bytes(file, path, max)
+}
+
+fn bounded_image_bytes(reader: impl Read, path: &str, max: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{path}: {e}"))?;
+    if bytes.len() as u64 > max {
+        return Err(format!("{path} is over {} KiB", max >> 10));
+    }
+    Ok(bytes)
 }
 
 /// The kind of a version's file at `path`: the project's, but a `.hmod` without native code of a
@@ -695,6 +725,19 @@ pub struct Review {
 /// native (its next versions carry native code), and changes by someone who
 /// isn't an owner, or to owners and keys, are pointed out.
 pub fn review(base: &[Entry], head: &[Entry], author: &str) -> Review {
+    review_with_revoked(base, head, &[], author)
+}
+
+/// [`review`], where a version may leave its entry once `revoked` (the pull
+/// request's `revoked.toml`) takes its file down by hash: a project whose
+/// signing key was lost lists its next version under a new key and drops the
+/// versions the new key can't verify.
+pub fn review_with_revoked(
+    base: &[Entry],
+    head: &[Entry],
+    revoked: &[Revoked],
+    author: &str,
+) -> Review {
     let mut r = Review::default();
     for old in base {
         let Some(new) = head.iter().find(|e| e.id == old.id) else {
@@ -723,7 +766,16 @@ pub fn review(base: &[Entry], head: &[Entry], author: &str) -> Review {
             r.errors.push(format!("{}: its kind can't change", old.id));
         }
         for v in &old.versions {
+            let taken_down = || {
+                revoked
+                    .iter()
+                    .any(|t| t.id == old.id && t.sha256.as_deref() == Some(v.sha256.as_str()))
+            };
             match new.versions.iter().find(|w| w.version == v.version) {
+                None if taken_down() => r.notes.push(format!(
+                    "{} {}: leaves the entry, taken down in {REVOKED}",
+                    old.id, v.version
+                )),
                 None => r.errors.push(format!(
                     "{} {}: removed; take it down in {REVOKED} instead",
                     old.id, v.version

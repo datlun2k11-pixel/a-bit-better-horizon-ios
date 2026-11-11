@@ -4,7 +4,7 @@
 //! - **Focus** (menus): a highlight steps between the widgets, list rows and
 //!   fields each screen registers (`widgets::target_as`) with vanilla's
 //!   arrow-key navigation; A presses the focused one, the bumpers switch tabs,
-//!   the right stick scrolls, left/right move a focused slider, A on a text
+//!   the right stick scrolls, A takes hold of a focused slider for left/right to move, A on a text
 //!   field opens the on-screen keyboard (`osk`).
 //! - **Crosshair** (inventories, containers and the screens whose clickable
 //!   parts register no target): a pointer the left stick moves and the D-pad
@@ -44,6 +44,16 @@ use winit::{
 const STICK_STEP: f32 = 0.55;
 /// Scrolls a step may try to reveal the next row of a list.
 const SCROLL_TRIES: u8 = 4;
+/// How far apart two rectangles may be and still be one widget found again (GUI pixels).
+const SAME_RECT: f32 = 0.5;
+/// Frames after a scroll that may still have been drawn before it: their rectangles are stale.
+const STALE_FRAMES: u64 = 1;
+
+/// Whether the frames drawn since `pad_reveal` scrolled a row, at frame `revealed`, may still
+/// show the list where it was.
+fn reveal_pending(revealed: Option<u64>, now: u64) -> bool {
+    revealed.is_some_and(|at| now <= at + STALE_FRAMES)
+}
 
 /// A focus step that ran off the visible part of a list: the list was
 /// scrolled and the step runs again once a new frame is drawn. When the
@@ -131,6 +141,9 @@ pub(super) struct MenuCursor {
     /// The focused button A went down on: letting go presses it, unless the
     /// focus moved or the input was cancelled first.
     pub(super) armed: Option<Rect>,
+    /// The frame count when `pad_reveal` scrolled the focused row into view: the frames drawn
+    /// before it still show the row where it was, so the focus isn't looked for in them.
+    pub(super) revealed: Option<u64>,
     /// The OS pointer is hidden while the pad's cursor is drawn.
     os_hidden: bool,
     /// Polls since a menu opened (its widgets are drawn after one frame).
@@ -139,9 +152,6 @@ pub(super) struct MenuCursor {
     pub(super) focus: Option<Target>,
     /// The left stick's step direction last poll.
     stick: Option<Button>,
-    /// A right stick click swapped modes for this screen.
-    swapped: bool,
-    pub(super) keyboard_focus: bool,
     pending: Option<Pending>,
     /// The focused slider being nudged and where the pad put its handle.
     nudge: Option<(Rect, f32)>,
@@ -149,20 +159,32 @@ pub(super) struct MenuCursor {
     repeats: u32,
     /// The on-screen keyboard, open over a text field.
     pub(super) osk: Option<Keyboard>,
+    /// The recipe being crafted straight into the inventory (`pad_craft`).
+    pub(super) craft: Option<super::pad_craft::DirectCraft>,
+    /// LT held over the crafting book: it changes the category as it comes up, unless A was
+    /// pressed meanwhile (LT + A crafts, `pad_craft`).
+    pub(super) trigger: Option<HeldTrigger>,
     /// The keyboard was closed on this screen (it doesn't open by itself again).
     osk_dismissed: bool,
+    /// The system's keyboard was asked for (iOS: `sync_system_keyboard`).
+    system_keyboard: bool,
+    /// The player put the system's keyboard away with the touch controls' keyboard button: the field keeps
+    /// its focus and text, and the keyboard stays down until the focus moves or the button is pressed again.
+    system_keyboard_hidden: bool,
     /// The keyboard drives the focus (`key_focus`: Tab, the arrows, Enter):
     /// focus mode whatever the screen, the OS pointer shown.
     pub(super) keyboard: bool,
     /// The focused slider's arrows change its value (`canChangeValue`).
     slider_edit: bool,
+    /// The slider A took hold of for left and right to move, and the screen it's on.
+    pub(super) slider_hold: Option<(u64, Rect)>,
     /// What the last click landed on: vanilla focuses it, so the next Tab
     /// or arrow goes on from there (`ContainerEventHandler.mouseClicked`).
     origin: Option<Rect>,
     /// A shortcut put the focus here: not where the screen reopens.
     shortcut_focus: Option<Rect>,
     /// A pointer event the pad or the keyboard sends is being handled.
-    synthetic: bool,
+    pub(super) synthetic: bool,
     /// Where the real mouse last moved the pointer (window pixels).
     real_pointer: Option<PhysicalPosition<f64>>,
     /// The screen the keyboard's focus is on (`Game::key_screen`), and the
@@ -170,11 +192,6 @@ pub(super) struct MenuCursor {
     /// new screen's first drawn frame.
     key_screen: u64,
     key_restart: Option<u64>,
-    /// The system's keyboard was asked for (iOS: `sync_system_keyboard`).
-    system_keyboard: bool,
-    /// The player put the system's keyboard away with the touch controls' keyboard button: the field keeps
-    /// its focus and text, and the keyboard stays down until the focus moves or the button is pressed again.
-    system_keyboard_hidden: bool,
     /// The pad's focus on each screen it left (`Game::key_screen`), so coming
     /// back lands where it was, as vanilla keeps a screen's focused widget.
     remembered: std::collections::HashMap<u64, Remembered>,
@@ -190,7 +207,21 @@ pub(super) struct MenuCursor {
     prompt_crosshair: Option<(Screen, (f32, f32))>,
 }
 
+/// LT held over the crafting book.
+#[derive(Clone, Copy)]
+pub(super) struct HeldTrigger {
+    /// A was pressed while it was held: it was LT + A, not a category change.
+    pressed_a: bool,
+}
+
 impl MenuCursor {
+    /// A running direct craft ends, as cleanly as the server still lets it (`DirectCraft::stop`).
+    pub(super) fn stop_craft(&mut self) {
+        if let Some(craft) = &mut self.craft {
+            craft.stop();
+        }
+    }
+
     /// `Screen.clearFocus`: nothing is focused any more, and no click focus
     /// is kept for the next Tab (`ComponentPath.applyFocus(false)`).
     fn clear_focus(&mut self) {
@@ -242,10 +273,12 @@ fn beside(rect: Rect, targets: &[Rect]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// Where letting go of A clicks: the armed button, if the focus is still on it.
+/// Where letting go of A clicks: the armed button, if the focus is still on it. A row scrolled
+/// into view under A (`pad_reveal`) is found again a fraction of a pixel off.
 fn armed_click(armed: Option<Rect>, focus: Option<Target>) -> Option<(f32, f32)> {
+    let same = |a: Rect, b: Rect| a.iter().zip(b).all(|(a, b)| (a - b).abs() < SAME_RECT);
     focus
-        .filter(|focus| armed == Some(focus.rect))
+        .filter(|focus| armed.is_some_and(|armed| same(armed, focus.rect)))
         .map(|focus| focus.center())
 }
 
@@ -263,8 +296,6 @@ impl Game<'_> {
             || self.screen != Screen::Playing
             || self.sign_edit.is_some()
             || self.book.is_some()
-            || self.server_packs.prompt.is_some()
-            || self.dialog_open()
     }
 
     /// Which prompt is up: another one starts the controller's focus again.
@@ -343,7 +374,11 @@ impl Game<'_> {
     fn pad_pointer_screen(&self) -> bool {
         matches!(
             self.screen,
-            Screen::Inventory | Screen::Creative | Screen::Stats | Screen::Advancements
+            Screen::Inventory
+                | Screen::Creative
+                | Screen::Stats
+                | Screen::Advancements
+                | Screen::HudEditor
         ) || self.book.is_some()
             || (self.screen == Screen::Options && self.ui.options.page() == Page::Packs)
     }
@@ -465,10 +500,10 @@ impl Game<'_> {
         if self.prompt_open() {
             return self.pad_prompt_first(targets).or(targets.first().copied());
         }
+        let rects: Vec<Rect> = targets.iter().map(|t| t.rect).collect();
         // Back on a screen the pad left: where it was, as vanilla keeps a
         // screen's focused widget (Options, after its Done). The same widget
         // first: the rows under it can have moved.
-        let rects: Vec<Rect> = targets.iter().map(|t| t.rect).collect();
         if let Some(i) = self
             .pad
             .menu
@@ -727,6 +762,12 @@ impl Game<'_> {
     ) -> Result<()> {
         if !down {
             match button {
+                Button::LeftTrigger if self.pad.menu.trigger.is_some() => {
+                    let pressed_a = self.pad.menu.trigger.take().is_some_and(|t| t.pressed_a);
+                    if !pressed_a && self.pad_recipe_book_showing() {
+                        self.pad_tab(event_loop, false);
+                    }
+                }
                 Button::South if self.pad.menu.armed.is_some() => {
                     let armed = self.pad.menu.armed.take();
                     if let Some(at) = armed_click(armed, self.pad.menu.focus) {
@@ -746,15 +787,29 @@ impl Game<'_> {
         }
         // The pad takes the focus back from the keyboard.
         self.pad.menu.keyboard = false;
+        // A with LT held over the crafting book is LT + A: LT coming up changes no category.
+        if button == Button::South
+            && let Some(trigger) = &mut self.pad.menu.trigger
+        {
+            trigger.pressed_a = true;
+        }
+        // Any press ends a running craft but another LT + A on its recipe, which asks for one
+        // more further down: quick taps while one is in flight each make a craft.
+        if !self.direct_craft_takes_press(button) {
+            self.direct_craft_stop();
+        }
         // A prompt over the screen answers first; no press reaches both.
         let prompt = self.prompt_open();
-        // Bindings waiting for a button: this one (Start cancels).
+        // Bindings, or the radial menu's opener row, waiting for a button: this one (Start
+        // cancels).
         if !prompt
             && self.screen == Screen::Options
-            && self.ui.options.controller_open()
             && let Some(action) = self.ui.options.selected_pad_action.take()
         {
-            if button != Button::Start {
+            // Start cancels, and so does a button the action can't take (the radial menu's
+            // opener under the selecting thumb or on B, `gamepad::opener_refused`): the binding
+            // stays.
+            if button != Button::Start && self.settings.controller.can_bind(action, button) {
                 self.settings.controller.bind(action, Some(button));
             }
             return self.handle_option_events(vec![Event::Changed]);
@@ -784,6 +839,10 @@ impl Game<'_> {
                 return Ok(());
             }
         }
+        // The screen under the keyboard went away (dying with chat open): so does the keyboard.
+        if self.pad.menu.osk.is_some() && !self.pad_has_typing_screen() {
+            self.pad.menu.osk = None;
+        }
         // The on-screen keyboard takes every button while it is open.
         if let Some(keyboard) = self.pad.menu.osk.as_mut() {
             if let Some(out) = keyboard.button(button) {
@@ -797,7 +856,14 @@ impl Game<'_> {
             }
             return Ok(());
         }
+        // B lets go of a slider, before it means Back or a screen's button.
+        if button == Button::East && self.pad_holding_slider() {
+            self.pad.menu.slider_hold = None;
+            return Ok(());
+        }
         if let Some((action, target)) = self.pad_action_target(button) {
+            // The button may change a slider's value, which the pad's own position doesn't know.
+            self.pad.menu.nudge = None;
             if action == widgets::Action::Exit {
                 self.pad_focus_on(event_loop, target);
                 self.pad.menu.shortcut_focus = Some(target.rect);
@@ -830,13 +896,42 @@ impl Game<'_> {
                 return Ok(());
             }
         }
+        // LT + A on a recipe crafts it into the inventory.
+        if button == Button::South
+            && !prompt
+            && self.pad.edges.is_held(Button::LeftTrigger)
+            && self.screen == Screen::Inventory
+            && self.title.is_none()
+        {
+            self.pad_take_pointer(event_loop);
+            // Refused, the press is plain A's.
+            if let Some(entry) = self.recipe_under_pointer()
+                && self.direct_craft_start(entry)
+            {
+                return Ok(());
+            }
+        }
+        // The book's controls take A alone; X, Y and the throws are for slots and recipes.
+        let book_control = !prompt
+            && self.screen == Screen::Inventory
+            && self.title.is_none()
+            && self.recipe_book_under_pointer();
+        let on_recipe = book_control && self.recipe_under_pointer().is_some();
         match button {
+            Button::West | Button::North if book_control && !on_recipe => {}
+            Button::Select | Button::LeftStick if book_control => {}
             Button::East | Button::Start => return self.pad_back(),
             Button::South if self.pad_focusing() => {
-                let focus = self.pad.menu.focus.expect("focusing");
+                let focus = self.pad_reveal(self.pad.menu.focus.expect("focusing"));
+                self.pad.menu.focus = Some(focus);
                 match focus.kind {
-                    // A click would jump the handle; left/right move it.
-                    Kind::Slider { .. } => {}
+                    // A click would jump the handle: A takes hold of it, or lets it go.
+                    Kind::Slider { .. } => {
+                        let hold =
+                            (!self.pad_holding_slider()).then(|| (self.key_screen(), focus.rect));
+                        self.pad.menu.slider_hold = hold;
+                        self.pad.menu.nudge = None;
+                    }
                     Kind::Field => {
                         self.pad_click_at(event_loop, focus.center(), false);
                         self.pad_open_keyboard();
@@ -851,6 +946,8 @@ impl Game<'_> {
                     }
                 }
             }
+            // A sign has no field to press, so A opens its keyboard from anywhere on it.
+            Button::South if !prompt && self.sign_edit.is_some() => self.pad_open_keyboard(),
             Button::South | Button::West => {
                 self.pad_take_pointer(event_loop);
                 self.pad_pointer_button(event_loop, button == Button::West, true);
@@ -899,6 +996,15 @@ impl Game<'_> {
             // The recipe book open: bumpers turn its pages, triggers change its category.
             Button::LeftBumper | Button::RightBumper if self.pad_recipe_book_showing() => {
                 self.pad_recipe_page(button == Button::RightBumper);
+            }
+            // On the crafting book LT waits for its release, as LT + A crafts there; RT, and
+            // either on a furnace's book, change the category as they go down.
+            Button::LeftTrigger
+                if self.pad_recipe_book_showing()
+                    && self.active_book()
+                        == Some(horizon_client::recipe_book::BookType::Crafting) =>
+            {
+                self.pad.menu.trigger = Some(HeldTrigger { pressed_a: false });
             }
             Button::LeftTrigger | Button::RightTrigger if self.pad_recipe_book_showing() => {
                 self.pad_tab(event_loop, button == Button::RightTrigger);
@@ -1015,9 +1121,7 @@ impl Game<'_> {
             self.pad_take_pointer(event_loop);
             return;
         };
-        if matches!(focus.kind, Kind::Slider { .. })
-            && matches!(button, Button::DPadLeft | Button::DPadRight)
-        {
+        if self.pad_holding_slider() && matches!(button, Button::DPadLeft | Button::DPadRight) {
             let step = gamepad::slider_step(self.pad.menu.repeats);
             let sign = if button == Button::DPadLeft {
                 -1.0
@@ -1027,7 +1131,51 @@ impl Game<'_> {
             self.pad_nudge(event_loop, focus, sign * step);
             return;
         }
+        if self.pad_step_value(event_loop, button, focus) {
+            return;
+        }
         self.pad_focus_move(event_loop, button, focus, targets);
+    }
+
+    /// Left or right on a focused value the screen steps with them (`widgets::steps_value`: the
+    /// settings shell's choices): Right presses it, Left presses it with Shift, the screen's own
+    /// step back. Whether it did; anything else moves the focus.
+    fn pad_step_value(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        button: Button,
+        focus: Target,
+    ) -> bool {
+        if !matches!(button, Button::DPadLeft | Button::DPadRight)
+            || !widgets::last_steps_value(focus.rect)
+        {
+            return false;
+        }
+        let focus = self.pad_reveal(focus);
+        self.pad.menu.focus = Some(focus);
+        // A step, not a press: a radial slot's press opens its list.
+        self.ui.options.pad_clicks_step(true);
+        if button == Button::DPadLeft {
+            self.pad_with_modifier(KeyCode::ShiftLeft, |game| {
+                game.pad_click_at(event_loop, focus.center(), false)
+            });
+        } else {
+            self.pad_click_at(event_loop, focus.center(), false);
+        }
+        self.ui.options.pad_clicks_step(false);
+        true
+    }
+
+    /// Left and right are the focused slider's, after A took hold of it. Until then they move the
+    /// focus, so passing over a slider doesn't change it.
+    fn pad_holding_slider(&self) -> bool {
+        let menu = &self.pad.menu;
+        !menu.keyboard
+            && self.pad_focus_mode()
+            && menu.focus.is_some_and(|focus| {
+                matches!(focus.kind, Kind::Slider { .. })
+                    && menu.slider_hold == Some((self.key_screen(), focus.rect))
+            })
     }
 
     /// Move a focused slider's handle by `by` GUI pixels (one pixel is
@@ -1060,8 +1208,22 @@ impl Game<'_> {
         if self.pad.menu.pending.is_some() {
             return;
         }
+        // Nor while a row scrolled into view: the targets still show it where it was, and a step
+        // from them could land on its neighbour.
+        if reveal_pending(self.pad.menu.revealed, widgets::generation()) {
+            return;
+        }
         let rects: Vec<Rect> = targets.iter().map(|t| t.rect).collect();
         let vertical = matches!(button, Button::DPadUp | Button::DPadDown);
+        // A step the screen declared comes first (`widgets::focus_link`).
+        let linked = vertical
+            .then(|| widgets::linked_step(focus.rect, button == Button::DPadDown))
+            .flatten()
+            .and_then(|to| gamepad::refind(to, &rects, 0.0));
+        if let Some(i) = linked {
+            self.pad_focus_on(event_loop, targets[i]);
+            return;
+        }
         let areas = widgets::last_scroll_areas();
         let step = if vertical {
             gamepad::list_step(focus.rect, button, &rects, &areas)
@@ -1105,7 +1267,26 @@ impl Game<'_> {
         }
     }
 
+    /// `AbstractSelectionList.setSelected`: a settings row the focus lands on, or presses, while
+    /// its list hides part of it scrolls all into view first. Where it is now.
+    fn pad_reveal(&mut self, target: Target) -> Target {
+        if self.screen != Screen::Options {
+            return target;
+        }
+        let size = self.gui_size();
+        let mut moved = target;
+        if let Some(dy) = self.ui.options.reveal(&self.settings, size, target.rect) {
+            moved.rect[1] += dy;
+            self.pad.menu.revealed = Some(widgets::generation());
+        }
+        moved
+    }
+
     fn pad_focus_on(&mut self, event_loop: &dyn EventLoopCtl, target: Target) {
+        if self.screen == Screen::Chat && target.kind != Kind::Field {
+            self.bed_chat_focus(false);
+        }
+        let target = self.pad_reveal(target);
         self.pad.menu.shortcut_focus = None;
         let left = self.pad.menu.focus.replace(target);
         if left.is_some_and(|l| l.rect != target.rect) {
@@ -1193,6 +1374,14 @@ impl Game<'_> {
     /// A bumper: the next or previous tab, wrapping (creative keeps its own
     /// order; other screens register their tabs).
     fn pad_tab(&mut self, event_loop: &dyn EventLoopCtl, next: bool) {
+        // The server list has no tabs: the bumpers move the selected server.
+        if self
+            .title
+            .as_mut()
+            .is_some_and(|title| title.multiplayer_move_selected(next))
+        {
+            return;
+        }
         if self.screen == Screen::Creative && self.title.is_none() {
             self.pad_creative_tab(next);
             return;
@@ -1232,7 +1421,7 @@ impl Game<'_> {
 
     /// An inventory with its recipe book open and nothing over it: the book's tabs are targets
     /// only then (`recipe_book_targets`).
-    fn pad_recipe_book_showing(&self) -> bool {
+    pub(super) fn pad_recipe_book_showing(&self) -> bool {
         self.title.is_none()
             && self.screen == Screen::Inventory
             && self
@@ -1266,6 +1455,9 @@ impl Game<'_> {
     /// follows its widget from frame to frame, and the OS pointer hides
     /// while the pad drives.
     pub(super) fn pad_menu_frame(&mut self, event_loop: &dyn EventLoopCtl) {
+        if self.menu_input_blocked() {
+            return;
+        }
         let now = Instant::now();
         let seconds = self
             .pad
@@ -1285,15 +1477,15 @@ impl Game<'_> {
             menu.repeat = None;
             menu.held = [false; 2];
             menu.focus = None;
-            menu.swapped = false;
-            menu.keyboard_focus = false;
             menu.pending = None;
             menu.stick_scrolled = None;
+            menu.trigger = None;
             menu.anchors = None;
             menu.layout = None;
             menu.nudge = None;
             menu.osk = None;
             menu.osk_dismissed = false;
+            menu.craft = None;
             menu.focus_name = None;
             menu.prompt = None;
             menu.prompt_restart = None;
@@ -1302,6 +1494,12 @@ impl Game<'_> {
             return;
         }
         self.pad.menu.open_polls = self.pad.menu.open_polls.saturating_add(1);
+        self.direct_craft_poll();
+        // Once the focus or the screen moved on from a slider it's let go for good, or coming back
+        // to it would find it still held.
+        if !self.pad_holding_slider() {
+            self.pad.menu.slider_hold = None;
+        }
         // A real mouse move hands the pointer back. The keyboard's focus
         // stays where the next Tab or arrow goes on from.
         if let Some(at) = self.pad.menu.pos
@@ -1312,8 +1510,6 @@ impl Game<'_> {
             if std::mem::take(&mut self.pad.menu.keyboard) {
                 self.pad.menu.origin = focus.map(|t| t.rect);
             }
-            self.pad.in_use = false;
-            self.pad.menu.keyboard_focus = false;
             self.pad_yield_input(event_loop);
         }
         // Focus lands on the menu as it opens when the pad was in use.
@@ -1665,8 +1861,20 @@ impl Game<'_> {
                 }
                 None => {}
             }
-        } else if ready.is_none() {
-            if let Some(focus) = self.pad.menu.focus {
+        } else if ready.is_none()
+            // Two frames on, as after a step that scrolled: the first may predate the scroll.
+            && !reveal_pending(self.pad.menu.revealed, widgets::generation())
+        {
+            // A settings page that says where its focus opens (a radial slot's list on the slot's
+            // action, the slot again after it), once its row is drawn.
+            let opened = (self.screen == Screen::Options)
+                .then(|| self.ui.options.shell_opened_focus())
+                .flatten()
+                .and_then(|rect| gamepad::refind(rect, &rects, 2.0));
+            if let Some(i) = opened {
+                self.ui.options.clear_shell_opened_focus();
+                self.pad.menu.focus = Some(targets[i]);
+            } else if let Some(focus) = self.pad.menu.focus {
                 let kind = std::mem::discriminant(&focus.kind);
                 let named = self.pad_named_focus(focus, &rects);
                 let followed = stick_scrolled.and_then(|s| {
@@ -1750,7 +1958,9 @@ impl Game<'_> {
     }
 
     fn pad_show_os_pointer(&mut self, show: bool) {
-        if self.pad.menu.os_hidden != show {
+        // While the game's grab is internal the system pointer stays as it is; the first poll
+        // after shows or hides it.
+        if self.pad.menu.os_hidden != show || self.internal_grab() {
             return;
         }
         self.pad.menu.os_hidden = !show;
@@ -1778,8 +1988,11 @@ impl Game<'_> {
         serde_json::json!({
             "mode": if self.pad_focus_mode() { "focus" } else { "pointer" },
             "focus": self.pad.menu.focus.as_ref().map(target),
+            "holding_slider": self.pad_holding_slider(),
             "pointer": self.pad.menu.pos.map(|_| self.cursor),
             "keyboard": self.pad.menu.osk.is_some(),
+            "crafting": self.pad.menu.craft.is_some(),
+            "craft_hint": self.direct_craft_usable(),
             "targets": self.pad_targets().iter().map(target).collect::<Vec<_>>(),
             "actions": self.pad_actions_status(),
             "glyphs": self.pad_glyphs_status(),
@@ -1807,6 +2020,7 @@ impl Game<'_> {
         self.pad.menu.stick = None;
         self.pad.menu.wheel = [0.0; 2];
         self.pad.menu.moving = false;
+        self.pad.menu.trigger = None;
         self.pad.menu.glide = None;
         self.pad.menu.gesture = None;
         self.pad.menu.pending = None;
@@ -1831,8 +2045,8 @@ impl Game<'_> {
     /// button being bound, the credits, the on-screen keyboard.
     fn key_focus_blocked(&self) -> bool {
         let playing_screen = |screen| self.title.is_none() && self.screen == screen;
-        self.pad.menu.osk.is_some()
-            || playing_screen(Screen::Chat)
+        self.pad_keyboard_captures()
+            || (playing_screen(Screen::Chat) && self.chat_text_focused())
             || self.sign_edit.is_some()
             || matches!(self.book, Some(super::books::BookScreen::Edit { .. }))
             || (playing_screen(Screen::Creative) && self.creative_screen.tab().search)
@@ -1896,7 +2110,11 @@ impl Game<'_> {
         }
         let ctx = key_focus::Context {
             slider_edit,
-            typing: self.edit_box_focused(),
+            typing: if self.screen == Screen::Chat && self.title.is_none() {
+                self.chat_text_focused()
+            } else {
+                self.edit_box_focused()
+            },
             rows_take_enter: self.title.as_ref().is_some_and(|t| t.list_focused()),
             gui: self.gui_size(),
         };
@@ -1922,9 +2140,13 @@ impl Game<'_> {
                 self.pad.menu.slider_edit = key_focus::slider_edit_on_focus(nav);
             }
             (Act::Step(button), Some(focus)) => {
-                self.pad_focus_move(event_loop, button, focus, &targets);
+                if !self.pad_step_value(event_loop, button, focus) {
+                    self.pad_focus_move(event_loop, button, focus, &targets);
+                }
             }
             (Act::Press, Some(focus)) => {
+                let focus = self.pad_reveal(focus);
+                self.pad.menu.focus = Some(focus);
                 // AbstractButton.keyPressed: onPress, with its click sound.
                 self.pad_click_at(event_loop, focus.center(), false);
             }
@@ -2040,8 +2262,10 @@ impl Game<'_> {
             return;
         }
         let takeover = match event {
+            // Not while the pad holds the radial menu open: as for raw mouse motion in play
+            // (`device_event`), a cursor that moved is a bumped mouse.
             WindowEvent::CursorMoved { position, .. } => {
-                self.pad.menu.real_pointer != Some(*position)
+                self.pad.menu.real_pointer != Some(*position) && !self.pad_radial_captures()
             }
             WindowEvent::KeyboardInput { event, .. } => event.state == ElementState::Pressed,
             WindowEvent::MouseInput { state, .. } => *state == ElementState::Pressed,
@@ -2146,15 +2370,15 @@ impl Game<'_> {
     /// A text field anywhere has focus: `pad_typing`'s, a title screen's (a server's name and address, a
     /// world's name, the world search), or an options page's search box (the language page's included).
     pub(super) fn field_focused(&mut self) -> bool {
-        let title_field = self
-            .title
-            .as_mut()
-            .is_some_and(|t| t.focused_field().is_some());
-        self.dialog_text_focused()
-            || (!self.dialog_open()
-                && (title_field
-                    || self.pad_typing()
-                    || (self.screen == Screen::Options && self.ui.options.typing())))
+        if self.dialog_open() {
+            return self.dialog_text_focused();
+        }
+        // Use the same focus inventory as IME commits, including upstream's
+        // caret-based title fields, social search and block/debug editors.
+        self.text_field_focused()
+            // Keep the explicit mobile keyboard button available on the bed
+            // screen even before the player chooses its chat field.
+            || (self.title.is_none() && self.screen == Screen::Chat && self.ui.in_bed_chat)
     }
 
     /// The focused field's box (GUI pixels), where the screen can say: a title screen's field or an options
@@ -2173,13 +2397,25 @@ impl Game<'_> {
     /// while a touch is being handled) is otherwise never repeated, as `sync_system_keyboard` only asks on a
     /// change. The touch controls' keyboard button, when the keyboard is down.
     pub(super) fn show_system_keyboard(&mut self) {
+        if self.menu_input_blocked() {
+            return;
+        }
+        self.bed_chat_focus(true);
         self.pad.menu.osk = None;
         self.pad.menu.system_keyboard = true;
         self.pad.menu.system_keyboard_hidden = false;
-        log::info!("Horizon: the keyboard button asked for the system keyboard");
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
             window.set_ime_allowed(true);
+        }
+    }
+
+    /// Hide IME for a loading overlay without treating it as the player's
+    /// explicit hide preference; the focused field may reopen it afterwards.
+    pub(super) fn suspend_system_keyboard(&mut self) {
+        self.pad.menu.system_keyboard = false;
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(false);
         }
     }
 
@@ -2191,7 +2427,6 @@ impl Game<'_> {
         }
         self.pad.menu.system_keyboard = false;
         self.pad.menu.system_keyboard_hidden = true;
-        log::info!("Horizon: the system keyboard was put away");
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
@@ -2221,30 +2456,31 @@ impl Game<'_> {
     /// A player who put it away keeps it away until the focus moves. winit types its keys into the window as
     /// `KeyboardInput`, which the fields already read.
     pub(super) fn sync_system_keyboard(&mut self) {
-        let focused = self.field_focused();
+        let focused =
+            self.field_focused() && (self.screen != Screen::Chat || self.chat_text_focused());
         if !focused {
             // The next field to take the focus asks for the keyboard again.
             self.pad.menu.system_keyboard_hidden = false;
         }
         let want = cfg!(target_os = "ios")
+            && !self.menu_input_blocked()
             && focused
             && self.pad.menu.osk.is_none()
             && !self.pad.menu.system_keyboard_hidden;
         if want != self.pad.menu.system_keyboard {
             self.pad.menu.system_keyboard = want;
-            log::info!("Horizon: system keyboard {want} (a text field focused: {focused})");
             if let Some(window) = &self.window {
                 window.set_ime_allowed(want);
             }
         }
     }
 
-    /// A text field has keyboard focus: chat, a sign, a book being written,
+    /// A text field has keyboard focus: chat, a command block, a sign, a book being written,
     /// a search box, the anvil's name, the title screens' and the options'
     /// fields, the LAN port, a dialog's input, the command box and the edit
     /// screens of the jigsaw, structure and test blocks.
     fn pad_typing(&self) -> bool {
-        (self.screen == Screen::Chat && self.title.is_none())
+        (matches!(self.screen, Screen::Chat | Screen::CommandBlock) && self.title.is_none())
             || self.sign_edit.is_some()
             || matches!(self.book, Some(super::books::BookScreen::Edit { .. }))
             || (self.screen == Screen::Creative && self.creative_screen.tab().search)
@@ -2255,6 +2491,23 @@ impl Game<'_> {
             || matches!(
                 self.screen,
                 Screen::CommandBlock | Screen::BlockEditor | Screen::Social | Screen::DebugOptions
+            )
+    }
+
+    /// Whether the screen under the keyboard can still be typed in.
+    fn pad_has_typing_screen(&self) -> bool {
+        self.pad_typing()
+            || self.title.is_some()
+            || matches!(self.screen, Screen::Options | Screen::WorldOptions)
+    }
+
+    /// Enter on these goes on to a new line: a dialog's, a sign's or a book's page.
+    fn pad_enter_keeps_typing(&self) -> bool {
+        self.dialog_typing_lines()
+            || self.sign_edit.is_some()
+            || matches!(
+                self.book,
+                Some(super::books::BookScreen::Edit { signing: false, .. })
             )
     }
 
@@ -2300,6 +2553,9 @@ impl Game<'_> {
     /// What a key of the on-screen keyboard does: the same as a typed key in
     /// the field that has focus.
     fn pad_osk_output(&mut self, out: osk::Output) {
+        if self.menu_input_blocked() {
+            return;
+        }
         use osk::Output;
         let (key, text) = match &out {
             Output::Text(t) => (None, Some(t.as_str())),
@@ -2332,6 +2588,11 @@ impl Game<'_> {
                 Some(t) => self.chat_type(t),
                 None => self.chat_key_code(key.expect("a key"), None),
             }
+        } else if self.screen == Screen::CommandBlock && self.title.is_none() {
+            match text {
+                Some(t) => self.command_block_type(t),
+                None => self.command_block_key_code(key.expect("a key"), None, None),
+            }
         } else if self.sign_edit.is_some() {
             self.sign_input(key, text);
         } else if self.book.is_some() {
@@ -2357,12 +2618,6 @@ impl Game<'_> {
         } else if self.screen == Screen::WorldOptions {
             if key != Some(KeyCode::Enter) {
                 self.world_options_text(text);
-            }
-        } else if self.screen == Screen::CommandBlock {
-            // Enter is its Done, as on the keyboard.
-            match text {
-                Some(t) => self.command_block_type(t),
-                None => self.command_block_key_code(key.expect("a key"), None, None),
             }
         } else if self.screen == Screen::BlockEditor {
             match text {
@@ -2403,12 +2658,10 @@ impl Game<'_> {
                 _ => self.title_edit(text, false),
             }
         }
-        // Enter ends the typing, but for a dialog's new line; a field that
-        // closed with it closes the keyboard.
-        if (key == Some(KeyCode::Enter) && !self.dialog_typing_lines())
-            || (!self.pad_typing()
-                && self.title.is_none()
-                && !matches!(self.screen, Screen::Options | Screen::WorldOptions))
+        // Enter ends the typing, but for a new line; a field that closed with it closes the
+        // keyboard.
+        if (key == Some(KeyCode::Enter) && !self.pad_enter_keeps_typing())
+            || !self.pad_has_typing_screen()
         {
             self.pad.menu.osk = None;
         }
@@ -2433,7 +2686,7 @@ impl Game<'_> {
                 || self.screen == Screen::Chat;
             let mut ui = horizon_client::ui_theme::Ui::new(&self.gui.atlas, batch, self.cursor);
             let options = &self.ui.options;
-            keyboard.draw(&mut ui, at_top, options.pad_style, options.pad_by_letter);
+            keyboard.draw(&mut ui, at_top, options.pad_glyphs);
             ui.finish();
             return;
         }
@@ -2473,6 +2726,10 @@ impl Game<'_> {
     /// `EditBox`'s highlighted border).
     fn draw_pad_focus(&self, batch: &mut HudBatch, focus: Target) {
         key_focus::draw_outline(&self.gui.atlas, batch, focus);
+        // A slider in hand shows it: left and right do something else on one that isn't.
+        if self.pad_holding_slider() {
+            key_focus::draw_white_outline(&self.gui.atlas, batch, focus.rect);
+        }
     }
 }
 
@@ -2588,6 +2845,15 @@ mod tests {
         let kind = Kind::Button;
         let focus = Some(Target { rect, kind });
         assert_eq!(armed_click(Some(rect), focus), Some((60.0, 30.0)));
+        let refound = Some(Target {
+            rect: [10.0, 20.000_002, 100.0, 20.0],
+            kind,
+        });
+        assert!(armed_click(Some(rect), refound).is_some());
+        // A row scrolled into view at frame 10 is looked for again from frame 12.
+        assert!(!reveal_pending(None, 10));
+        assert!(reveal_pending(Some(10), 10) && reveal_pending(Some(10), 11));
+        assert!(!reveal_pending(Some(10), 12));
         let moved = Some(Target {
             rect: [10.0, 44.0, 100.0, 20.0],
             kind,

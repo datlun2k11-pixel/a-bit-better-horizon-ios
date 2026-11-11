@@ -101,6 +101,43 @@ fn a_scaled_picture_fills_the_whole_window() {
     );
 }
 
+#[test]
+fn a_scaled_pack_without_final_uses_no_unused_final_target() {
+    let instance = crate::gfx::test_gpu::instance();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        return;
+    };
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_limits: adapter.limits(),
+        ..Default::default()
+    })) else {
+        return;
+    };
+    eprintln!("scaled no-final adapter: {:?}", adapter.get_info());
+    let picture = [4, 2];
+    let window = [8, 4];
+    let colour = texture(&device, picture, T::Rgba8Unorm);
+    let depth = texture(&device, picture, T::Depth32Float);
+    clear(&device, &queue, &colour, &depth, [32, 64, 16, 255], 0.25);
+    let mut post = pack(&device, &queue, &adapter, &colour, false);
+    let hud = HudBatch::new(window);
+    let pixels = render(
+        &device,
+        &queue,
+        &mut post,
+        &colour,
+        &depth,
+        &frame(&hud),
+        picture,
+        window,
+    );
+    assert!(pixels.iter().all(|p| *p == [32, 64, 16, 255]));
+    assert!(
+        post.targets.as_ref().unwrap().final_color.is_none(),
+        "without a final shader, directly present colortex0 instead of allocating an unused full-size image"
+    );
+}
+
 fn replacement(change: Change, final_shader: bool) {
     let instance = crate::gfx::test_gpu::instance();
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
@@ -304,6 +341,7 @@ fn pack_with(
             weather: false,
             hand: false,
         },
+        &Default::default(),
     )
     .expect("the pack runs");
     assert!(post.notes.is_empty(), "{:?}", post.notes);
@@ -321,6 +359,7 @@ fn render(
     size: [u32; 2],
     window: [u32; 2],
 ) -> Vec<[u8; 4]> {
+    super::wait_resize(post, device, queue, size);
     let screen = texture(device, window, T::Rgba8Unorm);
     let stride = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let read = device.create_buffer(&wgpu::BufferDescriptor {
@@ -330,19 +369,23 @@ fn render(
         mapped_at_creation: false,
     });
     let mut encoder = device.create_command_encoder(&Default::default());
-    post.run(
-        device,
-        queue,
-        &mut encoder,
-        colour,
-        depth,
-        &screen,
-        frame,
-        &Default::default(),
-        size,
-        window,
-        &[],
-        &mut |_, _, _, _| {},
+    assert_eq!(
+        post.run(
+            device,
+            queue,
+            &mut encoder,
+            colour,
+            depth,
+            &screen,
+            frame,
+            &Default::default(),
+            size,
+            window,
+            &[],
+            &mut |_, _, _, _| {},
+        )
+        .unwrap(),
+        ResizeState::Ready
     );
     encoder.copy_texture_to_buffer(
         screen.texture().as_image_copy(),
@@ -400,6 +443,7 @@ fn frame(hud: &HudBatch) -> Frame<'_> {
         skybox: false,
         end_sky: false,
         end_sky_sprite: None,
+        boss_world_fog: false,
         environment_fog: None,
         water_fog: [0.0; 3],
         fog: None,

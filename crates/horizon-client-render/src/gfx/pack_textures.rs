@@ -119,17 +119,19 @@ pub(super) fn find(textures: &[PackTexture], group: Group, ty: &str, name: &str)
         wgpu::TextureViewDimension::D2
     };
     let buffer = horizon_shaders::buffer_index(name);
-    let staged = textures.iter().position(|t| {
-        t.stage == stage(group)
-            && t.dimension == dimension
-            && (t.name == name
-                || buffer.is_some() && horizon_shaders::buffer_index(&t.name) == buffer)
-    });
-    staged.or_else(|| {
-        textures.iter().position(|t| {
-            t.stage == horizon_shaders::EVERY_STAGE && t.dimension == dimension && t.name == name
+    textures
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            (t.stage == horizon_shaders::EVERY_STAGE || t.stage == stage(group))
+                && t.dimension == dimension
+                && (t.name == name
+                    || t.stage != horizon_shaders::EVERY_STAGE
+                        && buffer.is_some()
+                        && horizon_shaders::buffer_index(&t.name) == buffer)
         })
-    })
+        .min_by_key(|(_, t)| t.stage == horizon_shaders::EVERY_STAGE)
+        .map(|(index, _)| index)
 }
 
 /// The `shaders.properties` key a texture came from, for notes.
@@ -144,7 +146,10 @@ fn key(stage: &str, name: &str) -> String {
 pub(super) fn noise(textures: &[PackTexture]) -> Option<&wgpu::TextureView> {
     textures
         .iter()
-        .find(|t| t.stage == "noise" && t.dimension == wgpu::TextureViewDimension::D2)
+        .find(|t| {
+            (t.stage == "noise" || t.stage == horizon_shaders::EVERY_STAGE && t.name == "noisetex")
+                && t.dimension == wgpu::TextureViewDimension::D2
+        })
         .and_then(|t| match &t.image {
             Image::View(v) => Some(v),
             _ => None,
@@ -227,7 +232,6 @@ fn create(
     features: wgpu::Features,
 ) -> Result<(wgpu::TextureView, wgpu::TextureSampleType), String> {
     let format = format(texture);
-    let bytes = bytes(texture, format);
     let [width, height, depth] = texture.size;
     let limits = device.limits();
     let largest = match texture.dim {
@@ -240,8 +244,19 @@ fn create(
             "{width}x{height}x{depth} is larger than this device's {largest}"
         ));
     }
-    let row = width * format.block_copy_size(None).unwrap_or(4);
-    if bytes.len() as u64 != u64::from(row) * u64::from(height) * u64::from(depth) {
+    let row = width
+        .checked_mul(format.block_copy_size(None).unwrap_or(4))
+        .ok_or("texture row overflow")?;
+    let byte_len = u64::from(row)
+        .checked_mul(u64::from(height))
+        .and_then(|n| n.checked_mul(u64::from(depth)))
+        .filter(|&n| n <= 256 << 20)
+        .ok_or("custom texture exceeds memory limit")?;
+    if width == 0 || height == 0 || depth == 0 {
+        return Err("empty custom texture".into());
+    }
+    let bytes = bytes(texture, format);
+    if bytes.len() as u64 != byte_len {
         return Err(format!(
             "{} bytes of texels for {width}x{height}x{depth}",
             bytes.len()
@@ -311,6 +326,23 @@ mod tests {
             clamp: false,
             raw: true,
         }
+    }
+
+    #[test]
+    fn stage_texture_overrides_custom_texture_default() {
+        use wgpu::TextureViewDimension as D;
+        let textures = [
+            lightmap("*", "colortex4", D::D2),
+            lightmap("composite", "gaux1", D::D2),
+        ];
+        assert_eq!(
+            find(&textures, Group::Final, "sampler2D", "colortex4"),
+            Some(1)
+        );
+        assert_eq!(
+            find(&textures, Group::Prepare, "sampler2D", "colortex4"),
+            Some(0)
+        );
     }
 
     #[test]

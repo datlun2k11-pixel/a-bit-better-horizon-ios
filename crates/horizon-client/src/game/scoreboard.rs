@@ -149,9 +149,6 @@ impl Game<'_> {
         }
         self.score.storage =
             horizon_client::command_storage::CommandStorage::load(&self.world_root);
-        // ServerLevel.getWorldBorder: the level in place reads its own file; the other levels
-        // read theirs when they are opened (`open_level`).
-        self.border = self.load_border(self.dim);
         self.score.stopwatches = horizon_client::stopwatches::Stopwatches::load(&self.world_root);
         self.sync_score_registries();
     }
@@ -221,6 +218,7 @@ impl Game<'_> {
             | Target::Crystal(id)
             | Target::Dragon(id)
             | Target::Tnt(id)
+            | Target::Cushion(id)
             | Target::Falling(id)
             | Target::Rocket(id)
             | Target::Trident(id)
@@ -233,13 +231,17 @@ impl Game<'_> {
                 .iter()
                 .find(|s| s.id == id)
                 .map(|s| uuid_text(s.uuid)),
-            // Orbs and projectiles have no UUID here.
-            Target::Orb(_) | Target::Projectile(_) => None,
+            // An orb's registered identity, as its saved UUID reads.
+            Target::Orb(id) => Some(uuid_text(self.uuid_for(id))),
+            // Projectiles have no UUID here.
+            Target::Projectile(_) => None,
+            // The UUID the tie gave the knot (game/leads.rs `tie_knot`).
+            Target::Knot(id) => self.persist.uuids.get(&id).map(|&u| uuid_text(u)),
         }
     }
     fn holder_for(&mut self, t: Target) -> Option<Holder> {
         let name = self.holder_name(t)?;
-        let shown = self.target_name(t);
+        let shown = feedback_name(self.target_name(t), &name);
         Some(Holder {
             display: Some(literal(&shown.plain())),
             text: shown,
@@ -265,6 +267,7 @@ impl Game<'_> {
             | Target::Boat(id)
             | Target::Cart(id)
             | Target::Tnt(id)
+            | Target::Cushion(id)
             | Target::Orb(id)
             | Target::Projectile(id)
             | Target::Crystal(id)
@@ -287,6 +290,8 @@ impl Game<'_> {
                 .iter()
                 .find(|f| f.id == id)
                 .and_then(|f| f.saved.as_ref().map(|s| &s.1)),
+            // A natural knot keeps no saved compound: it has no tags.
+            Target::Knot(_) => None,
         };
         match raw.and_then(|r| r.get("Tags")) {
             Some(Tag::List(l)) => l
@@ -548,13 +553,6 @@ impl Game<'_> {
             }
         }
     }
-    /// `Scoreboard.entityRemoved`: a dead non-player entity leaves the board.
-    pub(super) fn score_entity_removed(&mut self, id: u32) {
-        let Some(uuid) = self.persist.uuids.get(&id).copied() else {
-            return;
-        };
-        self.score.board.entity_removed(&uuid_text(uuid));
-    }
 
     // ---- teams in gameplay -----------------------------------------------------
 
@@ -589,6 +587,11 @@ impl Game<'_> {
         id: u32,
         owner: impl FnOnce() -> Option<[i32; 4]>,
     ) -> Option<&sb::Team> {
+        if let Some(remote) = &self.remote
+            && let Some(team) = remote.entity_team(&self.score.board, id)
+        {
+            return Some(team);
+        }
         let uuid = *self.persist.uuids.get(&id)?;
         let own = self.scoreboard_name(id, uuid);
         if let Some(team) = self.score.board.players_team(&own) {
@@ -619,7 +622,11 @@ impl Game<'_> {
         })
     }
     pub(super) fn player_team(&self) -> Option<&sb::Team> {
-        self.score.board.players_team(self.acting_player_name())
+        let name = self.remote.as_ref().map_or_else(
+            || self.acting_player_name(),
+            |remote| remote.profile_name.as_str(),
+        );
+        self.score.board.players_team(name)
     }
     /// The teams of the player and of the mobs on one (empty without teams).
     pub(super) fn mob_teams(&self) -> horizon_client::mobs::Teams<'_> {
@@ -741,7 +748,7 @@ impl Game<'_> {
             other => other,
         }
     }
-    fn resolve_selector_text(&mut self, raw: &str) -> String {
+    pub(super) fn resolve_selector_text(&mut self, raw: &str) -> String {
         let mut reader = horizon_client::command::Reader::new(raw);
         let ty = horizon_client::command::args::ArgType::Entity {
             single: false,
@@ -825,16 +832,15 @@ impl Game<'_> {
         for (location, rgba) in ready {
             self.store_skin(location, rgba);
         }
-        self.cosmetics_frame();
+        self.client_hooks_frame();
     }
     /// `Hud.extractTabList`: the player list while the player-list key is
     /// held. A local world shows it with a joined LAN guest or a `list`
     /// objective.
     pub(super) fn draw_tab_list(&mut self, batch: &mut HudBatch) {
         use horizon_client::tab_list::{self, TabInputs};
-        // Player heads and the player list both draw from the same skin
-        // slots: a new frame, with what the last one drew.
-        self.flush_skin_slots();
+        // Skin preparation ran before the frame's optional HUD widgets.
+        // This layer may be cancelled without stopping NPC skin progress.
         let key = self.screen == super::Screen::Playing && self.keys.held(Action::Playerlist);
         let count = self.remote.as_ref().map_or_else(
             || {
@@ -902,9 +908,12 @@ impl Game<'_> {
         let board = &self.score.board;
         let objective = board.display_objective(sb::SLOT_LIST);
         let up = |id: u128| upside_down.contains(&id);
-        // Horizon's mark before the names of Horizon players (the cosmetics service's cache).
-        let horizon = self.horizon_players(players.iter().map(|p| p.uuid));
-        let marked = |id: u128| horizon.contains(&id);
+        // A hook's mark before a name (Horizon's: they play Horizon).
+        debug_assert!(
+            self.serving.is_none(),
+            "a server thread calls no client hook"
+        );
+        let marked = horizon_hooks::engine::player_mark;
         let inputs = TabInputs {
             players: &players,
             board,
@@ -918,7 +927,7 @@ impl Game<'_> {
                 f64::from(self.settings.text_background_opacity),
             ),
             upside_down: &up,
-            horizon: &marked,
+            mark: &marked,
         };
         let draws = self.tab_list.layout(&inputs, &self.gui.atlas.font);
         horizon_client::hud_layout::paint(batch, &self.gui.atlas, &draws);
@@ -954,6 +963,20 @@ pub(super) fn local_tab_players(me: TabPlayer, guests: &[Guest]) -> Vec<TabPlaye
         player
     }));
     players
+}
+
+/// `ScoreHolder.getFeedbackDisplayName`: the holder's display name with its
+/// hover replaced by `HoverEvent.ShowText` of its scoreboard name (a player's
+/// name, an entity's UUID string); the insertion stays.
+fn feedback_name(display: Text, scoreboard_name: &str) -> Text {
+    let mut component = display.component();
+    if let serde_json::Value::Object(o) = &mut component {
+        o.insert(
+            "hover_event".into(),
+            serde_json::json!({"action": "show_text", "value": scoreboard_name}),
+        );
+    }
+    display.with_component(component)
 }
 
 /// The commands' view of the game.
@@ -996,7 +1019,7 @@ impl Env for GameEnv<'_, '_> {
             Target::Mob(id) | Target::Item(id) => uuid_text(self.g.uuid_for(id)),
             _ => return None,
         };
-        let text = self.g.target_name(entity);
+        let text = feedback_name(self.g.target_name(entity), &name);
         Some((
             Holder {
                 display: Some(literal(&text.plain())),
@@ -1106,6 +1129,26 @@ mod tab_list_tests {
 #[cfg(test)]
 mod team_tests {
     use super::*;
+    /// #14279: `ScoreHolder.getFeedbackDisplayName` keeps the display name and
+    /// its insertion, and shows the scoreboard name (an entity's UUID) on hover.
+    #[test]
+    fn a_feedback_name_shows_the_scoreboard_name_on_hover() {
+        let uuid = "00000001-0000-0002-0000-000300000004";
+        let display = Text::translate("entity.minecraft.pig", &[]).with_component_fields(vec![
+            (
+                "hover_event".into(),
+                serde_json::json!({"action": "show_entity", "id": "minecraft:pig", "uuid": uuid}),
+            ),
+            ("insertion".into(), uuid.into()),
+        ]);
+        let c = feedback_name(display, uuid).component();
+        assert_eq!(c["translate"], "entity.minecraft.pig");
+        assert_eq!(c["insertion"], uuid);
+        assert_eq!(
+            c["hover_event"],
+            serde_json::json!({"action": "show_text", "value": uuid})
+        );
+    }
 
     const WOLF: [i32; 4] = [1, 2, 3, 4];
     const CAT: [i32; 4] = [5, 6, 7, 8];

@@ -43,7 +43,7 @@ fn selectors_reject_criteria_absent_from_the_selected_definition() {
     ));
     std::fs::create_dir_all(&scratch).unwrap();
     game.world_root = scratch.clone();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(10.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(10.5, 64.0, 0.5)).unwrap());
 
     const ROOT: &str = "minecraft:story/root";
     let tree = game.advancement_tree();

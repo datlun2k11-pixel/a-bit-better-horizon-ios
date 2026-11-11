@@ -47,6 +47,13 @@ impl Game<'_> {
             .as_ref()
             .is_some_and(|t| t.contains(id))
     }
+    /// Whether `entity_type_exists` has a registry to answer from.
+    pub(super) fn entity_types_loaded(&self) -> bool {
+        self.spawners
+            .entity_types
+            .as_ref()
+            .is_some_and(|t| !t.is_empty())
+    }
     pub(super) fn load_entity_types(&mut self) {
         if self.spawners.entity_types.is_some() {
             return;
@@ -113,6 +120,13 @@ impl Game<'_> {
         if !self.alive_player_near(at[0], at[1], at[2], range)
             || !self.ui.rules.bool("spawner_blocks_work")
         {
+            return Ok(());
+        }
+        // While its delay counts down, `serverTick` only takes one off it: no
+        // level, random or event (a server with hundreds of dungeons near its
+        // players built the level for every one of them, every tick).
+        if spawner.spawn_delay > 0 {
+            spawner.spawn_delay -= 1;
             return Ok(());
         }
         let pos = [key.0, key.1, key.2];
@@ -550,7 +564,7 @@ impl Game<'_> {
                     out,
                 );
             }
-            horizon_client::mobs::render::render_posed(
+            let items = horizon_client::mobs::render::render_posed(
                 mob,
                 alpha as f32,
                 origin,
@@ -559,6 +573,63 @@ impl Game<'_> {
                 self.res.mob_data(),
                 out,
             );
+            for item in items {
+                self.mark_rendered_item(item.start, item.end, &item.item);
+            }
+        }
+    }
+}
+
+/// Menu inventories also live in block_entities under synthetic keys. They
+/// can span the full i32 range relative to the player; subtracting first can
+/// overflow before the scan even discovers that the entry is not a spawner.
+fn within_client_tick_range(pos: Pos, center: [i32; 3]) -> bool {
+    pos.0.abs_diff(center[0]) <= 64
+        && pos.1.abs_diff(center[1]) <= 64
+        && pos.2.abs_diff(center[2]) <= 64
+}
+
+#[cfg(test)]
+mod client_tick_range_tests {
+    use super::within_client_tick_range;
+
+    #[test]
+    fn menu_storage_keys_are_outside_the_client_tick_range() {
+        for center in [
+            [3, 68, 8],
+            [-3, 68, -8],
+            [0, 0, 0],
+            [30_000_000, 64, 30_000_000],
+            [-30_000_000, 64, -30_000_000],
+        ] {
+            assert!(!within_client_tick_range((i32::MIN, 0, 0), center));
+            assert!(!within_client_tick_range(
+                (i32::MAX - 15, -100_000, 42),
+                center
+            ));
+        }
+    }
+
+    #[test]
+    fn range_includes_64_blocks_in_each_direction_without_wrapping() {
+        let center = [4, 70, -8];
+        for axis in 0..3 {
+            for delta in [-65, -64, 64, 65] {
+                let mut pos = center;
+                pos[axis] += delta;
+                assert_eq!(
+                    within_client_tick_range((pos[0], pos[1], pos[2]), center),
+                    delta.abs() <= 64
+                );
+            }
+            let mut pos = [0; 3];
+            let mut extreme_center = [0; 3];
+            pos[axis] = i32::MIN;
+            extreme_center[axis] = i32::MAX;
+            assert!(!within_client_tick_range(
+                (pos[0], pos[1], pos[2]),
+                extreme_center
+            ));
         }
     }
 }
@@ -566,7 +637,7 @@ impl Game<'_> {
 /// `SpawnerBlockEntity.clientTick` / `BaseSpawner.clientTick`: spawner, trial
 /// spawner and vault keys within 64 blocks (Chebyshev distance) of `center`
 /// among `entities`. Non-spawner block entities are ignored before distance
-/// calculation, and coordinate difference uses `abs_diff` to prevent overflow.
+/// calculation, and the shared range predicate widens differences to prevent overflow.
 pub(super) fn nearby_remote_spawner_keys<'a>(
     entities: impl IntoIterator<Item = (&'a Pos, &'a BlockEntity)>,
     center: [i32; 3],
@@ -581,12 +652,7 @@ pub(super) fn nearby_remote_spawner_keys<'a>(
             BlockEntity::Vault(_) => &mut vault_keys,
             _ => continue,
         };
-        let d = pos
-            .0
-            .abs_diff(center[0])
-            .max(pos.1.abs_diff(center[1]))
-            .max(pos.2.abs_diff(center[2]));
-        if d <= 64 {
+        if within_client_tick_range(pos, center) {
             target.push(pos);
         }
     }
@@ -596,6 +662,47 @@ pub(super) fn nearby_remote_spawner_keys<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BaseSpawner.serverTick` with a player in range: a running delay only
+    /// goes down by one a tick, drawing nothing from the level random and
+    /// adding no mob. At 0 the spawn runs: with nothing to spawn it calls
+    /// `delay`, which draws the next delay in [MinSpawnDelay, MaxSpawnDelay).
+    #[test]
+    #[ignore = "needs prepared resources (HORIZON_TEST_RESOURCES)"]
+    fn a_running_delay_counts_down_without_drawing() {
+        let mut game = super::super::native_machines::tests::server_game();
+        game.player = Some(
+            horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::new(8.5, 64.0, 8.5))
+                .unwrap(),
+        );
+        let key = (8, 64, 12);
+        let spawner = Spawner {
+            spawn_delay: 3,
+            ..Spawner::default()
+        };
+        game.world
+            .block_entities
+            .put(key, BlockEntity::Spawner(Box::new(spawner)));
+        let delay = |game: &Game<'_>| match game.world.block_entities.get(&key) {
+            Some(BlockEntity::Spawner(s)) => s.spawn_delay,
+            _ => panic!("the spawner is gone"),
+        };
+        for expected in [2, 1, 0] {
+            let mut before = game.world.random.clone();
+            game.tick_spawner(key).unwrap();
+            assert_eq!(delay(&game), expected);
+            assert_eq!(
+                game.world.random.next_long(),
+                before.next_long(),
+                "no draw at delay {expected}"
+            );
+            assert!(game.mobs.is_empty());
+        }
+        let mut before = game.world.random.clone();
+        game.tick_spawner(key).unwrap();
+        assert!((200..800).contains(&delay(&game)), "{}", delay(&game));
+        assert_ne!(game.world.random.next_long(), before.next_long());
+    }
 
     #[test]
     fn dummy_container_at_min_coordinate_does_not_panic_or_tick() {

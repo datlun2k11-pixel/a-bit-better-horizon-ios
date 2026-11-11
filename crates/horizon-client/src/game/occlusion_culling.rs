@@ -16,7 +16,7 @@ use std::{
     cell::{Cell, RefCell},
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::JoinHandle,
@@ -725,11 +725,12 @@ impl PlaneWorkerScratch {
 /// chunks and rendered sections are revalidated. Fail-open visible results
 /// survive camera movement because they can only reduce culling.
 pub(super) struct AsyncOcclusionCuller {
-    jobs: SyncSender<CullJob>,
-    _ray_thread: JoinHandle<()>,
+    jobs: Option<SyncSender<CullJob>>,
+    ray_thread: Option<JoinHandle<()>>,
     results_rx: Receiver<CullResults>,
-    _thread: JoinHandle<()>,
+    plane_thread: Option<JoinHandle<()>>,
     job_generation: Arc<AtomicU64>,
+    stopping: Arc<AtomicBool>,
     snapshot: Option<(SnapshotKey, ChunkBounds, Arc<OcclusionSnapshot>)>,
     snapshot_epoch: u64,
     opaque_states: Option<Arc<[bool]>>,
@@ -810,11 +811,17 @@ impl AsyncOcclusionCuller {
         let job_generation = Arc::new(AtomicU64::new(0));
         let worker_generation = Arc::clone(&job_generation);
         let plane_generation = Arc::clone(&job_generation);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let ray_stopping = Arc::clone(&stopping);
+        let plane_stopping = Arc::clone(&stopping);
         let thread = std::thread::Builder::new()
             .name("world-occlusion-culling".into())
             .spawn(move || {
                 let mut scratch = PlaneWorkerScratch::default();
                 while let Ok(job) = plane_rx.recv() {
+                    if plane_stopping.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if result_tx
                         .send(cull_job(job, &plane_generation, &mut scratch))
                         .is_err()
@@ -829,18 +836,36 @@ impl AsyncOcclusionCuller {
             .spawn(move || {
                 let mut scratch = RayWorkerScratch::default();
                 while let Ok(mut job) = job_rx.recv() {
+                    if ray_stopping.load(Ordering::Relaxed) {
+                        break;
+                    }
                     filter_rays(&mut job, &worker_generation, &mut scratch);
+                    if ray_stopping.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if ray_plane_tx.send(job).is_err() {
                         break;
                     }
                 }
-            })?;
+            });
+        // If the second spawn fails, wake and join the already-started idle plane worker.
+        // No work has been submitted, so cleanup cannot wait on an expensive query.
+        drop(plane_tx);
+        let ray_thread = match ray_thread {
+            Ok(ray_thread) => ray_thread,
+            Err(error) => {
+                drop(job_tx);
+                let _ = thread.join();
+                return Err(error);
+            }
+        };
         Ok(Self {
-            jobs: job_tx,
-            _ray_thread: ray_thread,
+            jobs: Some(job_tx),
+            ray_thread: Some(ray_thread),
             results_rx: result_rx,
-            _thread: thread,
+            plane_thread: Some(thread),
             job_generation,
+            stopping,
             snapshot: None,
             snapshot_epoch: 0,
             opaque_states: None,
@@ -869,6 +894,27 @@ impl AsyncOcclusionCuller {
             frame: 0,
             proof_validation_sample_counter: Cell::new(0),
         })
+    }
+
+    fn request_stop(&mut self) {
+        if self.jobs.take().is_some() {
+            self.stopping.store(true, Ordering::Relaxed);
+            // Cancel both stages and close the first stage's idle receiver. The ray worker
+            // owns the final sender to the plane worker and wakes it on exit.
+            self.job_generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn shutdown(&mut self) -> bool {
+        self.request_stop();
+        for thread in [&mut self.ray_thread, &mut self.plane_thread] {
+            if thread.as_ref().is_some_and(JoinHandle::is_finished)
+                && let Some(thread) = thread.take()
+            {
+                let _ = thread.join();
+            }
+        }
+        self.ray_thread.is_none() && self.plane_thread.is_none()
     }
 
     pub(super) fn begin_frame(&mut self, camera: glam::DVec3, world: &World) {
@@ -1471,7 +1517,10 @@ impl AsyncOcclusionCuller {
         drop(stats);
         let query_count = job.queries.len();
         let send_started = self.timing_start();
-        match self.jobs.try_send(job) {
+        let Some(jobs) = self.jobs.as_ref() else {
+            return;
+        };
+        match jobs.try_send(job) {
             Ok(()) => {
                 self.pending = true;
                 let mut stats = self.stats.borrow_mut();
@@ -1628,6 +1677,19 @@ impl AsyncOcclusionCuller {
     pub(super) fn reset_stats(&self) {
         *self.stats.borrow_mut() = AsyncCullingStats::default();
         self.proof_validation_sample_counter.set(0);
+    }
+}
+
+impl Drop for AsyncOcclusionCuller {
+    fn drop(&mut self) {
+        self.request_stop();
+        // Normal frame/session teardown polls shutdown first. Retain ownership even when
+        // an unexpected caller drops the service without that preparation.
+        for thread in [&mut self.ray_thread, &mut self.plane_thread] {
+            if let Some(thread) = thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 }
 
@@ -2032,7 +2094,40 @@ impl<'a> SyncOccluder<'a> {
 }
 
 impl Game<'_> {
+    fn retire_occlusion_culler(&mut self) {
+        if let Some(mut culler) = self.async_occlusion_culler.take() {
+            culler.request_stop();
+            self.retired_occlusion_cullers.push(culler);
+        }
+    }
+
+    fn poll_retired_occlusion_cullers(&mut self) {
+        self.retired_occlusion_cullers
+            .retain_mut(|culler| !culler.shutdown());
+    }
+
+    /// Move the guest's active and already-retired work before its Game is dropped.
+    /// In particular, removing an AirPlay guest must not join workers from UIKit's frame.
+    pub(super) fn retire_guest_culling_workers(&mut self, guest: &mut Game<'_>) {
+        guest.retire_occlusion_culler();
+        self.retired_occlusion_cullers
+            .append(&mut guest.retired_occlusion_cullers);
+        self.async_particle_culler
+            .get_mut()
+            .retire_from(guest.async_particle_culler.get_mut());
+        self.poll_retired_occlusion_cullers();
+    }
+
+    /// Poll every owned culling worker before releasing an engine session.
+    pub(super) fn shutdown_culling_workers(&mut self) -> bool {
+        self.retire_occlusion_culler();
+        self.poll_retired_occlusion_cullers();
+        let particles_done = self.async_particle_culler.get_mut().shutdown();
+        self.retired_occlusion_cullers.is_empty() && particles_done
+    }
+
     pub(super) fn prepare_occlusion_culling(&mut self, camera: glam::DVec3) {
+        self.poll_retired_occlusion_cullers();
         self.entity_section_camera = None;
         self.entity_section_visibility_valid = false;
         let entity_mode = self.settings.horizon.entity_culling;
@@ -2044,7 +2139,7 @@ impl Game<'_> {
             && !self.spectator();
         if !eligible {
             self.sync_occlusion_culler = None;
-            self.async_occlusion_culler = None;
+            self.retire_occlusion_culler();
             self.async_occlusion_culling_failed = false;
             return;
         }
@@ -2055,7 +2150,7 @@ impl Game<'_> {
         let camera_facts = self.res.facts().get(self.world.block(at[0], at[1], at[2]));
         if opaque(camera_facts) {
             self.sync_occlusion_culler = None;
-            self.async_occlusion_culler = None;
+            self.retire_occlusion_culler();
             self.async_occlusion_culling_failed = false;
             return;
         }
@@ -2079,7 +2174,7 @@ impl Game<'_> {
                 culler.begin_frame(camera, &self.world);
             }
         } else {
-            self.async_occlusion_culler = None;
+            self.retire_occlusion_culler();
             self.async_occlusion_culling_failed = false;
         }
 
@@ -2099,6 +2194,58 @@ impl Game<'_> {
 mod tests {
     use super::*;
     use horizon_client::chunk::ColumnLayout;
+
+    #[test]
+    fn stopping_idle_workers_wakes_and_joins_both_stages() {
+        let mut culler = AsyncOcclusionCuller::new().unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !culler.shutdown() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(culler.ray_thread.is_none());
+        assert!(culler.plane_thread.is_none());
+        assert!(culler.jobs.is_none());
+        assert!(culler.shutdown(), "shutdown is idempotent");
+    }
+
+    #[test]
+    fn shutdown_cancels_queued_queries_and_joins_both_stages() {
+        let mut culler = AsyncOcclusionCuller::new().unwrap();
+        let (snapshot, _live) = wall(None);
+        let mut job = job(snapshot);
+        job.queries = vec![job.queries[0]; 16_384];
+        assert!(culler.jobs.as_ref().unwrap().try_send(job).is_ok());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !culler.shutdown() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            culler.shutdown(),
+            "queued work must not outlive engine shutdown"
+        );
+    }
+
+    #[test]
+    fn invalidated_jobs_still_complete_the_pipeline() {
+        let mut culler = AsyncOcclusionCuller::new().unwrap();
+        let (snapshot, _live) = wall(None);
+        let job = job(snapshot);
+        culler.job_generation.store(1, Ordering::Relaxed);
+        assert!(culler.jobs.as_ref().unwrap().try_send(job).is_ok());
+        // Layout invalidation is not shutdown: the owner needs the canceled result to
+        // clear its pending state and submit this new world's first job.
+        let result = culler
+            .results_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a canceled generation must acknowledge completion");
+        assert_eq!(result.generation, 0);
+        assert!(result.hidden.is_empty());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !culler.shutdown() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(culler.shutdown());
+    }
 
     #[test]
     fn timing_samples_keep_a_bounded_recent_window_and_use_nearest_rank() {

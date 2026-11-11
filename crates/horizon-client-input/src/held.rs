@@ -13,6 +13,8 @@ pub enum Source {
     /// The keyboard and mouse.
     Keyboard,
     Pad,
+    /// Direct touch controls, independently of a hardware keyboard or gamepad.
+    Touch,
     /// `horizon-ctl`'s `key` and `mouse` and the agent commands that walk and click.
     Agent,
 }
@@ -22,7 +24,8 @@ impl Source {
         match self {
             Source::Keyboard => 1,
             Source::Pad => 2,
-            Source::Agent => 4,
+            Source::Touch => 4,
+            Source::Agent => 8,
         }
     }
 }
@@ -150,6 +153,50 @@ mod tests {
         assert!(keys.held(Action::Jump) && !keys.held(Action::Forward));
         assert!(keys.held_by(&KeyCode::Space, Source::Pad));
         assert!(!keys.held_by(&KeyCode::Space, Source::Keyboard));
+        assert!(keys.release(&KeyCode::Space, Source::Pad));
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn releasing_touch_preserves_keyboard_and_controller_holds() {
+        let mut keys = HeldKeys::default();
+        keys.press(KeyCode::KeyW, Source::Keyboard);
+        keys.press(KeyCode::KeyW, Source::Touch);
+        keys.press(KeyCode::Space, Source::Pad);
+        keys.press(KeyCode::Space, Source::Touch);
+        keys.press(KeyCode::KeyA, Source::Touch);
+        assert_eq!(keys.release_source(Source::Touch), vec![KeyCode::KeyA]);
+        assert!(keys.held_by(&KeyCode::KeyW, Source::Keyboard));
+        assert!(keys.held_by(&KeyCode::Space, Source::Pad));
+        assert!(!keys.held_by(&KeyCode::KeyW, Source::Touch));
+        assert!(keys.release(&KeyCode::KeyW, Source::Keyboard));
+        assert!(keys.release(&KeyCode::Space, Source::Pad));
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn touch_repeats_do_not_require_extra_releases_or_lose_to_keyboard_release() {
+        let mut keys = HeldKeys::default();
+        assert!(keys.press(KeyCode::KeyW, Source::Touch));
+        assert!(!keys.press(KeyCode::KeyW, Source::Touch));
+        assert!(!keys.press(KeyCode::KeyW, Source::Keyboard));
+        assert!(!keys.release(&KeyCode::KeyW, Source::Keyboard));
+        assert!(keys.held_by(&KeyCode::KeyW, Source::Touch));
+        assert!(keys.release(&KeyCode::KeyW, Source::Touch));
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn touch_agent_keyboard_and_pad_own_independent_bits() {
+        let mut keys = HeldKeys::default();
+        for source in [Source::Keyboard, Source::Pad, Source::Touch, Source::Agent] {
+            keys.press(KeyCode::Space, source);
+        }
+        for source in [Source::Touch, Source::Agent, Source::Keyboard] {
+            assert!(!keys.release(&KeyCode::Space, source));
+            assert!(keys.held(Action::Jump));
+            assert!(keys.held_by(&KeyCode::Space, Source::Pad));
+        }
         assert!(keys.release(&KeyCode::Space, Source::Pad));
         assert!(keys.is_empty());
     }

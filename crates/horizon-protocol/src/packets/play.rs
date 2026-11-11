@@ -22,6 +22,9 @@ use crate::{
 };
 use horizon_world::nbt::Tag;
 
+mod commands;
+pub use commands::{ARGUMENT_TYPES, ArgumentProperties, CommandNode, Commands};
+
 // ---- shared structures -------------------------------------------------
 
 packet!(
@@ -467,8 +470,8 @@ impl VecDelta {
         let mut out = base;
         for i in 0..3 {
             if delta[i] != 0 {
-                out[i] = (horizon_core::jmath::round(base[i] * 4096.0) + i64::from(delta[i]))
-                    as f64
+                out[i] = horizon_core::jmath::round(base[i] * 4096.0)
+                    .wrapping_add(i64::from(delta[i])) as f64
                     / 4096.0;
             }
         }
@@ -1334,325 +1337,6 @@ impl Codec<StopSound> for StopSound {
         }
     }
 }
-/// One entry of ClientboundCommandsPacket: a literal or an argument node.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CommandNode {
-    /// 0 root, 1 literal, 2 argument.
-    pub kind: u8,
-    pub executable: bool,
-    pub restricted: bool,
-    pub children: Vec<i32>,
-    pub redirect: Option<i32>,
-    pub name: String,
-    /// Argument parser registry id and its raw property bytes.
-    pub parser: Option<(i32, Vec<u8>)>,
-    /// Custom suggestion provider (`minecraft:ask_server`).
-    pub suggestions: Option<String>,
-}
-/// The `minecraft:command_argument_type` registry of 26.3 in id order
-/// (ArgumentTypeInfos.bootstrap).
-pub const ARGUMENT_TYPES: &[&str] = &[
-    "brigadier:bool",
-    "brigadier:float",
-    "brigadier:double",
-    "brigadier:integer",
-    "brigadier:long",
-    "brigadier:string",
-    "minecraft:entity",
-    "minecraft:game_profile",
-    "minecraft:block_pos",
-    "minecraft:column_pos",
-    "minecraft:vec3",
-    "minecraft:vec2",
-    "minecraft:block_state",
-    "minecraft:block_predicate",
-    "minecraft:item_stack",
-    "minecraft:item_predicate",
-    "minecraft:team_color",
-    "minecraft:hex_color",
-    "minecraft:component",
-    "minecraft:style",
-    "minecraft:message",
-    "minecraft:nbt_compound_tag",
-    "minecraft:nbt_tag",
-    "minecraft:nbt_path",
-    "minecraft:objective",
-    "minecraft:objective_criteria",
-    "minecraft:operation",
-    "minecraft:particle",
-    "minecraft:angle",
-    "minecraft:rotation",
-    "minecraft:scoreboard_slot",
-    "minecraft:score_holder",
-    "minecraft:swizzle",
-    "minecraft:team",
-    "minecraft:item_slot",
-    "minecraft:item_slots",
-    "minecraft:resource_location",
-    "minecraft:function",
-    "minecraft:entity_anchor",
-    "minecraft:int_range",
-    "minecraft:float_range",
-    "minecraft:dimension",
-    "minecraft:gamemode",
-    "minecraft:time",
-    "minecraft:resource_or_tag",
-    "minecraft:resource_or_tag_key",
-    "minecraft:resource",
-    "minecraft:resource_key",
-    "minecraft:resource_selector",
-    "minecraft:template_mirror",
-    "minecraft:template_rotation",
-    "minecraft:heightmap",
-    "minecraft:loot_table",
-    "minecraft:loot_predicate",
-    "minecraft:loot_modifier",
-    "minecraft:context_float_provider",
-    "minecraft:context_int_provider",
-    "minecraft:slot_source",
-    "minecraft:dialog",
-    "minecraft:feature",
-    "minecraft:swing_animation",
-    "minecraft:uuid",
-];
-
-/// The properties of an argument parser (`ArgumentTypeInfo.Template`) as
-/// one of the 26.3 parsers decoded from the network.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ArgumentProperties {
-    None,
-    Integer {
-        min: Option<i32>,
-        max: Option<i32>,
-    },
-    Long {
-        min: Option<i64>,
-        max: Option<i64>,
-    },
-    Float {
-        min: Option<f32>,
-        max: Option<f32>,
-    },
-    Double {
-        min: Option<f64>,
-        max: Option<f64>,
-    },
-    /// StringArgumentType.StringType: 0 word, 1 phrase, 2 greedy.
-    String(i32),
-    Entity {
-        single: bool,
-        players_only: bool,
-    },
-    ScoreHolder {
-        multiple: bool,
-    },
-    Time {
-        min: i32,
-    },
-    /// The resource arguments' registry.
-    Registry(String),
-}
-
-impl ArgumentProperties {
-    /// ArgumentTypeInfo.deserializeFromNetwork for parser `id`.
-    pub fn read(r: &mut Reader, id: i32) -> Result<Self> {
-        let name = usize::try_from(id)
-            .ok()
-            .and_then(|i| ARGUMENT_TYPES.get(i))
-            .ok_or_else(|| crate::Error::new(format!("unknown argument type {id}")))?;
-        let flagged = |r: &mut Reader| -> Result<(bool, bool)> {
-            let f = r.u8()?;
-            Ok((f & 1 != 0, f & 2 != 0))
-        };
-        Ok(match *name {
-            "brigadier:integer" => {
-                let (min, max) = flagged(r)?;
-                let min = if min { Some(r.i32()?) } else { None };
-                let max = if max { Some(r.i32()?) } else { None };
-                Self::Integer { min, max }
-            }
-            "brigadier:long" => {
-                let (min, max) = flagged(r)?;
-                let min = if min { Some(r.i64()?) } else { None };
-                let max = if max { Some(r.i64()?) } else { None };
-                Self::Long { min, max }
-            }
-            "brigadier:float" => {
-                let (min, max) = flagged(r)?;
-                let min = if min { Some(r.f32()?) } else { None };
-                let max = if max { Some(r.f32()?) } else { None };
-                Self::Float { min, max }
-            }
-            "brigadier:double" => {
-                let (min, max) = flagged(r)?;
-                let min = if min { Some(r.f64()?) } else { None };
-                let max = if max { Some(r.f64()?) } else { None };
-                Self::Double { min, max }
-            }
-            "brigadier:string" => Self::String(r.varint()?),
-            "minecraft:entity" => {
-                let f = r.u8()?;
-                Self::Entity {
-                    single: f & 1 != 0,
-                    players_only: f & 2 != 0,
-                }
-            }
-            "minecraft:score_holder" => Self::ScoreHolder {
-                multiple: r.u8()? & 1 != 0,
-            },
-            "minecraft:time" => Self::Time { min: r.i32()? },
-            "minecraft:resource"
-            | "minecraft:resource_key"
-            | "minecraft:resource_or_tag"
-            | "minecraft:resource_or_tag_key"
-            | "minecraft:resource_selector" => Self::Registry(r.string(32767)?),
-            _ => Self::None,
-        })
-    }
-    /// Decodes a node's raw `parser` bytes.
-    pub fn decode(id: i32, bytes: &[u8]) -> Result<Self> {
-        Self::read(&mut Reader::new(bytes), id)
-    }
-}
-
-/// Reads past an argument node's parser properties.
-fn read_argument_properties(r: &mut Reader, id: i32) -> Result<()> {
-    ArgumentProperties::read(r, id).map(|_| ())
-}
-
-/// Whether following `edges` from any node never comes back to it. An index
-/// outside the nodes leads nowhere (the dispatcher drops it).
-fn acyclic(nodes: &[CommandNode], edges: impl Fn(&CommandNode) -> &[i32]) -> bool {
-    const NEW: u8 = 0;
-    const ON_PATH: u8 = 1;
-    const DONE: u8 = 2;
-    let mut state = vec![NEW; nodes.len()];
-    // Depth first without recursion: a node and how many of its edges are followed.
-    let mut path: Vec<(usize, usize)> = Vec::new();
-    for start in 0..nodes.len() {
-        if state[start] != NEW {
-            continue;
-        }
-        state[start] = ON_PATH;
-        path.push((start, 0));
-        while let Some(&(node, followed)) = path.last() {
-            let Some(&edge) = edges(&nodes[node]).get(followed) else {
-                state[node] = DONE;
-                path.pop();
-                continue;
-            };
-            if let Some(top) = path.last_mut() {
-                top.1 += 1;
-            }
-            let Some(next) = usize::try_from(edge).ok().filter(|&e| e < nodes.len()) else {
-                continue;
-            };
-            match state[next] {
-                ON_PATH => return false,
-                NEW => {
-                    state[next] = ON_PATH;
-                    path.push((next, 0));
-                }
-                _ => {}
-            }
-        }
-    }
-    true
-}
-
-/// The command tree: nodes and the index of the root.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Commands {
-    pub nodes: Vec<CommandNode>,
-    pub root: i32,
-}
-impl Codec<Commands> for Commands {
-    fn read(r: &mut Reader) -> Result<Self> {
-        let n = r.count(r.remaining())?;
-        let mut nodes = Vec::with_capacity(n.min(4096));
-        for _ in 0..n {
-            let flags = r.u8()?;
-            let count = r.count(r.remaining())?;
-            let children = (0..count).map(|_| r.varint()).collect::<Result<_>>()?;
-            let redirect = if flags & 8 != 0 {
-                Some(r.varint()?)
-            } else {
-                None
-            };
-            let kind = flags & 3;
-            let (mut name, mut parser, mut suggestions) = (String::new(), None, None);
-            if kind >= 1 {
-                name = r.string(32767)?;
-            }
-            if kind == 2 {
-                let id = r.varint()?;
-                let start = r.position();
-                read_argument_properties(r, id)?;
-                parser = Some((id, r.since(start).to_vec()));
-                if flags & 16 != 0 {
-                    suggestions = Some(r.string(32767)?);
-                }
-            }
-            nodes.push(CommandNode {
-                kind,
-                executable: flags & 4 != 0,
-                restricted: flags & 32 != 0,
-                children,
-                redirect,
-                name,
-                parser,
-                suggestions,
-            });
-        }
-        // ClientboundCommandsPacket.validateEntries: every node's redirect builds
-        // first (canBuild), then its children (canResolve). A cycle in either never
-        // does, and walking it would recurse without end.
-        if !acyclic(&nodes, |n| n.redirect.as_slice()) || !acyclic(&nodes, |n| &n.children) {
-            return Err(crate::Error::new("Server sent an impossible command tree"));
-        }
-        Ok(Self {
-            nodes,
-            root: r.varint()?,
-        })
-    }
-    fn write(v: &Self, w: &mut Writer) {
-        w.varint(v.nodes.len() as i32);
-        for n in &v.nodes {
-            let mut flags = n.kind & 3;
-            if n.executable {
-                flags |= 4;
-            }
-            if n.redirect.is_some() {
-                flags |= 8;
-            }
-            if n.suggestions.is_some() {
-                flags |= 16;
-            }
-            if n.restricted {
-                flags |= 32;
-            }
-            w.u8(flags);
-            w.varint(n.children.len() as i32);
-            n.children.iter().for_each(|c| w.varint(*c));
-            if let Some(r) = n.redirect {
-                w.varint(r);
-            }
-            if n.kind >= 1 {
-                w.string(&n.name);
-            }
-            if n.kind == 2 {
-                let (id, props) = n.parser.clone().unwrap_or((5, Vec::new()));
-                w.varint(id);
-                w.bytes(&props);
-                if let Some(s) = &n.suggestions {
-                    w.string(s);
-                }
-            }
-        }
-        w.varint(v.root);
-    }
-}
-
 /// `DisplayInfo` of an advancement as sent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdvancementDisplay {
@@ -2736,6 +2420,62 @@ mod tests {
     };
 
     #[test]
+    fn command_tree_roots_and_references_must_name_real_nodes() {
+        let node = |kind: u8, children: Vec<i32>, redirect: Option<i32>| CommandNode {
+            kind,
+            executable: false,
+            restricted: false,
+            children,
+            redirect,
+            name: "x".into(),
+            parser: (kind == 2).then_some((0, Vec::new())),
+            suggestions: None,
+        };
+        let read = |nodes: Vec<CommandNode>, root| {
+            let mut w = Writer::new();
+            Commands::write(&Commands { nodes, root }, &mut w);
+            Commands::read(&mut Reader::new(&w.data))
+        };
+        assert!(read(Vec::new(), 0).is_err());
+        for root in [-1, 1, i32::MAX] {
+            assert!(read(vec![node(0, Vec::new(), None)], root).is_err());
+        }
+        for kind in [1, 2, 3] {
+            assert!(read(vec![node(kind, Vec::new(), None)], 0).is_err());
+        }
+        for missing in [-1, 2, i32::MAX] {
+            assert!(
+                read(
+                    vec![node(0, vec![missing], None), node(1, Vec::new(), None)],
+                    0
+                )
+                .is_err()
+            );
+            assert!(
+                read(
+                    vec![node(0, vec![1], None), node(1, Vec::new(), Some(missing))],
+                    0
+                )
+                .is_err()
+            );
+        }
+        // The root need not be entry zero. Ordinary redirects back to it
+        // (execute ... run) remain valid; neither edge set is cyclic alone.
+        assert!(read(vec![node(1, Vec::new(), None), node(0, vec![0], None)], 1).is_ok());
+        assert!(
+            read(
+                vec![
+                    node(0, vec![1], None),
+                    node(1, vec![2], None),
+                    node(1, Vec::new(), Some(0))
+                ],
+                0
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn a_command_tree_with_a_cycle_is_refused() {
         let node = |kind: u8, name: &str, children: Vec<i32>, redirect: Option<i32>| CommandNode {
             kind,
@@ -3696,6 +3436,32 @@ mod tests {
         assert_eq!(
             VecDelta::Stepped(vec![([4096, 0, 0], 1), ([4096, 0, 0], 2)]).end(base),
             [12.0, 64.0, -3.5]
+        );
+    }
+
+    #[test]
+    fn move_entity_half_steps_follow_java_rounding() {
+        // Pinned 26.3 VecDeltaCodec.encode -> Java double rounding, checked
+        // against the actual private client JAR through a reflection oracle.
+        let unit = 1.0 / 4096.0;
+        assert_eq!(
+            VecDelta::apply([-0.5 * unit, -1.5 * unit, 0.5 * unit], [1; 3]),
+            [unit, 0.0, 2.0 * unit]
+        );
+        let below_half = f64::from_bits(0.5f64.to_bits() - 1) * unit;
+        assert_eq!(
+            VecDelta::apply([below_half, -below_half, 0.0], [1, 1, 0]),
+            [unit, unit, 0.0]
+        );
+        let base = [-0.5 * unit, 0.123_456_789, -1.5 * unit];
+        assert_eq!(
+            VecDelta::Stepped(vec![([0, 0, 0], 1), ([1, 0, 1], 2)]).end(base),
+            [unit, base[1], 0.0]
+        );
+        // Java's long addition wraps after its double-to-long rounding saturates.
+        assert_eq!(
+            VecDelta::apply([f64::INFINITY, f64::NEG_INFINITY, f64::NAN], [1, -1, 1]),
+            [i64::MIN as f64 * unit, i64::MAX as f64 * unit, unit]
         );
     }
 

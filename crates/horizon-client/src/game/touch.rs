@@ -89,6 +89,53 @@ impl TouchInput {
             .flatten()
             .any(|k| matches!(k, touch::CustomKey::Key(k) if *k == key))
     }
+
+    /// Whether a finger holds what `button` stands for (attack or use), so another device's release
+    /// must not end it.
+    fn holds_mouse_mapping(&self, button: MouseButton) -> bool {
+        self.holding == Some(button)
+            || self.late.iter().any(|(held, _)| *held == button)
+            || self
+                .custom_keys
+                .values()
+                .flatten()
+                .any(|k| matches!(k, touch::CustomKey::Mouse(b) if *b == button))
+    }
+}
+
+impl Game<'_> {
+    /// Whether touch is holding sneak, for the live Shift word screens sample instead of the key set.
+    pub(super) fn touch_shift_held(&self) -> bool {
+        self.touch.fingers.held(Control::Sneak)
+            || self.touch.holds_key(KeyCode::ShiftLeft)
+            || self.touch.holds_key(KeyCode::ShiftRight)
+    }
+
+    /// Whether a finger holds what `button` stands for (attack or use), so another device's release
+    /// must not end it.
+    pub(super) fn touch_holds_mouse_mapping(&self, button: MouseButton) -> bool {
+        self.touch.holds_mouse_mapping(button)
+    }
+
+    /// Touch input never comes in as the platform's made-up window events (a finger is not a key the
+    /// OS invented), so the input log leaves nothing out for it.
+    pub(super) fn touch_synthetic_input(&self) -> bool {
+        false
+    }
+
+    /// Drop pending fingers and deferred presses where the screen or the world is replaced: that
+    /// boundary has already let go of gameplay holds and the screen's drag state.
+    pub(super) fn cancel_touch_for_reload(&mut self) {
+        self.touch.fingers.release_all();
+        self.touch.menu = None;
+        self.touch.late.clear();
+        self.touch.holding = None;
+        self.touch.late_keys.clear();
+        self.touch.custom_keys.clear();
+        self.touch.toggled.clear();
+        self.touch.analog = None;
+        self.keys.release_source(Source::Touch);
+    }
 }
 
 /// A finger over a menu. Its press waits for a frame drawn with the pointer under it, and its release for a

@@ -21,7 +21,9 @@ mod pose;
 pub mod prefs;
 pub mod preview;
 pub mod trail;
+pub mod transport;
 pub mod viewer;
+pub mod workers;
 
 pub use emote::{
     BODY, Ease, Emote, Key, MAX_ALL_KEYS, MAX_KEYS, MAX_LENGTH, MAX_MOVE, MAX_ROOT_MOVE,
@@ -48,7 +50,7 @@ pub use pose::{Pose, pose_matrix};
 pub const ON_BY_DEFAULT: bool = true;
 
 /// The cosmetics service (`HORIZON_COSMETICS_API` overrides it).
-pub const API: &str = "https://cosmetics.playhorizon.dev";
+pub const API: &str = horizon_addresses::COSMETICS_API;
 
 /// Whether cosmetics run: `ON_BY_DEFAULT`, or `HORIZON_COSMETICS=1` / `0` for one run
 /// (development, the bench).

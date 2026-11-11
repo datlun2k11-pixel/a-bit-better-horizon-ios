@@ -583,20 +583,25 @@ impl Game<'_> {
         if include_world {
             let root = world_root.as_ref().expect("a local world's save folder");
             if let Some(server) = self.integrated.as_ref() {
-                server.set_paused(true);
-                let saved = server.call(|game| game.save_game().map_err(|e| e.to_string()));
-                let copied = copy_tree(root, &dir.join("world"));
-                server.set_paused(self.pause);
-                match saved {
-                    Some(Ok(())) => {}
-                    Some(Err(e)) => {
+                // The server thread saves, then waits there for the copy: pausing it instead
+                // runs its pause save (which renames files into place) during the copy.
+                let (saved_tx, saved) = mpsc::channel();
+                let (copied, copied_rx) = mpsc::channel::<()>();
+                // A server that has stopped drops the task, and `saved_tx` with it.
+                server.poster().post(move |game| {
+                    let _ = saved_tx.send(game.save_game().map_err(|e| e.to_string()));
+                    let _ = copied_rx.recv();
+                });
+                match saved.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
                         return Err(format!("saving the world for the recording: {e}").into());
                     }
-                    None => {
-                        log::warn!("Horizon: the integrated server did not save for the recording")
-                    }
+                    Err(_) => return Err("the integrated server has stopped".into()),
                 }
-                copied.map_err(|e| format!("copying the world: {e}"))?;
+                let result = copy_tree(root, &dir.join("world"));
+                drop(copied);
+                result.map_err(|e| format!("copying the world: {e}"))?;
             } else {
                 self.save_game_with(true)?;
                 copy_tree(root, &dir.join("world"))
@@ -1296,6 +1301,36 @@ impl Game<'_> {
                 );
                 true
             }
+            TraceKind::Touch {
+                id: finger,
+                phase,
+                x,
+                y,
+            } => {
+                let phase = match phase.as_str() {
+                    "started" => TouchPhase::Started,
+                    "moved" => TouchPhase::Moved,
+                    "ended" => TouchPhase::Ended,
+                    "cancelled" => TouchPhase::Cancelled,
+                    _ => return false,
+                };
+                if !x.is_finite() || !y.is_finite() {
+                    return false;
+                }
+                self.handle_window_event(
+                    event_loop,
+                    id,
+                    WindowEvent::Touch(winit::event::Touch {
+                        device_id,
+                        phase,
+                        location: PhysicalPosition::new(x, y),
+                        force: None,
+                        id: finger,
+                    }),
+                    InputOrigin::Agent,
+                );
+                true
+            }
             TraceKind::Motion { x, y } => {
                 self.mouse.on_move(0.0, 0.0, x, y, true, true);
                 self.last_input = Instant::now();
@@ -1313,6 +1348,9 @@ impl Game<'_> {
 
     /// Let go of everything a replay (or a person) held.
     fn release_replay_inputs(&mut self) {
+        // A replay ending mid-gesture must not keep walking or generate a
+        // deferred menu click on the next frame.
+        self.touch = Default::default();
         self.keys.clear();
         self.physical_keys.clear();
         self.physical_buttons.clear();
@@ -1386,6 +1424,11 @@ impl Game<'_> {
 }
 
 impl Repro {
+    /// A replay is running or waiting for its world.
+    pub(super) fn replaying(&self) -> bool {
+        self.replay.is_some() || self.pending_replay.is_some()
+    }
+
     /// An agent event while recording joins `events.jsonl`.
     pub(super) fn note_event(&mut self, tick: u64, event: &Value) {
         let Some(rec) = self.recording.as_mut() else {
@@ -1891,12 +1934,13 @@ mod tests {
             r#"{"seq":5,"tick":5,"ms":40,"origin":"user","kind":"motion","x":10.0,"y":-2.0}"#,
             r#"{"seq":6,"tick":6,"ms":50,"origin":"agent","kind":"pad","button":"south","action":"down"}"#,
             r#"{"seq":7,"tick":7,"ms":60,"origin":"agent","kind":"command","line":"key w down"}"#,
+            r#"{"seq":8,"tick":8,"ms":70,"origin":"user","kind":"touch","id":42,"phase":"cancelled","x":12.5,"y":99.25}"#,
         ];
         let events: Vec<TraceEvent> = lines
             .iter()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(events.len(), 7);
+        assert_eq!(events.len(), 8);
         // Each kind keeps what the replay needs.
         assert!(matches!(events[0].kind, TraceKind::Key { .. }));
         assert!(matches!(events[1].kind, TraceKind::Mouse { .. }));
@@ -1908,6 +1952,9 @@ mod tests {
         assert!(matches!(events[4].kind, TraceKind::Motion { .. }));
         assert!(matches!(events[5].kind, TraceKind::Pad { .. }));
         assert!(matches!(events[6].kind, TraceKind::Command { .. }));
+        assert!(
+            matches!(&events[7].kind, TraceKind::Touch { id: 42, phase, x: 12.5, y: 99.25 } if phase == "cancelled")
+        );
     }
 
     #[test]

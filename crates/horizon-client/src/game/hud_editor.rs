@@ -16,6 +16,7 @@ use horizon_client::{
 pub(super) struct HudEditor {
     /// The widget held, and where the cursor took it from its top left corner.
     drag: Option<(WidgetId, f32, f32)>,
+    selected: Option<WidgetId>,
     /// The lines the dragged box snapped to: a vertical one at x, a horizontal one at y.
     guides: (Option<f32>, Option<f32>),
     /// Opened from the PvP & HUD page: Done goes back there.
@@ -41,7 +42,7 @@ const GUIDE: u32 = 0xFF55_FFFF;
 fn buttons((w, h): (f32, f32)) -> [(f32, f32); 6] {
     let left = (w / 2.0 - BUTTON_W - GAP / 2.0).floor();
     let right = left + BUTTON_W + GAP;
-    let top = (h / 2.0 - (3.0 * BUTTON_H + 2.0 * GAP) / 2.0).floor();
+    let top = (h / 2.0 - (4.0 * BUTTON_H + 3.0 * GAP) / 2.0).floor();
     let row = |i: f32| top + i * (BUTTON_H + GAP);
     [
         (left, row(0.0)),
@@ -51,6 +52,28 @@ fn buttons((w, h): (f32, f32)) -> [(f32, f32); 6] {
         (left, row(2.0)),
         (right, row(2.0)),
     ]
+}
+
+const TOOL_W: f32 = (BUTTON_W * 2.0 - GAP) / 3.0;
+fn selection_buttons(size: (f32, f32)) -> [(f32, f32); 3] {
+    let places = buttons(size);
+    std::array::from_fn(|i| {
+        (
+            places[0].0 + i as f32 * (TOOL_W + GAP),
+            places[4].1 + BUTTON_H + GAP,
+        )
+    })
+}
+fn control_at(at: (f32, f32), size: (f32, f32)) -> Option<usize> {
+    buttons(size)
+        .iter()
+        .position(|&(x, y)| ui::hovered(at, x, y, BUTTON_W, BUTTON_H))
+        .or_else(|| {
+            selection_buttons(size)
+                .iter()
+                .position(|&(x, y)| ui::hovered(at, x, y, TOOL_W, BUTTON_H))
+                .map(|i| i + 6)
+        })
 }
 
 impl Game<'_> {
@@ -111,6 +134,18 @@ impl Game<'_> {
             .copied()
             .find(|(_, [x, y, w, h])| cx >= *x && cx < x + w && cy >= *y && cy < y + h)
     }
+    /// Direct manipulation regions are separate from the editor's buttons:
+    /// finger motion drags a HUD box, but a button remains a cancelable tap.
+    pub(super) fn hud_editor_drag_target(&self, at: (f32, f32)) -> bool {
+        self.screen == Screen::HudEditor
+            && control_at(at, self.gui_size()).is_none()
+            && self
+                .pvp
+                .boxes
+                .iter()
+                .any(|(_, [x, y, w, h])| ui::hovered(at, *x, *y, *w, *h))
+    }
+
     pub(super) fn draw_hud_editor(&mut self, batch: &mut HudBatch) {
         let atlas = &self.gui.atlas;
         let (w, h) = (batch.width, batch.height);
@@ -119,7 +154,10 @@ impl Game<'_> {
             rgba(r, g, b, a)
         };
         let held = self.pvp.editor.as_ref().and_then(|e| e.drag).map(|d| d.0);
-        let hot = held.or(self.widget_under_cursor().map(|(id, _)| id));
+        let selected = self.pvp.editor.as_ref().and_then(|e| e.selected);
+        let hot = held
+            .or(self.widget_under_cursor().map(|(id, _)| id))
+            .or(selected);
         for &(id, [x, y, bw, bh]) in &self.pvp.boxes {
             let c = colour(if Some(id) == hot { FRAME_HOT } else { FRAME });
             batch.fill(atlas, x - 1.0, y - 1.0, bw + 2.0, 1.0, c);
@@ -153,13 +191,53 @@ impl Game<'_> {
             let hover = active && ui::hovered(self.cursor, x, y, BUTTON_W, BUTTON_H);
             ui::button(batch, atlas, x, y, BUTTON_W, BUTTON_H, label, active, hover);
         }
+
+        for (i, (key, fallback)) in [
+            ("horizon.pvp.editor.smaller", "Smaller"),
+            ("horizon.pvp.editor.larger", "Larger"),
+            ("horizon.pvp.editor.reset_widget", "Reset widget"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (x, y) = selection_buttons((w, h))[i];
+            let label = Text::literal(horizon_client::lang::get_or(key, fallback));
+            ui::button(
+                batch,
+                atlas,
+                x,
+                y,
+                TOOL_W,
+                BUTTON_H,
+                &label,
+                selected.is_some(),
+                ui::hovered(self.cursor, x, y, TOOL_W, BUTTON_H),
+            );
+            horizon_client::widgets::pointer_binding(
+                [x, y, TOOL_W, BUTTON_H],
+                format!("hud-tool:{selected:?}:{i}"),
+            );
+        }
     }
     /// A press: a button, else the widget under the cursor (right button: back to its corner).
     pub(super) fn hud_editor_press(&mut self, right: bool) {
         let size = self.gui_size();
-        for (i, &(x, y)) in buttons(size).iter().enumerate() {
-            if right || !ui::hovered(self.cursor, x, y, BUTTON_W, BUTTON_H) {
-                continue;
+        if let Some(i) = control_at(self.cursor, size) {
+            if right {
+                return;
+            }
+            if i >= 6 {
+                let Some(id) = self.pvp.editor.as_ref().and_then(|e| e.selected) else {
+                    return;
+                };
+                if i == 8 {
+                    *self.settings.extras.pvp.layout.get_mut(id) = Place::default();
+                    self.settings.save(&Self::options_path());
+                } else {
+                    self.resize_hud_widget(id, if i == 7 { 1.0 } else { -1.0 });
+                }
+                self.audio.play_button_click();
+                return;
             }
             let back = self.has_shift_down();
             let pvp = &mut self.settings.extras.pvp;
@@ -180,6 +258,9 @@ impl Game<'_> {
         let Some((id, [x, y, _, _])) = self.widget_under_cursor() else {
             return;
         };
+        if let Some(e) = &mut self.pvp.editor {
+            e.selected = Some(id);
+        }
         if right {
             *self.settings.extras.pvp.layout.get_mut(id) = Place::default();
             self.settings.save(&Self::options_path());
@@ -220,6 +301,9 @@ impl Game<'_> {
         let Some((id, _)) = self.widget_under_cursor() else {
             return;
         };
+        self.resize_hud_widget(id, amount);
+    }
+    fn resize_hud_widget(&mut self, id: WidgetId, amount: f64) {
         let place = self.settings.extras.pvp.layout.get_mut(id);
         let (lo, hi) = pvp_hud::SCALES;
         place.scale = if amount > 0.0 {

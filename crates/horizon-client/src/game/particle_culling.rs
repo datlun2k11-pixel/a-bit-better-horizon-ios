@@ -12,6 +12,7 @@ use std::{
     cell::RefCell,
     sync::{
         Arc, Weak,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::JoinHandle,
@@ -20,6 +21,7 @@ use std::{
 type ChunkKey = (i32, i32);
 type SectionKey = (i32, i32, i32);
 const MAX_SNAPSHOT_CHUNKS: i64 = 4_096;
+const MAX_PARTICLE_ANSWERS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct CullKey {
@@ -126,14 +128,43 @@ struct CullJob {
 #[derive(Default)]
 pub(super) struct ParticleAsyncState {
     culler: Option<ParticleAsyncCuller>,
+    retired: Vec<ParticleAsyncCuller>,
     failed: bool,
+}
+
+impl ParticleAsyncState {
+    fn retire(&mut self) {
+        if let Some(mut culler) = self.culler.take() {
+            culler.request_stop();
+            self.retired.push(culler);
+        }
+    }
+
+    fn poll_retired(&mut self) -> bool {
+        self.retired.retain_mut(|culler| !culler.shutdown());
+        self.retired.is_empty()
+    }
+
+    /// Transfer guest work before dropping its Game, retaining ownership without joining
+    /// a running worker on the frame thread.
+    pub(super) fn retire_from(&mut self, guest: &mut Self) {
+        guest.retire();
+        self.retired.append(&mut guest.retired);
+        self.poll_retired();
+    }
+
+    pub(super) fn shutdown(&mut self) -> bool {
+        self.retire();
+        self.poll_retired()
+    }
 }
 
 /// Particle occlusion has a dedicated worker so its queue cannot delay entity visibility jobs.
 struct ParticleAsyncCuller {
-    jobs: SyncSender<CullJob>,
+    jobs: Option<SyncSender<CullJob>>,
     results_rx: Receiver<CullResults>,
-    _thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
     snapshot: Option<(SnapshotKey, ChunkBounds, Arc<OcclusionSnapshot>)>,
     opaque_states: Option<Arc<[bool]>>,
     results: Option<CullResults>,
@@ -147,19 +178,26 @@ impl ParticleAsyncCuller {
     fn new() -> std::io::Result<Self> {
         let (job_tx, job_rx) = mpsc::sync_channel::<CullJob>(1);
         let (result_tx, result_rx) = mpsc::channel::<CullResults>();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = stopping.clone();
         let thread = std::thread::Builder::new()
             .name("particle-culling".into())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    if result_tx.send(cull_job(job)).is_err() {
+                    if worker_stopping.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let result = cull_job(job, &worker_stopping);
+                    if worker_stopping.load(Ordering::Relaxed) || result_tx.send(result).is_err() {
                         break;
                     }
                 }
             })?;
         Ok(Self {
-            jobs: job_tx,
+            jobs: Some(job_tx),
             results_rx: result_rx,
-            _thread: thread,
+            thread: Some(thread),
+            stopping,
             snapshot: None,
             opaque_states: None,
             results: None,
@@ -174,26 +212,69 @@ impl ParticleAsyncCuller {
         })
     }
 
-    fn begin_frame(&mut self, camera: glam::DVec3, world: &World) {
-        while let Ok(mut results) = self.results_rx.try_recv() {
-            self.pending = false;
-            let scratch = std::mem::take(&mut results.scratch_queries);
-            if scratch.capacity() > self.queries.get_mut().capacity() {
-                *self.queries.get_mut() = scratch;
-            }
-            self.results = Some(results);
+    fn request_stop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        self.jobs.take(); // Wake recv even when the worker has no job.
+    }
+
+    fn shutdown(&mut self) -> bool {
+        self.request_stop();
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            return false;
         }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        true
+    }
+
+    fn begin_frame(&mut self, camera: glam::DVec3, world: &World) {
         self.camera = camera.to_array();
         self.stamp = SnapshotKey {
             world_revision: world.revision,
             chunks_revision: world.chunks.membership_revision(),
             bottom_y: world.bottom_y(),
         };
-        if self
-            .results
-            .as_ref()
-            .is_some_and(|results| results.stamp != self.stamp)
-        {
+        let camera_bits = self.camera.map(f64::to_bits);
+        while let Ok(mut results) = self.results_rx.try_recv() {
+            self.pending = false;
+            let scratch = std::mem::take(&mut results.scratch_queries);
+            if scratch.capacity() > self.queries.get_mut().capacity() {
+                *self.queries.get_mut() = scratch;
+            }
+            // A job only answers the clusters that missed, so merge instead of replacing.
+            if results.stamp != self.stamp {
+                continue;
+            }
+            results.answers.retain(|(key, _)| key.camera == camera_bits);
+            if let Some(old) = self
+                .results
+                .as_mut()
+                .filter(|old| old.stamp == results.stamp)
+            {
+                old.answers.retain(|(key, _)| key.camera == camera_bits);
+                // Newest first, so dedup keeps the newest answer of a key.
+                let mut merged = std::mem::take(&mut results.answers);
+                merged.append(&mut old.answers);
+                merged.sort_by_key(|(key, _)| *key);
+                merged.dedup_by_key(|(key, _)| *key);
+                merged.truncate(MAX_PARTICLE_ANSWERS);
+                old.answers = merged;
+            } else {
+                self.results = Some(results);
+            }
+        }
+        if self.results.as_ref().is_some_and(|results| {
+            results.stamp != self.stamp
+                || results
+                    .answers
+                    .iter()
+                    .any(|(key, _)| key.camera != camera_bits)
+        }) {
             self.results = None;
         }
         self.queries.get_mut().clear();
@@ -282,7 +363,8 @@ impl ParticleAsyncCuller {
             snapshot,
             queries,
         };
-        match self.jobs.try_send(job) {
+        let Some(jobs) = &self.jobs else { return };
+        match jobs.try_send(job) {
             Ok(()) => self.pending = true,
             Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
                 *self.queries.get_mut() = job.queries;
@@ -325,13 +407,25 @@ fn snapshot_bounds(camera: [f64; 3], queries: &[CullKey]) -> Option<ChunkBounds>
     (width > 0 && depth > 0 && width * depth <= MAX_SNAPSHOT_CHUNKS).then_some(bounds)
 }
 
-fn cull_job(mut job: CullJob) -> CullResults {
+impl Drop for ParticleAsyncCuller {
+    fn drop(&mut self) {
+        self.request_stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn cull_job(mut job: CullJob, stopping: &AtomicBool) -> CullResults {
     let camera = job.queries[0].camera.map(f64::from_bits);
     let culler = Culler::new(camera, 8_192);
     let mut last_chunk = LastChunk::default();
     let mut answers = Vec::with_capacity(job.queries.len());
     let mut covered = Vec::new();
     for &key in &job.queries {
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
         covered.clear();
         let min = key.min.map(f64::from_bits);
         let max = key.max.map(f64::from_bits);
@@ -521,6 +615,7 @@ impl Game<'_> {
             } else {
                 ParticleCullingMode::Off
             };
+        self.async_particle_culler.borrow_mut().poll_retired();
         if mode == ParticleCullingMode::Asynchronous {
             let mut state = self.async_particle_culler.borrow_mut();
             if state.culler.is_none() && !state.failed {
@@ -537,7 +632,7 @@ impl Game<'_> {
             }
         } else {
             let mut state = self.async_particle_culler.borrow_mut();
-            state.culler = None;
+            state.retire();
             state.failed = false;
         }
         ParticleOcclusionContext {
@@ -634,6 +729,90 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn held_worker() -> (ParticleAsyncCuller, std::sync::mpsc::Sender<()>) {
+        let mut worker = ParticleAsyncCuller::new().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !worker.shutdown() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(worker.shutdown());
+        // Hold a worker at a deterministic boundary. Retirement must retain its join
+        // handle, regardless of whether the OS has scheduled the real culling job yet.
+        let (release, wait) = std::sync::mpsc::channel();
+        worker.thread = Some(std::thread::spawn(move || {
+            let _ = wait.recv();
+        }));
+        (worker, release)
+    }
+
+    #[test]
+    fn mode_and_guest_retirement_return_before_workers_finish_and_keep_their_ownership() {
+        for guest_transfer in [false, true] {
+            let (active, release_active) = held_worker();
+            let (retired, release_retired) = held_worker();
+            let mut state = ParticleAsyncState {
+                culler: Some(active),
+                retired: vec![retired],
+                failed: false,
+            };
+            let (returned, completed) = std::sync::mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                if guest_transfer {
+                    let mut host = ParticleAsyncState::default();
+                    host.retire_from(&mut state);
+                    assert!(state.culler.is_none() && state.retired.is_empty());
+                    state = host;
+                } else {
+                    state.retire();
+                    state.poll_retired();
+                }
+                returned.send(state).unwrap();
+            });
+            let result = completed.recv_timeout(std::time::Duration::from_secs(5));
+            // Always release the held workers before asserting, including on regression,
+            // so a failed test never leaves an owner thread stuck in Drop::join.
+            release_active.send(()).unwrap();
+            release_retired.send(()).unwrap();
+            let mut state = result.expect("retirement joined a still-running worker");
+            owner.join().unwrap();
+            assert!(state.culler.is_none());
+            assert_eq!(
+                state.retired.len(),
+                2,
+                "active and previously retired work must move"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !state.shutdown() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(state.shutdown(), "the final owner must join every worker");
+        }
+    }
+
+    #[test]
+    fn stopping_an_idle_worker_wakes_and_joins_it() {
+        let mut culler = ParticleAsyncCuller::new().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !culler.shutdown() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            culler.thread.is_none(),
+            "idle recv must wake during shutdown"
+        );
+        assert!(culler.jobs.is_none());
+        assert!(culler.shutdown(), "shutdown is idempotent");
+    }
+
+    #[test]
+    fn canceled_jobs_stop_before_culling_more_queries() {
+        let (snapshot, _live) = wall(None);
+        let results = cull_job(wall_job(snapshot), &AtomicBool::new(true));
+        assert!(results.answers.is_empty());
+        assert!(results.scratch_queries.is_empty());
+    }
+
     use horizon_client::chunk::ColumnLayout;
 
     fn wall(hole: Option<[i32; 3]>) -> (Arc<OcclusionSnapshot>, Vec<Arc<Chunk>>) {
@@ -770,15 +949,56 @@ mod tests {
     #[test]
     fn particle_worker_requires_a_complete_opaque_plane_to_hide() {
         let (snapshot, live) = wall(None);
-        let results = cull_job(wall_job(snapshot));
+        let results = cull_job(wall_job(snapshot), &AtomicBool::new(false));
         let proof = results.answers[0].1.as_ref().unwrap();
         assert_eq!(proof.sections.len(), 4);
         assert_eq!(proof.chunks.len(), 2);
         drop(live);
 
         let (snapshot, live) = wall(Some([4, 0, 0]));
-        let results = cull_job(wall_job(snapshot));
+        let results = cull_job(wall_job(snapshot), &AtomicBool::new(false));
         assert!(results.answers[0].1.is_none());
         drop(live);
+    }
+
+    #[test]
+    fn answers_of_an_earlier_job_survive_a_later_job_for_other_clusters() {
+        use std::time::{Duration, Instant};
+        let world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut culler = ParticleAsyncCuller::new().unwrap();
+        culler.begin_frame(glam::DVec3::ZERO, &world);
+        let (snapshot, _live) = wall(None);
+        let key = |x: f64| CullKey {
+            camera: [0.0; 3].map(f64::to_bits),
+            min: [x, -0.55, -0.55].map(f64::to_bits),
+            max: [x + 2.1, 0.55, 0.55].map(f64::to_bits),
+        };
+        let (a, b) = (key(7.95), key(11.95));
+        for k in [a, b] {
+            culler
+                .jobs
+                .as_ref()
+                .expect("live culling worker")
+                .send(CullJob {
+                    stamp: culler.stamp,
+                    snapshot: Arc::clone(&snapshot),
+                    queries: vec![k],
+                })
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                culler.begin_frame(glam::DVec3::ZERO, &world);
+                if culler.cached(&k).is_some() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "worker did not answer");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            culler.cached(&a).is_some(),
+            "answer of the first job was dropped"
+        );
+        assert!(culler.cached(&b).is_some());
     }
 }

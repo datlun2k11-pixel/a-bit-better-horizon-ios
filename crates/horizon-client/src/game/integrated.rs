@@ -61,6 +61,8 @@ struct Flags {
     /// server follows while it runs (IntegratedServer.tickServer).
     render_distance: AtomicI32,
     simulation_distance: AtomicI32,
+    /// The second player of splitscreen (game/splitscreen.rs), let in like the owner.
+    splitscreen: Mutex<Option<u128>>,
     /// `options.entityDistanceScaling` (an `f32`'s bits), which
     /// `IntegratedServer.getScaledTrackingDistance` reads on every call.
     entity_distance: AtomicU32,
@@ -91,6 +93,54 @@ struct Flags {
 /// Work the window hands its server thread (`MinecraftServer.execute`).
 type Task = Box<dyn FnOnce(&mut Game<'_>) + Send>;
 
+/// A session-bound, nonblocking sender for a prepared content transaction.
+#[derive(Clone)]
+pub(super) struct Poster {
+    tasks: Sender<Task>,
+    flags: Arc<Flags>,
+}
+impl Poster {
+    pub(super) fn post(&self, work: impl FnOnce(&mut Game<'_>) + Send + 'static) -> bool {
+        !self.flags.stop.load(Ordering::Acquire) && self.tasks.send(Box::new(work)).is_ok()
+    }
+    pub(super) fn is_for(&self, server: &Integrated) -> bool {
+        Arc::ptr_eq(&self.flags, &server.flags)
+    }
+}
+
+/// A test owns the receiving half of the real server task channel and chooses
+/// when its queued production callbacks execute. No helper thread is detached.
+#[cfg(test)]
+pub(super) struct TestTasks {
+    tasks: Receiver<Task>,
+    flags: Arc<Flags>,
+}
+#[cfg(test)]
+impl TestTasks {
+    pub(super) fn run_next(&self, game: &mut Game<'_>) -> bool {
+        if self.flags.stop.load(Ordering::Acquire) {
+            // A stopped session cannot commit work still queued for it.
+            while self.tasks.try_recv().is_ok() {}
+            return false;
+        }
+        match self.tasks.try_recv() {
+            Ok(task) => {
+                task(game);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+#[cfg(test)]
+impl Drop for TestTasks {
+    fn drop(&mut self) {
+        // Reject sends through any retained Poster, then dropping Receiver
+        // releases pending callbacks and their generation/root leases.
+        self.flags.stop.store(true, Ordering::Release);
+    }
+}
+
 /// The window's handle on its server thread.
 pub(super) struct Integrated {
     flags: Arc<Flags>,
@@ -100,6 +150,30 @@ pub(super) struct Integrated {
     pub world_name: String,
 }
 impl Integrated {
+    #[cfg(test)]
+    pub(super) fn controlled_test_session() -> (Self, TestTasks) {
+        let (tasks, receiver) = channel();
+        let flags = Arc::new(Flags::default());
+        let handle = Self {
+            flags: flags.clone(),
+            thread: None,
+            tasks,
+            world_name: "Controlled reload test".into(),
+        };
+        (
+            handle,
+            TestTasks {
+                tasks: receiver,
+                flags,
+            },
+        )
+    }
+    pub(super) fn poster(&self) -> Poster {
+        Poster {
+            tasks: self.tasks.clone(),
+            flags: self.flags.clone(),
+        }
+    }
     /// Queue every change, even if the currently published tree still has the requested state:
     /// an earlier update may be waiting for a busy server thread.
     fn queue_pregen_option(&self, enabled: bool) {
@@ -160,7 +234,9 @@ impl Integrated {
     /// Splitscreen: `name` left; the game pauses again once every such player has. The owner's
     /// permissions it was given go with it (a LAN player could otherwise join under that name).
     pub fn leave_split(&self, name: &str) {
-        let uuid = horizon_protocol::crypto::offline_uuid(name);
+        self.leave_split_uuid(horizon_protocol::crypto::offline_uuid(name));
+    }
+    fn leave_split_uuid(&self, uuid: u128) {
         self.flags
             .split_players
             .lock()
@@ -175,7 +251,9 @@ impl Integrated {
     /// Splitscreen: a connection through memory for another player on this machine, who gets
     /// the owner's permissions. `None` once the server has stopped.
     pub fn join_split(&self, name: &str) -> Option<horizon_protocol::connection::Pipe> {
-        let uuid = horizon_protocol::crypto::offline_uuid(name);
+        self.join_split_uuid(horizon_protocol::crypto::offline_uuid(name))
+    }
+    fn join_split_uuid(&self, uuid: u128) -> Option<Pipe> {
         self.flags.split_players.lock().unwrap().push(uuid);
         let pipe = self
             .call(move |g| {
@@ -187,7 +265,7 @@ impl Integrated {
             })
             .flatten();
         if pipe.is_none() {
-            self.leave_split(name);
+            self.leave_split_uuid(uuid);
         }
         pipe
     }
@@ -201,6 +279,22 @@ impl Integrated {
         self.flags
             .entity_distance
             .store(entity.to_bits(), Ordering::Relaxed);
+    }
+    /// A second connection through memory, for splitscreen's second player `uuid`, who the server lets in
+    /// while it is not open to the LAN.
+    pub fn join_splitscreen(&self, uuid: u128) -> Result<Pipe> {
+        let pipe = self
+            .join_split_uuid(uuid)
+            .ok_or("the integrated server could not connect the external-display player")?;
+        *self.flags.splitscreen.lock().unwrap() = Some(uuid);
+        Ok(pipe)
+    }
+    /// The external-display player left; desktop splitscreen seats remain registered.
+    pub fn leave_splitscreen(&self) {
+        let uuid = self.flags.splitscreen.lock().unwrap().take();
+        if let Some(uuid) = uuid {
+            self.leave_split_uuid(uuid);
+        }
     }
     /// The window's legacy combat rules option, for the server's hits.
     pub fn set_legacy_rules(&self, on: bool) {
@@ -240,11 +334,6 @@ impl Integrated {
             Err(RecvTimeoutError::Disconnected) => None,
         }
     }
-    /// `execute`: run `f` on the server thread between two ticks, without
-    /// waiting for it. False once the server has stopped.
-    pub fn post(&self, f: impl FnOnce(&mut Game<'_>) + Send + 'static) -> bool {
-        self.tasks.send(Box::new(f)).is_ok()
-    }
     /// `IntegratedServer.halt(true)`: returns once the world is saved and let go.
     pub fn stop(mut self) -> Result<()> {
         self.halt()
@@ -252,6 +341,7 @@ impl Integrated {
     /// Stop on the server thread; the window polls completion while drawing.
     pub fn request_stop(&self) {
         self.flags.stop.store(true, Ordering::Relaxed);
+        self.flags.upgrade.set_canceled();
     }
     pub fn stopped(&self) -> bool {
         self.thread
@@ -353,6 +443,26 @@ struct Launch {
 }
 
 impl Game<'_> {
+    /// Stop and drain the server owning a world, including its preparation worker.
+    /// The window polls this while returning to the launcher instead of blocking UIKit.
+    pub(super) fn shutdown_integrated_workers(&mut self) -> bool {
+        let mut stopped = true;
+        if let Some(starting) = &self.integrated_starting {
+            starting.handle.request_stop();
+            stopped &= starting.handle.stopped();
+        }
+        if let Some(server) = &self.integrated {
+            server.request_stop();
+            stopped &= server.stopped();
+        }
+        if stopped {
+            // Integrated's Drop joins its finished thread and reports failed saves.
+            self.integrated_starting = None;
+            self.integrated = None;
+        }
+        stopped
+    }
+
     /// Only the owner window changes its integrated server's command tree. A remote
     /// server (or a splitscreen guest) keeps its own choice and permissions.
     pub(super) fn sync_pregen_option(&self) {
@@ -369,6 +479,11 @@ impl Game<'_> {
     /// in the frame or on its server thread.
     pub(super) fn has_singleplayer_server(&self) -> bool {
         self.remote.is_none() || self.integrated.is_some()
+    }
+    /// `Minecraft.isMultiplayerServer`: on another's server, or a world of one's own open to the
+    /// network.
+    pub(super) fn is_multiplayer_server(&self) -> bool {
+        !self.has_singleplayer_server() || self.is_published()
     }
     /// `IntegratedServer.isPublished`: the world is open to the network.
     pub(super) fn is_published(&self) -> bool {
@@ -405,14 +520,21 @@ impl Game<'_> {
             .as_ref()
             .map_or_else(|| self.options.player_name(), |a| a.name.clone());
         let new_world = create.is_some();
+        // `IntegratedServer`'s constructor: `setSingleplayerProfile(minecraft.getGameProfile())`
+        // — the signed-in account's own UUID. Only an offline start names its player by the
+        // offline profile. The owner is the world's player, so a world without
+        // `singleplayer_uuid` (a Realms download, `renameAndDropPlayer`) finds the owner's
+        // `players/data/<uuid>.dat` instead of starting a new player.
+        let owner = auth
+            .as_ref()
+            .map_or_else(|| offline_uuid(&player), |a| a.uuid);
         let launch = Launch {
             folder: folder.to_owned(),
             name: name.map(str::to_owned),
             seed,
             creative,
             create: create.cloned(),
-            // An offline-mode server names its players by their offline profile.
-            owner: offline_uuid(&player),
+            owner,
             player: player.clone(),
             owner_profile: auth.as_ref().map(|a| {
                 let id = a.uuid;
@@ -707,6 +829,7 @@ impl Game<'_> {
                 self.wait_for_next_server_tick(&mut next, true);
                 continue;
             }
+            self.server_tick_deadline = Some(next + self.clock.tick_duration());
             let paused = flags.paused.load(Ordering::Relaxed);
             if paused && !was_paused {
                 // IntegratedServer.tickServer: the tick the game pauses saves
@@ -779,7 +902,14 @@ impl Game<'_> {
         self.native_server_about_to_start(false);
         self.native_lifecycle_open_started();
         // `load_world`, with the world `serve` started preparing.
-        startup::time("server.wait_rest", || self.join_world_rest())?;
+        if let Err(error) = startup::time("server.wait_rest", || self.join_world_rest()) {
+            // A failed client/server transition must not leave the preparation worker
+            // writing the world after the server reports that it has stopped.
+            if let Ok(world) = opening.world {
+                drop(world.finish());
+            }
+            return Err(error);
+        }
         self.perf.world_opening();
         let open_step = startup::step("server.open_world");
         self.finish_open_world(opening.world?.finish()?)?;
@@ -834,6 +964,9 @@ impl Game<'_> {
             })),
             levels: self.level_shapes,
             owner_profile: launch.owner_profile.clone(),
+            // `IntegratedServer.getSingleplayerProfile`: the window's own player logs in
+            // through memory as the account's profile, whatever the hello says.
+            singleplayer_profile: Some((launch.player.clone(), owner)),
             // IntegratedServer.initServer: the MOTD names the owner and the world.
             ..NetConfig::lan(
                 0,
@@ -870,10 +1003,11 @@ impl Game<'_> {
             pending: None,
             load: LoadPhase::default(),
         });
-        // MinecraftServer.prepareLevels: no forced chunks to load, so the
-        // stage is over at once; the player's chunks come after.
+        // MinecraftServer.prepareLevels: the saved tickets' chunks load; the
+        // player's chunks come after.
         let view = &flags.load;
         view.start(Stage::LoadInitialChunks, 0);
+        startup::time("server.prepare_levels", || self.prepare_levels())?;
         view.finish(Stage::LoadInitialChunks);
         let _ = ready.send(Ok((pipe, self.level.name.clone())));
         startup::time("server.settle_spawn", || self.settle_spawn())
@@ -1231,6 +1365,9 @@ fn serve(
         launch.creative,
         launch.create.as_ref(),
     )
+    // `IntegratedServer.setSingleplayerProfile`: the account this world belongs to
+    // (an older world's offline owner moves to it at open).
+    .map(|request| request.owned_by(&launch.player, launch.owner))
     .and_then(|request| {
         WorldLoader::start(
             request,
@@ -1386,6 +1523,7 @@ mod tests {
         };
         server.request_stop();
         assert!(flags.stop.load(Ordering::Relaxed));
+        assert!(flags.upgrade.is_canceled());
         assert!(!server.stopped());
         release.send(()).unwrap();
         server.stop().unwrap();

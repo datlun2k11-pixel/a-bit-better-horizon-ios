@@ -43,7 +43,7 @@ fn empty_tag_selectors_follow_actual_tag_edits() {
     ));
     std::fs::create_dir_all(&scratch).unwrap();
     game.world_root = scratch.clone();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(10.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(10.5, 64.0, 0.5)).unwrap());
 
     game.build_registries();
     game.set_allow_commands(true);

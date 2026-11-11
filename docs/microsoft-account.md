@@ -1,14 +1,15 @@
 # Microsoft account sign-in and online-mode play
 
+> For this mobile fork, sign in through the native account sheet. iOS builds read `HorizonMSAClientID` from the app’s Info.plist; the mobile workflow fills it from `HORIZON_MSA_CLIENT_ID`, using the official public application ID by default. Use [the mobile issue tracker](https://github.com/heyskylo/horizon-ios/issues) for sign-in problems. The desktop and registration details below are shared engine reference.
+
 Horizon signs players in with their Microsoft account in the launcher and joins online-mode
 (authenticated) servers like vanilla 26.3 does. The launcher plays only with an account that owns
 Minecraft: Java Edition ([the owner gate](#the-owner-gate)); offline names, LAN and offline-mode
-servers play behind it. This note is the design, the status of each part and what Ludovic has to
-register.
+servers play behind it. This note describes the shared engine flow and the application registration maintained for a build.
 
-## What Ludovic registers (needs his accounts)
+## What the build maintainers configure
 
-Nothing below can be done by an agent: the app registrations belong to Ludovic. A build without
+Application registrations belong to their maintainers. Use the client ID provided for your build, or register an application you control. A build without
 the client ID can't sign in, so its launcher can't start the game ("This build of the launcher has
 no Microsoft sign-in"); release builds have it.
 
@@ -28,17 +29,16 @@ no Microsoft sign-in"); release builds have it.
    `api.minecraftservices.com/authentication/login_with_xbox` (HTTP 403, "Invalid app registration")
    until Mojang approves them. Apply with the form linked from https://aka.ms/mce-reviewappid
    (Minecraft Java "App ID review"), giving the client ID above, the app name, the project URL
-   (https://github.com/horizon-rust/horizon) and a short description ("open-source Minecraft Java
+   (https://github.com/heyskylo/horizon-ios) and a short description ("open-source Minecraft Java
    Edition client written in Rust; signs players in to join online-mode servers"). Approval takes
    days to weeks; sign-in fails at the Minecraft step with "This app is not approved by Mojang yet"
    until then.
 3. **Where the ID goes**:
-   - Release builds: the GitHub repository variable (not a secret: client IDs are public)
-     `HORIZON_MSA_CLIENT_ID`; the launcher's build reads it with `option_env!` at compile time.
-   - Any build, at run time: the environment variable `HORIZON_MSA_CLIENT_ID` overrides the built-in
-     value (empty or unset = not configured).
+   - This mobile fork includes Horizon’s public application ID by default. Its iOS workflow passes `HORIZON_MSA_CLIENT_ID` at build time and writes `HorizonMSAClientID` into the app’s Info.plist. The native SwiftUI account sheet reads that plist value, with the same public default as a fallback.
+   - Custom Rust game builds may override the default with the build-time environment variable `HORIZON_MSA_CLIENT_ID`; empty or unset retains the public mobile default. The native account sheet does not read a runtime shell environment override.
+   - The separate upstream desktop launcher has its own configuration: its release workflow reads a repository variable and its desktop process can accept a runtime environment override.
 
-Never use another application's client ID (the official launcher's or another launcher's).
+Do not borrow the Minecraft launcher’s or an unrelated application’s client ID. The public default used by this port is the official **Horizon** application ID, documented in [Mobile public client ID](#mobile-public-client-id).
 
 ## Flow (launcher)
 
@@ -47,6 +47,13 @@ All requests use HTTPS and JSON except the two OAuth calls (form-encoded):
 1. **Device code**: `POST https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode`
    (`client_id`, `scope=XboxLive.signin offline_access`). The launcher shows the `user_code` and
    `verification_uri` (https://www.microsoft.com/link) with a copy button and opens the browser.
+   The device code page takes whatever Microsoft account the browser is signed in to, and the flow has
+   no option for an account picker (no `prompt`, no `login_hint`). To add a different account without any
+   change to the Azure app (#3786), the sign-in panel offers **Open in private window**: the default
+   browser's private window (`launcher/src/private_window.rs`: the `https` ProgId on Windows, LaunchServices
+   on macOS, `xdg-settings` on Linux; `--incognito`, `--inprivate`, `--private`, `--private-window`) has no
+   Microsoft session. Safari and unknown browsers get **Copy link** and a hint instead. **Use a different
+   Microsoft account** opens `login.live.com/logout.srf` and then the code page.
 2. **Poll** `POST …/consumers/oauth2/v2.0/token` (`grant_type=urn:ietf:params:oauth:grant-type:device_code`)
    every `interval` seconds; `authorization_pending` waits, `slow_down` adds 5 s, `authorization_declined`,
    `expired_token` and `bad_verification_code` end the sign-in with a message. Result: the Microsoft
@@ -79,7 +86,7 @@ possible; the launcher just doesn't offer it on its own.
   says "Sign in with a Microsoft account that owns Minecraft: Java Edition to play", with Sign in.
 - **The window says it once.** A player without an owner (one who played offline until now) sees
   the gate's screen once when the launcher opens: why Horizon needs the account ("like other
-  launchers"), that worlds, offline names and settings stay where they are, and Sign in, which shows
+  launchers"), and Sign in, which shows
   the device code on the same screen. It comes back whenever Play is refused; Not now closes it,
   and Home keeps a Sign in row (`launcher/src/owner_page.rs`).
 - **The answer lives with the tokens.** Each account's keychain item keeps the last answer
@@ -88,8 +95,13 @@ possible; the launcher just doesn't offer it on its own.
   `secret-tool` or Keychain Access. With no network (or a sign-in that can't be renewed) the
   last answer stands: being offline never blocks a player who passed before, and the game starts
   without a session, offline. An answer of "doesn't own" (or no profile) blocks at once.
-- **Offline names play behind an owner.** They can be added and played only while an owning
-  account is signed in. Signing the last one out keeps them, and they play again once one is back.
+- **The account that plays owns the game.** The game plays as the selected account (else the
+  first), which must own the game itself: another account's ownership doesn't let it play
+  (`account::launch_for_game`). The project decided on 2026-11-09 that Horizon plays only with a
+  Microsoft account that owns Minecraft: Java Edition: the offline names, their skins and capes,
+  and 0.2.58's hidden developer option are gone. Files from older launchers still load; the next
+  save drops them (`offline`, `offline_selected`, `looks` and `skins/` in accounts.json's folder,
+  `dev_offline` in settings.json).
 - **Who isn't affected:** the game binary itself (`horizon-client`, `horizon-ctl launch`, the
   harnesses, CI), the dedicated server and `horizon-server`, the website. There is no bypass flag:
   the launcher's tests use accounts in a memory store (`MemoryStore`, and `HORIZON_NO_KEYCHAIN`
@@ -140,8 +152,11 @@ one is selected. "Sign out" deletes the account's secrets from the keychain.
   secrets the keychain refuses go to `account-secrets.json` in the launcher's data folder instead,
   readable and writable by the player only (0600 on Unix) and never in plain text: the file is
   encrypted (ChaCha20-Poly1305) with a key derived from the computer's identity (`/etc/machine-id`,
-  `/etc/hostid`), so a copy taken off the computer (a backup, a synced home folder) can't be read
-  elsewhere. On the computer itself the file's mode is what keeps other users out. A file that
+  `/etc/hostid`) and a random secret of the install's own, `account-secrets.key` beside it (32
+  bytes, 0600, made at the first write), so a copy taken off the computer (a backup, a synced home
+  folder) can't be read elsewhere, and nobody can work the key out from what every user can read.
+  On the computer itself the files' mode is what keeps other users out. A file sealed by an older
+  launcher (machine identity only) is read once and sealed again under the new key. A file that
   doesn't open (another computer's, or changed) is never written over: remove it and sign in again. The
   launcher never picks one store for a run: every read takes the file's copy first (it was written
   while the keychain was away, so it is the newer one) and the keychain's otherwise, and every write
@@ -219,7 +234,7 @@ Progress is public metadata and does not expose credentials through the UI or MC
 name the expected player. Signing in to a different account is rejected before storing its
 credentials or adding/selecting that identity. Retry keeps the same target; Cancel leaves the
 saved account alone. Successful re-sign-in restores that account without changing the player
-or offline name currently selected for Play. Adding a new account remains a separate action.
+currently selected for Play. Adding a new account remains a separate action.
 
 ## Handing the session to the game
 
@@ -276,7 +291,8 @@ Code: `horizon-protocol` (`rsa.rs`, `crypto::server_hash`), `horizon-client` (`a
 
 Horizon's dedicated server verifies players when `online-mode=true`. A LAN or Play with Friends world
 verifies its guests when the host is signed in, as vanilla's `IntegratedServer` does
-(`OnlineMode::lan`); under an offline name it stays offline-mode. The host's own player joins through
+(`OnlineMode::lan`); started without a session (the services couldn't be reached at Play) it
+stays offline-mode. The host's own player joins through
 memory and is never asked to authenticate.
 
 `HORIZON_API_DISCOVERY` overrides the discovery URL, the counterpart of authlib's
@@ -359,3 +375,33 @@ Microsoft, Xbox and Minecraft endpoints, and the keychain abstraction with an in
 - (d) Game: chat signing (profile keys, chat session, signed messages and commands).
 
 Each part ships on its own: online mode needs a session, which only (c) creates.
+
+## Native iOS launcher accounts
+
+The launcher Account sheet can keep several Microsoft accounts. Add an account,
+select the profile to use for the next Play, remove an individual account, or
+choose offline play without deleting the saved accounts. Microsoft profile names
+are read-only. Switching in the launcher does not change an existing multiplayer
+connection's identity.
+
+Every Play waits for the selected account's credentials and the game's session
+acknowledgement. A Minecraft session with five minutes or less remaining is renewed;
+concurrent requests await the same renewal. A renewal failure blocks launch with a
+message instead of silently using offline mode. A still-unexpired token can be
+revoked by the service before its recorded expiry; such revocation is not probed
+on every Play.
+
+Credentials are stored per Minecraft UUID in the device Keychain; preferences keep
+only profile metadata and selection. Existing single-account installations migrate
+by copying credentials successfully before deleting the legacy entry. Updates do
+not delete a working Keychain entry before writing its replacement. Rotated refresh
+tokens are saved before subsequent Xbox/Minecraft requests, so a downstream failure
+does not discard the replacement. Temporary failures keep the saved account;
+Microsoft rejecting the refresh credential asks the user to sign in again.
+
+The simulator authentication tests use intercepted networking, an in-memory vault,
+and isolated preferences. They do not access real Microsoft accounts or credentials.
+
+## Mobile public client ID
+
+The mobile port defaults to `331e08f8-172d-43b9-835a-3108c2fcdbf3`, embedded in the [official Horizon launcher release](https://github.com/horizon-rust/horizon/releases/tag/launcher%400.2.56). Client IDs are public application identifiers, not client secrets. The same default is used by the native account sheet, the game and mobile CI builds. Custom build tooling can supply an explicit ID. Existing accounts may require a new sign-in when moving between application registrations; refresh tokens belong to the registration that issued them.

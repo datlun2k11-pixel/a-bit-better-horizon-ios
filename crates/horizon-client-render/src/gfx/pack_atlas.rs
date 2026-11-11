@@ -19,7 +19,7 @@ pub(super) struct PackAtlas {
     pub sprite: u32,
     /// Layers per sprite array.
     split: u32,
-    /// OptiFine/Iris separate ambient occlusion: pass vertex alpha to hz_Color.a.
+    /// Shader policy: expose the per-quad ambient occlusion in `hz_Color.a`.
     pub separate_ao: bool,
     /// The stitched layout, when the atlas has one.
     stitched: Option<Stitched>,
@@ -548,27 +548,107 @@ impl PackAtlas {
     }
 }
 
-/// A `TerrainVertex` of flat draws' arena page (`hz_vertices`, six words each) into the vertex
-/// inputs, for vertex `hz_vertex_index`.
-pub const PULL: &str = "        uint hz_pw = hz_vertex_index * 6u;\n        \
-    hz_v_pos = uintBitsToFloat(uvec3(hz_vertices[hz_pw], hz_vertices[hz_pw + 1u], hz_vertices[hz_pw + 2u]));\n        \
-    hz_v_uv = uvec2(hz_vertices[hz_pw + 3u] & 65535u, hz_vertices[hz_pw + 3u] >> 16u);\n        \
-    hz_v_layer = hz_vertices[hz_pw + 4u] & 65535u;\n        \
-    uint hz_pl = hz_vertices[hz_pw + 4u] >> 16u;\n        \
-    hz_v_light = uvec2(hz_pl & 255u, hz_pl >> 8u);\n        \
-    hz_v_color = unpackUnorm4x8(hz_vertices[hz_pw + 5u]);\n";
+/// GLSL: terrain.wgsl's `section_corner` over the arena page (`hz_vertices`), by quad: a
+/// vertex's words as `TerrainVertex` holds them (position, then UV, layer with light, colour),
+/// from vertices below `PACKED_BASE` or a compact record (`mesher/packed.rs`) past it. Records
+/// give back their quad's vertices bit for bit, so packs read either layout alike.
+/// `hz_arena_corner`: a vertex's position and UV words; `hz_record_corner`: corner `k`'s of the
+/// record `lo`, `hi`; `hz_record_rest`: its layer-with-light and colour words.
+const CORNER_FN: &str = "void hz_arena_corner(uint hz_av, out uvec3 hz_p, out uint hz_uv) {\n    \
+    uint hz_w = hz_av * 6u;\n    \
+    hz_p = uvec3(hz_vertices[hz_w], hz_vertices[hz_w + 1u], hz_vertices[hz_w + 2u]);\n    \
+    hz_uv = hz_vertices[hz_w + 3u];\n\
+}\n\
+uint hz_corner_offset(uint hz_rel, uint hz_side, uint hz_du, uint hz_dw) {\n    \
+    return hz_rel == 0u ? hz_side : (hz_rel == 1u ? hz_du : hz_dw);\n\
+}\n\
+void hz_record_corner(uvec3 hz_lo, uvec3 hz_hi, uint hz_k, out uvec3 hz_p, out uint hz_uv) {\n    \
+    uint hz_o = (hz_hi.z >> 12u) & 0x3ffffu;\n    \
+    uvec3 hz_block = uvec3(hz_o & 15u, (hz_o >> 4u) & 15u, (hz_o >> 8u) & 15u);\n    \
+    uint hz_axis = (hz_o >> 12u) & 3u;\n    \
+    uint hz_side = (hz_o >> 14u) & 1u;\n    \
+    uint hz_step = (((hz_o >> 15u) & 3u) + (((hz_o >> 17u) & 1u) == 1u ? 4u - hz_k : hz_k)) & 3u;\n    \
+    uint hz_du = (hz_step == 1u || hz_step == 2u) ? 1u : 0u;\n    \
+    uint hz_dw = hz_step >= 2u ? 1u : 0u;\n    \
+    uvec3 hz_pos = hz_block + uvec3(hz_corner_offset((3u - hz_axis) % 3u, hz_side, hz_du, hz_dw),\n        \
+        hz_corner_offset((4u - hz_axis) % 3u, hz_side, hz_du, hz_dw),\n        \
+        hz_corner_offset((5u - hz_axis) % 3u, hz_side, hz_du, hz_dw));\n    \
+    uint hz_sel = hz_lo.z >> 24u;\n    \
+    uint hz_u = (hz_lo.z >> (6u * ((hz_sel >> (2u * hz_k)) & 1u))) & 63u;\n    \
+    uint hz_v = (hz_lo.z >> (12u + 6u * ((hz_sel >> (2u * hz_k + 1u)) & 1u))) & 63u;\n    \
+    hz_p = floatBitsToUint(vec3(hz_pos));\n    \
+    hz_uv = (hz_u << 10u) | (hz_v << 26u);\n\
+}\n\
+uvec2 hz_record_rest(uvec3 hz_lo, uvec3 hz_hi, uint hz_k) {\n    \
+    uint hz_l = hz_k == 0u ? hz_hi.x >> 16u : (hz_k == 1u ? hz_hi.y : (hz_k == 2u ? hz_hi.y >> 12u : hz_hi.z));\n    \
+    hz_l &= 0xfffu;\n    \
+    uint hz_pl = ((hz_l & 63u) << 2u) | (((hz_l >> 6u) & 63u) << 10u);\n    \
+    uint hz_g = (hz_lo.y >> (8u * hz_k)) & 255u;\n    \
+    uint hz_t = hz_lo.x;\n    \
+    uint hz_code = hz_k == 1u ? (hz_hi.x >> 28u) & 7u : (hz_k == 2u ? (hz_hi.y >> 24u) & 7u\n        \
+        : (hz_k == 3u ? (hz_hi.y >> 27u) & 7u : 0u));\n    \
+    uint hz_alpha = hz_code == 0u ? hz_t & 0xff000000u : (hz_code * 51u) << 24u;\n    \
+    uint hz_c = (hz_g * ((hz_t >> 16u) & 255u) / 255u) | ((hz_g * ((hz_t >> 8u) & 255u) / 255u) << 8u)\n        \
+        | ((hz_g * (hz_t & 255u) / 255u) << 16u) | hz_alpha;\n    \
+    return uvec2((hz_hi.x & 0xffffu) | (hz_pl << 16u), hz_c);\n\
+}\n";
+
+/// GLSL: a flat-drawn vertex's inputs, and its quad's four corners' positions (`hz_cp0`..) and
+/// UV words (`hz_uv0`..), pulled from the arena page as terrain.wgsl's `vs_section_flat` pulls
+/// them (`CORNER_FN`): a record is read once for all four, and only the vertex's own light and
+/// colour are worked out. `hz_slot`: the slot its block is found by (`hz_block_slots`, 256 a
+/// block). The colour as the vertex fetch converts a Unorm8x4 (terrain.wgsl's `unorm8x4`).
+const PULL_FLAT: &str = "    uint hz_qv = uint(gl_VertexIndex);\n    \
+    uint hz_own = hz_qv & 3u;\n    \
+    uint hz_av = hz_qv & ~3u;\n    \
+    uint hz_slot = hz_qv;\n    \
+    bool hz_rec = false;\n    \
+    uvec3 hz_lo = uvec3(0u);\n    \
+    uvec3 hz_hi = uvec3(0u);\n    \
+    if (hz_av >= 0x10000000u) {\n        \
+        hz_slot = (hz_av - 0x10000000u) >> 2u;\n        \
+        uint hz_rw = hz_slot * 6u;\n        \
+        hz_lo = uvec3(hz_vertices[hz_rw], hz_vertices[hz_rw + 1u], hz_vertices[hz_rw + 2u]);\n        \
+        hz_hi = uvec3(hz_vertices[hz_rw + 3u], hz_vertices[hz_rw + 4u], hz_vertices[hz_rw + 5u]);\n        \
+        hz_rec = (hz_hi.z & 0x80000000u) == 0u;\n        \
+        hz_av = hz_slot + hz_lo.x;\n    \
+    }\n    \
+    uvec3 hz_cp0; uvec3 hz_cp1; uvec3 hz_cp2; uvec3 hz_cp3;\n    \
+    uint hz_uv0; uint hz_uv1; uint hz_uv2; uint hz_uv3;\n    \
+    uvec2 hz_rest;\n    \
+    if (hz_rec) {\n        \
+        hz_record_corner(hz_lo, hz_hi, 0u, hz_cp0, hz_uv0);\n        \
+        hz_record_corner(hz_lo, hz_hi, 1u, hz_cp1, hz_uv1);\n        \
+        hz_record_corner(hz_lo, hz_hi, 2u, hz_cp2, hz_uv2);\n        \
+        hz_record_corner(hz_lo, hz_hi, 3u, hz_cp3, hz_uv3);\n        \
+        hz_rest = hz_record_rest(hz_lo, hz_hi, hz_own);\n    \
+    } else {\n        \
+        hz_arena_corner(hz_av, hz_cp0, hz_uv0);\n        \
+        hz_arena_corner(hz_av + 1u, hz_cp1, hz_uv1);\n        \
+        hz_arena_corner(hz_av + 2u, hz_cp2, hz_uv2);\n        \
+        hz_arena_corner(hz_av + 3u, hz_cp3, hz_uv3);\n        \
+        uint hz_ow = (hz_av + hz_own) * 6u;\n        \
+        hz_rest = uvec2(hz_vertices[hz_ow + 4u], hz_vertices[hz_ow + 5u]);\n    \
+    }\n    \
+    uvec3 hz_vp = hz_own == 0u ? hz_cp0 : (hz_own == 1u ? hz_cp1 : (hz_own == 2u ? hz_cp2 : hz_cp3));\n    \
+    uvec3 hz_vr = uvec3(hz_own == 0u ? hz_uv0 : (hz_own == 1u ? hz_uv1 : (hz_own == 2u ? hz_uv2 : hz_uv3)), hz_rest);\n    \
+    hz_v_pos = uintBitsToFloat(hz_vp);\n    \
+    hz_v_uv = uvec2(hz_vr.x & 65535u, hz_vr.x >> 16u);\n    \
+    hz_v_layer = hz_vr.y & 65535u;\n    \
+    hz_v_light = uvec2((hz_vr.y >> 16u) & 255u, hz_vr.y >> 24u);\n    \
+    hz_v_color = vec4(float(hz_vr.z & 255u), float((hz_vr.z >> 8u) & 255u), float((hz_vr.z >> 16u) & 255u),\n        \
+        float(hz_vr.z >> 24u)) * (1.0 / 255.0);\n";
 
 /// GLSL: the face normal and tangent of a flat-drawn vertex, from its quad's first three corners
-/// (quads are four consecutive vertices of the page; position words 0-2, UV word 3).
-const FACE: &str = "    uint hz_q = (uint(gl_VertexIndex) & ~3u) * 6u;\n    \
-    vec3 hz_p0 = uintBitsToFloat(uvec3(hz_vertices[hz_q], hz_vertices[hz_q + 1u], hz_vertices[hz_q + 2u]));\n    \
-    vec3 hz_p1 = uintBitsToFloat(uvec3(hz_vertices[hz_q + 6u], hz_vertices[hz_q + 7u], hz_vertices[hz_q + 8u]));\n    \
-    vec3 hz_p2 = uintBitsToFloat(uvec3(hz_vertices[hz_q + 12u], hz_vertices[hz_q + 13u], hz_vertices[hz_q + 14u]));\n    \
-    uvec3 hz_w = uvec3(hz_vertices[hz_q + 3u], hz_vertices[hz_q + 9u], hz_vertices[hz_q + 15u]);\n    \
+/// (`PULL_FLAT`'s corners: four consecutive vertex indices, in either layout).
+const FACE: &str = "    vec3 hz_p0 = uintBitsToFloat(hz_cp0);\n    \
+    vec3 hz_p1 = uintBitsToFloat(hz_cp1);\n    \
+    vec3 hz_p2 = uintBitsToFloat(hz_cp2);\n    \
+    uvec3 hz_w = uvec3(hz_uv0, hz_uv1, hz_uv2);\n    \
     vec2 hz_t0 = vec2(hz_w.x & 65535u, hz_w.x >> 16u);\n    \
     vec2 hz_d1 = vec2(hz_w.y & 65535u, hz_w.y >> 16u) - hz_t0;\n    \
     vec2 hz_d2 = vec2(hz_w.z & 65535u, hz_w.z >> 16u) - hz_t0;\n    \
-    uint hz_w3 = hz_vertices[hz_q + 21u];\n    \
+    uint hz_w3 = hz_uv3;\n    \
     vec2 hz_t3 = vec2(hz_w3 & 65535u, hz_w3 >> 16u);\n    \
     hz_mid = (clamp(hz_t0 * hz_uv_scale, 0.0, 1.0) + clamp((hz_t0 + hz_d1) * hz_uv_scale, 0.0, 1.0)\n        \
         + clamp((hz_t0 + hz_d2) * hz_uv_scale, 0.0, 1.0) + clamp(hz_t3 * hz_uv_scale, 0.0, 1.0)) * 0.25;\n    \
@@ -620,36 +700,46 @@ impl PackAtlas {
     /// The vertex inputs of a gbuffers program drawing terrain (`TerrainVertex`, terrain.wgsl's
     /// `vs_terrain` or, for `flat` draws, `vs_terrain_flat`), in atlas coordinates.
     pub fn terrain_inputs(&self, flat: bool) -> horizon_shaders::GbuffersInputs {
-        let mut declarations = String::from(
-            "layout(location = 0) in vec3 hz_v_pos;\nlayout(location = 1) in uvec2 hz_v_uv;\n\
-             layout(location = 2) in uint hz_v_layer;\nlayout(location = 3) in vec4 hz_v_color;\n\
-             layout(location = 4) in uvec2 hz_v_light;\n",
-        );
+        // Flat draws pull their vertices from the arena page (`PULL_FLAT`), which may hold
+        // solid quads in the compact layout; others read them as vertex attributes.
+        let mut declarations = if flat {
+            String::from(
+                "vec3 hz_v_pos; uvec2 hz_v_uv; uint hz_v_layer; vec4 hz_v_color; uvec2 hz_v_light;\n",
+            )
+        } else {
+            String::from(
+                "layout(location = 0) in vec3 hz_v_pos;\nlayout(location = 1) in uvec2 hz_v_uv;\n\
+                 layout(location = 2) in uint hz_v_layer;\nlayout(location = 3) in vec4 hz_v_color;\n\
+                 layout(location = 4) in uvec2 hz_v_light;\n",
+            )
+        };
         let origin = if flat {
             declarations.push_str(
                 "layout(set = 1, binding = 0) readonly buffer HzBlockSlots { uint hz_block_slots[]; };\n\
                  layout(set = 1, binding = 1) readonly buffer HzSlotOrigins { vec4 hz_slot_origins[]; };\n",
             );
-            // Of each sprite layer, `mc_Entity` (id, then 1 for fluids or 0) and
-            // `at_midBlock.w` (its block's light), the game's table; and the arena page's
-            // vertices (`TerrainVertex`, six words each).
-            declarations.push_str(
-                "layout(set = 3, binding = 0) readonly buffer HzBlockIds { int hz_block_ids[]; };\n\
-                 layout(set = 3, binding = 1) readonly buffer HzVertices { uint hz_vertices[]; };\n\
-                 layout(set = 3, binding = 2) readonly buffer HzSpriteRects { uvec2 hz_sprite_rects[]; };\n",
-            );
-            "hz_slot_origins[hz_block_slots[uint(gl_VertexIndex) >> 8u]]"
+            "hz_slot_origins[hz_block_slots[hz_slot >> 8u]]"
         } else {
             declarations.push_str("layout(location = 5) in vec4 hz_v_origin;\n");
             "hz_v_origin"
         };
+        declarations.push_str("layout(set = 3, binding = 0) readonly buffer HzBlockIds { int hz_block_ids[]; };\nlayout(set = 3, binding = 1) readonly buffer HzVertices { uint hz_vertices[]; };\nlayout(set = 3, binding = 2) readonly buffer HzQuadStates { uint hz_quad_states[]; };\nlayout(set = 3, binding = 3) readonly buffer HzSpriteRects { uvec2 hz_sprite_rects[]; };\nvec4 hz_mc_entity; vec3 hz_mid_block; vec2 hz_mid_uv; float hz_emission;\n");
+        declarations.push_str(&format!(
+            "const uint hz_state_words = {}u;\n",
+            super::TERRAIN_STATE_WORDS
+        ));
+        declarations.push_str(&format!(
+            "const uint hz_quad_words = {}u;\n",
+            super::terrain_metadata::WORDS
+        ));
         let [width, height] = self.size();
         // A sprite's cell in its own sides, and the share of the atlas a side is: from the table
         // in flat draws (`rects_table`), from the grid in others.
         let columns = self.columns;
         let (cell, side, scale) = if flat {
             (
-                "uvec2 hz_rect = hz_sprite_rects[hz_layer];\n    \
+                "uvec2 hz_rect = uvec2(0u, 1u);\n    \
+                 if (hz_layer < uint(hz_sprite_rects.length())) hz_rect = hz_sprite_rects[hz_layer];\n    \
                  hz_cell = vec2(float(hz_rect.x & 65535u), float(hz_rect.x >> 16u)) / float(hz_rect.y);\n    "
                     .to_owned(),
                 "float(hz_rect.y)",
@@ -668,12 +758,8 @@ impl PackAtlas {
             )
         };
         // UVs past a sprite (models up to 2, distant tiles) cannot repeat in an atlas: clamped.
-        // The colour's alpha holds HDR's emission level (`mesher::EMISSION_BITS`): packs get 1 unless separate_ao.
-        let color_a = if self.separate_ao {
-            "hz_v_color.a"
-        } else {
-            "1.0"
-        };
+        // The vertex alpha retains HDR flags for normal rendering; shader AO is
+        // reconstructed exactly from the sidecar below, not borrowed from those bits.
         // A vertex's place in its section goes down to the 32768th of a block below it: read back
         // with a probe pack of ours, Iris 1.11.7's terrain `gl_Vertex` has that for every position
         // we read (water tops at 8/9 - 0.001, plants' offsets), on all three axes (#8464). A fit,
@@ -693,31 +779,43 @@ impl PackAtlas {
              hz_MultiTexCoord0 = vec4((hz_cell + clamp(vec2(hz_v_uv) * hz_uv_scale, 0.0, 1.0)) * hz_scale, 0.0, 1.0);\n    \
              hz_MultiTexCoord1 = vec4(float(hz_v_light.y), float(hz_v_light.x), 0.0, 1.0);\n    \
              hz_MultiTexCoord2 = hz_MultiTexCoord1;\n    \
-             hz_Color = vec4(hz_v_color.rgb, {color_a});\n    \
+             hz_Color = vec4(hz_v_color.rgb, 1.0);\n    \
              hz_Normal = vec3(0.0, 1.0, 0.0);\n    \
              hz_tangent = vec4(1.0, 0.0, 0.0, 1.0);\n",
             scale[0], scale[1],
         );
         let mut body = body;
-        if flat {
-            body.push_str(FACE);
+        body.push_str(FACE);
+        body.push_str(r#"    hz_mc_entity=vec4(-1.0,0.0,0.0,0.0); hz_mid_block=vec3(0.0); hz_emission=0.0;
+    uint hz_meta=(uint(gl_VertexIndex)>>2u)*hz_quad_words;
+    uvec2 hz_source=uvec2(hz_quad_states[hz_meta],hz_quad_states[hz_meta+1u]);
+    if(hz_source.x!=0xffffffffu){
+        vec3 hz_cell_origin=vec3(uvec3(hz_source.y&15u,(hz_source.y>>4u)&15u,(hz_source.y>>8u)&15u));
+        hz_mid_block=(hz_cell_origin+vec3(0.5)-hz_v_pos)*64.0;
+        if(hz_source.x<uint(hz_block_ids.length())/hz_state_words){
+            uint hz_id=hz_state_words*hz_source.x+2u*((hz_source.y>>12u)&1u);
+            hz_mc_entity.xy=vec2(float(hz_block_ids[hz_id]),float(hz_block_ids[hz_id+1u]));
+            hz_emission=float(hz_block_ids[hz_state_words*hz_source.x+4u]);
         }
+        if((hz_source.y&8192u)!=0u){
+            vec4 hz_no_dir=unpackUnorm4x8(hz_quad_states[hz_meta+2u+(uint(gl_VertexIndex)&3u)]);
+            vec4 hz_tint=unpackUnorm4x8(hz_quad_states[hz_meta+6u]);
+            vec4 hz_shaded_tint=unpackUnorm4x8(hz_quad_states[hz_meta+7u]);
+            float hz_ao=mix(1.0,hz_no_dir.a,hz_ao_strength);
+            if(hz_separate_ao){hz_Color=vec4(hz_old_lighting?hz_shaded_tint.rgb:hz_tint.rgb,hz_ao);}
+            else{hz_Color=vec4(hz_old_lighting?mix(hz_shaded_tint.rgb,hz_v_color.rgb,hz_ao_strength):mix(hz_tint.rgb,hz_no_dir.rgb,hz_ao_strength),1.0);}
+        }
+    }
+    vec2 hz_avg_uv=vec2(0.0);
+    for(uint hz_c=0u;hz_c<4u;++hz_c){
+        uint hz_uv_word=hz_vertices[hz_q+hz_c*6u+3u];
+        hz_avg_uv+=clamp(vec2(float(hz_uv_word&65535u),float(hz_uv_word>>16u))*(hz_origin.w > 0.0 ? uintBitsToFloat(floatBitsToUint(hz_origin.w) & 0xff800000u) : fract(abs(hz_origin.w))),0.0,1.0)*0.25;
+    }
+    hz_mid_uv=(hz_cell+hz_avg_uv)*hz_scale;
+"#);
         declarations.push_str(
             "vec2 hz_cell; vec2 hz_scale; vec2 hz_mid; float hz_uv_scale; vec4 hz_tangent;\n",
         );
-        let entity = if flat {
-            "vec4(float(hz_block_ids[3u * hz_layer]), float(hz_block_ids[3u * hz_layer + 1u]), 0.0, 0.0)"
-        } else {
-            "vec4(-1.0, 0.0, 0.0, 0.0)"
-        };
-        // The block a face belongs to: half a block behind its centre (the quad's diagonal);
-        // w, the light it gives (Iris's `BLOCK_EMISSION_ATTRIBUTE`, 0 to 15).
-        let mid_block = if flat {
-            "vec4((floor((hz_p0 + hz_p2) * 0.5 - 0.5 * hz_Normal) + 0.5 - hz_v_pos) * 64.0, \
-             float(hz_block_ids[3u * hz_layer + 2u]))"
-        } else {
-            "vec4(0.0)"
-        };
         let attributes = [
             // section_instance stores 1 - visibility in a positive origin's mantissa.
             // Negative origins encode a distant-terrain handover, fully visible here
@@ -726,11 +824,12 @@ impl PackAtlas {
                 "mc_chunkFade",
                 "(hz_origin.w > 0.0 ? 1.0 - float(floatBitsToUint(hz_origin.w) & 0x7fffffu) / 8388608.0 : 1.0)",
             ),
-            ("mc_Entity", entity),
-            ("at_midBlock", mid_block),
+            ("mc_Entity", "hz_mc_entity"),
+            ("at_midBlock", "vec4(hz_mid_block, hz_emission)"),
+            ("mc_midTexCoord", "vec4(hz_mid_uv, 0.0, 1.0)"),
             (
-                "mc_midTexCoord",
-                "vec4((hz_cell + hz_mid) * hz_scale, 0.0, 1.0)",
+                "horizonTier",
+                "float(15u - (uint(round(hz_v_color.a * 255.0)) & 15u))",
             ),
             ("at_tangent", "hz_tangent"),
             ("vaPosition", "hz_Vertex.xyz"),
@@ -747,9 +846,16 @@ impl PackAtlas {
                 .map(|&(n, v)| (n.to_owned(), v.to_owned()))
                 .collect(),
             after: String::new(),
+            terrain_lighting: Some(horizon_shaders::TerrainLighting {
+                separate_ao: self.separate_ao,
+                ..Default::default()
+            }),
             alpha_test: None,
             item_id_declared: false,
             far_depth: false,
+            paged_maps: false,
+            water_mask: false,
+            water_patches: false,
         }
     }
 }
@@ -1100,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn terrain_inputs_respects_separate_ao() {
+    fn terrain_inputs_separate_ao_uses_metadata_not_hdr_alpha() {
         let instance = crate::gfx::test_gpu::instance();
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             return;
@@ -1139,10 +1245,16 @@ mod tests {
 
         atlas.separate_ao = true;
         let inputs_separate = atlas.terrain_inputs(false);
+        assert!(inputs_separate.terrain_lighting.unwrap().separate_ao);
+        assert!(inputs_separate.body.contains("if(hz_separate_ao)"));
         assert!(
             inputs_separate
                 .body
-                .contains("hz_Color = vec4(hz_v_color.rgb, hz_v_color.a);")
+                .contains("hz_Color = vec4(hz_v_color.rgb, 1.0);")
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pack_atlas/source_ownership_test.rs"]
+mod source_ownership_test;

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,11 @@ REQUIRED = {
     "horizon-macos-x64.zip", "horizon-server-linux-x86_64.tar.gz", "horizon-source.tar.gz",
 }
 OPTIONAL = ("horizon-windows-arm64.zip", "horizon-linux-musl-x86_64.tar.gz")
+# The bash on PATH, as in test_pr_ready: Windows' CreateProcess looks in System32 before PATH, so a bare "bash"
+# there is WSL's, which gets none of the steps' env and none of the host's paths.
+BASH = shutil.which("bash")
+POSIX_BASH = BASH is not None and not (
+    os.name == "nt" and os.path.dirname(os.path.normcase(BASH)).endswith(os.path.normcase(r"\system32")))
 
 
 def run_step(containing):
@@ -26,8 +32,8 @@ def run_step(containing):
     raise AssertionError(f"no workflow step containing {containing}")
 
 
-@unittest.skipUnless(shutil.which("bash") and shutil.which("openssl") and shutil.which("sha256sum"),
-                     "release shell checks require bash, OpenSSL and sha256sum")
+@unittest.skipUnless(POSIX_BASH and shutil.which("openssl") and shutil.which("sha256sum"),
+                     "release shell checks require a bash that is not WSL's, OpenSSL and sha256sum")
 class OptionalReleaseAssetsTests(unittest.TestCase):
     def test_sign_and_publish_with_each_optional_archive_combination(self):
         for mask in range(4):
@@ -41,15 +47,39 @@ class OptionalReleaseAssetsTests(unittest.TestCase):
                 script_dir = root / "tools/ci"
                 script_dir.mkdir(parents=True)
                 shutil.copy(ROOT / "tools/ci/sign_release.sh", script_dir)
+                # Exercise actual shell temp creation too: macOS mktemp with no
+                # template can ignore TMPDIR and fail on a full internal drive.
+                temp_parent = root / "temporary files"
+                temp_parent.mkdir()
+                tools = root / "test-bin"
+                tools.mkdir()
+                allocations = root / "temp-allocations"
+                real_mktemp = shutil.which("mktemp")
+                self.assertIsNotNone(real_mktemp)
+                wrapper = tools / "mktemp"
+                wrapper.write_text(
+                    "#!/bin/sh\nset -eu\n"
+                    f"created=$({shlex.quote(real_mktemp)} \"$@\")\n"
+                    'printf \'%s\\n\' "$created" >> "$TEMP_ALLOCATIONS"\n'
+                    'printf \'%s\\n\' "$created"\n'
+                )
+                wrapper.chmod(0o755)
                 # The steps' own env from nightly-build.yml: SHORT is the commit the title and
                 # SHA256SUMS.v2.sig name (ALSO_FOR, nightly-<date>-<short>).
                 env = dict(os.environ, EPHEMERAL="yes", SHA="0123456789abcdef", SHORT="0123456", DATE="2026-11-04",
                            ALSO_FOR="nightly-2026-11-04-0123456", SOURCE_TAG="nightly-test",
-                           RELEASE_SIGNING_KEY="", RELEASE_SIGNING_KEY_NEXT="")
-                signed = subprocess.run(["bash", "-e", "-c", run_step("sign_release.sh nightly")],
+                           RELEASE_SIGNING_KEY="", RELEASE_SIGNING_KEY_NEXT="",
+                           PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                           TMPDIR=str(temp_parent), TEMP_ALLOCATIONS=str(allocations))
+                signed = subprocess.run([BASH, "-e", "-c", run_step("sign_release.sh nightly")],
                                         cwd=root, env=env, text=True, capture_output=True)
                 self.assertEqual(signed.returncode, 0, signed.stderr)
-                sums = {name: digest for digest, name in
+                created = [Path(line) for line in allocations.read_text().splitlines()]
+                self.assertTrue(created)
+                self.assertTrue(all(path.parent == temp_parent for path in created), created)
+                self.assertTrue(all(not path.exists() for path in created), created)
+                # `name` or `*name`: sha256sum on Windows (Git Bash) marks binary mode with `*`.
+                sums = {name.removeprefix("*"): digest for digest, name in
                         (line.split() for line in (dist / "SHA256SUMS").read_text().splitlines())}
                 self.assertEqual(sums, {name: hashlib.sha256(name.encode()).hexdigest() for name in present})
                 self.assertTrue((dist / "SHA256SUMS.sig").stat().st_size)
@@ -70,7 +100,7 @@ gh() {
   done
 }
 '''
-                published = subprocess.run(["bash", "-e", "-c", stubs + run_step("gh release create nightly")],
+                published = subprocess.run([BASH, "-e", "-c", stubs + run_step("gh release create nightly")],
                                            cwd=root, env=env, text=True, capture_output=True)
                 self.assertEqual(published.returncode, 0, published.stderr)
                 files = {Path(name).name for name in (root / "published").read_text().splitlines()}

@@ -233,38 +233,45 @@ impl Loading {
         self.import.as_ref().map(|import| import.reason.as_str())
     }
 
-    /// Take the game files a launch-time import put in place (`import::boot`): the options and the folder
-    /// were resolved before that worker ran, so the ones this run started with may be the fallback.
-    pub(super) fn adopt_imported_resources(&mut self) {
-        self.vanilla_root = horizon_client::import::imported_resources(&self.vanilla_root);
-        if let Some(options) = self.options.as_mut() {
-            options.resources = self.vanilla_root.clone();
+    /// Resolve newly installed files before a loader captures its vanilla base.
+    /// An existing explicit base wins; a staged pack overlay is never the base.
+    pub(super) fn refresh_import_root(&mut self, home: &std::path::Path) -> Result<()> {
+        let options = self.options.as_mut().ok_or("loading already finished")?;
+        let root = horizon_client::import::resources_root(&self.vanilla_root, Some(home))
+            // A concurrent publish briefly has only resources.previous. Keep
+            // the intended import destination; the worker's lease waits for
+            // publication before it reads, without blocking the frame thread.
+            .or_else(|| home.is_dir().then(|| home.join("resources")));
+        if let Some(root) = root {
+            options.resources = root.clone();
+            self.vanilla_root = root;
         }
+        Ok(())
     }
 
     /// Start the loader again on the files that arrived, as if the first attempt had found them.
     fn load_the_files_that_arrived(&mut self, home: std::path::PathBuf) -> Result<()> {
         self.loaded = None;
+        self.delivered = false;
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
         self.progress = Progress::new();
-        let mut options = self.options.take().ok_or("loading already finished")?;
-        if let Some(root) = horizon_client::import::resources_root(&options.resources, Some(&home))
-        {
-            options.resources = root;
-        }
-        self.vanilla_root = horizon_client::import::imported_resources(&self.vanilla_root);
-        let (receiver, handle) = startup_menu::spawn_loader(
+        self.refresh_import_root(&home)?;
+        let options = self.options.take().ok_or("loading already finished")?;
+        let spawned = startup_menu::spawn_loader(
             &options,
             &self.settings,
             &self.vanilla_root,
             self.started,
             &self.progress,
-        )?;
+        );
+        // A failed thread spawn must not consume the options needed by retry
+        // or by a native cancellation returning to the idle launcher.
+        self.options = Some(options);
+        let (receiver, handle) = spawned?;
         self.receiver = receiver;
         self.handle = Some(handle);
-        self.options = Some(options);
         log::info!("Horizon: loading the imported game files");
         Ok(())
     }

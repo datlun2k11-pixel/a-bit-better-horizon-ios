@@ -37,7 +37,7 @@ fn discarded_mob_leaves_selectors_and_saves_while_frozen() {
     game.world
         .chunks
         .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
     game.build_registries();
     game.set_allow_commands(true);
     assert!(game.run_command("tick freeze"));

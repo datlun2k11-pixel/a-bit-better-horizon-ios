@@ -118,7 +118,7 @@ impl Game<'_> {
             return None;
         }
         let feet = Vec3::new(eye[0], eye[1] - f64::from(FAKE_EYE), eye[2]);
-        let body = horizon_client::motion::PlayerMotion::new(self.motion, feet).ok()?;
+        let body = horizon_client::motion::PlayerMotion::new(&self.motion, feet).ok()?;
         let slots = self.inventory.len().max(36);
         let mut inventory = vec![None; slots];
         inventory[0] = (stack.count > 0).then_some(stack);
@@ -298,9 +298,8 @@ pub(crate) mod tests {
         let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
         options.resources = root.clone();
         options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
-        let res: &'static _ = Box::leak(Box::new(loaded.resources));
         let mut game = Game::new(
-            res,
+            &loaded.resources,
             loaded.pack,
             loaded.gui.unwrap(),
             options,
@@ -314,6 +313,18 @@ pub(crate) mod tests {
             .chunks
             .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
         game
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn server_fixture_releases_its_owned_resources() {
+        let game = server_game();
+        let resources = Arc::downgrade(&game.res);
+        drop(game);
+        assert!(
+            resources.upgrade().is_none(),
+            "the fixture must not leak its resource owner"
+        );
     }
 
     fn fake_use(game: &mut Game<'_>, target: NativeUseTarget, sneaking: bool) -> NativeFakeUse {
@@ -439,13 +450,26 @@ pub(crate) mod tests {
 
         let ender = [10, 64, 8];
         let key = (ender[0], ender[1], ender[2]);
+        let diamonds = Some(ItemStack::new("minecraft:diamond", 5));
+        game.ender_items[0] = diamonds.clone();
         assert!(click_new(&mut game, "minecraft:ender_chest", ender).consumed);
         assert!(game.ender_open.is_none());
-        assert!(
-            game.world.block_entities.get(&key).is_none(),
-            "a stand-in chest stayed",
-        );
+        // An ender chest keeps its block entity (`EnderChestBlock.newBlockEntity`), but
+        // `EnderChestBlockEntity` holds no items: the player's own are not left in it.
+        match game.world.block_entities.get(&key) {
+            Some(BlockEntity::Chest(items)) => {
+                assert!(
+                    items.iter().all(Option::is_none),
+                    "the player's items stayed"
+                );
+            }
+            other => panic!("the ender chest lost its block entity: {other:?}"),
+        }
         assert!(!game.lid_openers.contains_key(&key), "its lid stayed open");
+        assert_eq!(
+            game.ender_items[0], diamonds,
+            "the server's own ender items changed"
+        );
     }
 
     /// Each field holds a value the use can't have written, so a swap that
@@ -458,6 +482,7 @@ pub(crate) mod tests {
             dim: game.dim,
             pos: [1, 2, 3],
             yaw: 0.0,
+            pitch: 0.0,
             forced: false,
         };
         let spawn = Vec3::new(1.0, 2.0, 3.0);

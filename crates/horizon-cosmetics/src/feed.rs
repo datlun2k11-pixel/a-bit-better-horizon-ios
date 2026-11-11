@@ -46,6 +46,7 @@ struct Shared {
 /// The game's handle; dropping it stops the thread.
 pub struct Feed {
     shared: Arc<Shared>,
+    workers: crate::workers::Workers,
 }
 
 impl Feed {
@@ -55,40 +56,55 @@ impl Feed {
             wake: Condvar::new(),
         });
         let inner = shared.clone();
-        let _ = std::thread::Builder::new()
-            .name("Cosmetics emotes".into())
-            .spawn(move || {
-                loop {
-                    let wait = {
+        let stop = shared.clone();
+        let cancel = transport.cancellation();
+        let workers = crate::workers::Workers::new(Some(Arc::new(move || {
+            stop.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .stop = true;
+            stop.wake.notify_all();
+            if let Some(cancel) = &cancel {
+                cancel();
+            }
+        })));
+        workers.spawn(move || {
+            loop {
+                let wait = {
+                    let s = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if s.stop {
+                        return Ok(());
+                    }
+                    due(&s, Instant::now())
+                };
+                match wait {
+                    Some(Duration::ZERO) => round(&inner, &transport, Instant::now()),
+                    // Waiting for the next poll, or for the game to name anyone.
+                    Some(wait) => {
                         let s = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
-                        if s.stop {
-                            return;
-                        }
-                        due(&s, Instant::now())
-                    };
-                    match wait {
-                        Some(Duration::ZERO) => round(&inner, &transport, Instant::now()),
-                        // Waiting for the next poll, or for the game to name anyone.
-                        Some(wait) => {
-                            let s = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
-                            let (s, _) = inner
-                                .wake
-                                .wait_timeout_while(s, wait, |s| !s.stop)
-                                .unwrap_or_else(PoisonError::into_inner);
-                            drop(s);
-                        }
-                        None => {
-                            let s = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
-                            let s = inner
-                                .wake
-                                .wait_while(s, |s| !s.stop && due(s, Instant::now()).is_none())
-                                .unwrap_or_else(PoisonError::into_inner);
-                            drop(s);
-                        }
+                        let (s, _) = inner
+                            .wake
+                            .wait_timeout_while(s, wait, |s| !s.stop)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        drop(s);
+                    }
+                    None => {
+                        let s = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        let s = inner
+                            .wake
+                            .wait_while(s, |s| !s.stop && due(s, Instant::now()).is_none())
+                            .unwrap_or_else(PoisonError::into_inner);
+                        drop(s);
                     }
                 }
-            });
-        Self { shared }
+            }
+        });
+        Self { shared, workers }
+    }
+
+    /// Stop this feed, retaining its producer until it has actually returned.
+    pub fn shutdown(&mut self) -> bool {
+        self.workers.shutdown()
     }
 
     /// The Horizon players in view now; only the first `BATCH` are asked about.

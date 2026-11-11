@@ -1,7 +1,7 @@
 //! One of Horizon's own shader packs while it runs (docs/shaders.md): the frame its stages
 //! read, its sky, material and post stages, and the timer of their passes.
 
-use horizon_shader_api::{Report, StageKind};
+use horizon_shader_api::{Api, Blend, Report, StageKind};
 
 use super::displace::Displacement;
 use super::native_material::{DisplacedShape, NativeMaterial, TerrainShape};
@@ -78,12 +78,82 @@ fn chosen_shadow(
     })
 }
 
+/// The checker knows more API lines than this renderer can execute. Keep the
+/// runtime failure classified until the public constructor returns its diagnostic.
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeRefusal {
+    Api(Api),
+    LinearBlend,
+    Stage(StageKind),
+}
+
+impl std::fmt::Display for RuntimeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Api(api) => write!(
+                f,
+                "shader API {api} is checked but not drawn by this renderer; use shader API 0.1"
+            ),
+            Self::LinearBlend => {
+                f.write_str("[frame] blend = \"linear\" is checked but not drawn by this renderer")
+            }
+            Self::Stage(stage) => write!(
+                f,
+                "[{}] is checked but not drawn by this renderer",
+                stage.name()
+            ),
+        }
+    }
+}
+
+fn runtime_support(report: &Report) -> Result<(), RuntimeRefusal> {
+    if report.manifest.blend == Blend::Linear {
+        return Err(RuntimeRefusal::LinearBlend);
+    }
+    if report.manifest.tonemap.is_some()
+        || report
+            .stages
+            .iter()
+            .any(|stage| stage.kind == StageKind::Tonemap)
+    {
+        return Err(RuntimeRefusal::Stage(StageKind::Tonemap));
+    }
+    if report.manifest.api != Api::V0_1 {
+        return Err(RuntimeRefusal::Api(report.manifest.api));
+    }
+    Ok(())
+}
+
 impl NativePack {
     /// The pack of the checked stages `report` with the option values `constants`, drawing
     /// onto the world's targets as `terrain` describes; the sky reads the terrain's group 0.
     /// Also returns its stages' labels, in the order they draw. Errors name the stage wgpu
     /// refused.
     pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        terrain: &TerrainShape<'_>,
+        report: Report,
+        constants: &[(String, f64)],
+        lights: super::block_light::LightTable,
+    ) -> Result<(Self, Vec<String>), String> {
+        // Refuse unsupported semantics before allocating GPU state. In particular a checked
+        // tonemap-only pack must not become an empty pack that replaces the previous one.
+        runtime_support(&report).map_err(|error| error.to_string())?;
+        // A backend may refuse a layout or pipeline the pack asks for (a stage's bindings
+        // past its sampled-texture limit, say, as OpenGL's 16 was before #10095): the pack
+        // is refused with that error instead of a validation panic in the renderer.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let built = Self::build(device, queue, terrain, report, constants, lights);
+        let refused = pollster::block_on(scope.pop());
+        match (built, refused) {
+            (Ok(built), None) => Ok(built),
+            (Ok(_), Some(e)) => Err(e.to_string()),
+            (Err(e), _) => Err(e),
+        }
+    }
+
+    fn build(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         terrain: &TerrainShape<'_>,
@@ -278,8 +348,89 @@ impl NativePack {
 
 #[cfg(test)]
 mod tests {
-    use super::chosen_shadow;
+    use super::{NativePack, TerrainShape, chosen_shadow};
     use horizon_shader_api::manifest::{OptionKind, PackOption, Shadow};
+
+    /// A device with OpenGL's minimum 16 sampled textures per stage refuses a pack whose
+    /// sky adds the terrain's 10 to the frame's 9: that is the pack's error to report, not
+    /// a validation panic (#10095).
+    #[test]
+    fn a_pack_the_backend_refuses_is_an_error_not_a_panic() {
+        use horizon_shader_api::{MANIFEST, Pack, check};
+        let instance = crate::gfx::test_gpu::instance();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            return;
+        };
+        let mut limits = adapter.limits();
+        limits.max_sampled_textures_per_shader_stage = 16;
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            }))
+        else {
+            return;
+        };
+        // The terrain's group 0: its uniform and the 10 sampled textures (_terrain.wgsl_'s
+        // 8 sprite arrays, the lightmap and the emission thresholds).
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty,
+            count: None,
+        };
+        let mut entries = vec![entry(
+            0,
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+        )];
+        entries.extend((1..=10).map(|binding| {
+            entry(
+                binding,
+                wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+            )
+        }));
+        let globals = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &entries,
+        });
+        let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[],
+        });
+        let terrain = TerrainShape {
+            globals: &globals,
+            flat: None,
+            sprites: [1.0, 2048.0],
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            sprite_tags: &[],
+            sprite_materials: &[],
+            entities: &empty,
+            weather_groups: [&empty, &empty],
+            pbr: None,
+        };
+        let manifest = "schema = 1\nid = \"t\"\nname = \"T\"\nversion = \"1\"\napi = \"0.1\"\n\
+            [sky]\nfile = \"sky.wgsl\"\n";
+        let files = [
+            (MANIFEST, manifest),
+            (
+                "sky.wgsl",
+                "fn sky(input: SkyInput) -> vec4<f32> { return input.color; }\n",
+            ),
+        ]
+        .map(|(n, t)| (n.to_owned(), t.as_bytes().to_vec()))
+        .into();
+        let report = check(&Pack::from_files(files).unwrap()).unwrap();
+        let built = NativePack::new(&device, &queue, &terrain, report, &[], Default::default());
+        assert!(built.is_err(), "the pack should be refused");
+    }
 
     fn option(id: &str, kind: OptionKind) -> PackOption {
         PackOption {
@@ -333,3 +484,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "native_pack/runtime_api_tests.rs"]
+mod runtime_api_tests;

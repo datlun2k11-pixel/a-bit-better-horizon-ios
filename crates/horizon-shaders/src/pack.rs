@@ -7,11 +7,60 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
+
+/// The most bytes one file of a zipped pack unpacks to: far above any `.properties`, `.lang` or
+/// GLSL file, with room for the largest textures packs carry.
+pub const MAX_FILE: u64 = 64 << 20;
 use std::sync::Arc;
 
 use zip::ZipArchive;
 
 const ROOT: &str = "shaders";
+// Resource packs are untrusted. A small ZIP may advertise enormous uncompressed entries.
+// Bound both the archive held in RAM and each expanded file before reserving memory.
+// These limits also apply to folder packs and to files changed after a pack was opened.
+const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+fn bounded_read(
+    mut reader: impl Read,
+    declared: u64,
+    limit: u64,
+    name: &str,
+) -> io::Result<Vec<u8>> {
+    let too_large = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{name}: exceeds the {} MiB shader-pack read limit",
+                limit / (1024 * 1024)
+            ),
+        )
+    };
+    if declared > limit {
+        return Err(too_large());
+    }
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        if out.len() as u64 + n as u64 > limit {
+            return Err(too_large());
+        }
+        out.try_reserve(n)
+            .map_err(|_| io::Error::other(format!("{name}: cannot allocate shader-pack data")))?;
+        out.extend_from_slice(&chunk[..n]);
+    }
+}
+
+fn bounded_file(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    bounded_read(file, size, limit, &path.to_string_lossy())
+}
 
 pub struct Pack {
     name: String,
@@ -70,13 +119,25 @@ impl Pack {
             }
             Files::Folder(root)
         } else {
-            Self::zip_files(fs::read(path)?)?
+            Self::zip_files(bounded_file(path, MAX_ARCHIVE_BYTES)?)?
         };
-        Ok(Self {
+        let pack = Self {
             name,
             files,
             chosen: BTreeMap::new(),
-        })
+        };
+        if let Files::Folder(root) = &pack.files {
+            for name in pack.all_files() {
+                if fs::metadata(root.join(&name))?.len() > MAX_ENTRY_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{name}: exceeds the 256 MiB shader-pack read limit"),
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(pack)
     }
 
     /// An archive held in memory; `name` is what [`Pack::name`] returns.
@@ -90,7 +151,12 @@ impl Pack {
     }
 
     fn zip_files(bytes: Vec<u8>) -> Result<Files, PackError> {
-        let archive = ZipArchive::new(Cursor::new(Arc::from(bytes)))
+        if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+            return Err(PackError::Zip(
+                "archive exceeds the 512 MiB shader-pack read limit".into(),
+            ));
+        }
+        let mut archive = ZipArchive::new(Cursor::new(Arc::from(bytes)))
             .map_err(|e| PackError::Zip(e.to_string()))?;
         let mut entries = BTreeMap::new();
         for i in 0..archive.len() {
@@ -104,6 +170,15 @@ impl Pack {
                 && !inner.is_empty()
                 && !inner.ends_with('/')
             {
+                let size = archive
+                    .by_index_raw(i)
+                    .map_err(|e| PackError::Zip(e.to_string()))?
+                    .size();
+                if size > MAX_ENTRY_BYTES {
+                    return Err(PackError::Zip(format!(
+                        "{inner}: exceeds the 256 MiB shader-pack read limit"
+                    )));
+                }
                 entries.insert(inner.to_owned(), i);
             }
         }
@@ -131,18 +206,43 @@ impl Pack {
     }
 
     /// The bytes of a file, by its path inside `shaders` (`lang/en_us.lang`). `None` when it
-    /// doesn't exist or the path leaves the folder.
+    /// doesn't exist, the path leaves the folder, or a zipped file unpacks to more than
+    /// [`MAX_FILE`].
     pub fn read(&self, path: &str) -> Option<Vec<u8>> {
-        let path = normalize(path)?;
+        self.read_capped(path, MAX_FILE)
+    }
+
+    /// Apply a caller's smaller cap without trusting the archive's declared sizes.
+    fn read_capped(&self, path: &str, cap: u64) -> Option<Vec<u8>> {
+        self.read_capped_checked(path, cap.min(MAX_FILE))
+            .ok()
+            .flatten()
+    }
+
+    /// Like `read`, but preserves resource-limit and I/O errors for loader diagnostics.
+    pub fn read_checked(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
+        self.read_capped_checked(path, MAX_FILE)
+    }
+
+    fn read_capped_checked(&self, path: &str, cap: u64) -> io::Result<Option<Vec<u8>>> {
+        let Some(path) = normalize(path) else {
+            return Ok(None);
+        };
         match &self.files {
-            Files::Folder(root) => fs::read(root.join(&path)).ok(),
+            Files::Folder(root) => match bounded_file(&root.join(&path), cap) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            },
             Files::Zip { archive, entries } => {
-                // A clone shares the bytes and the central directory; reading needs `&mut`.
+                let Some(&index) = entries.get(&path) else {
+                    return Ok(None);
+                };
+                // A clone shares archive bytes and the central directory; reading needs &mut.
                 let mut archive = archive.clone();
-                let mut entry = archive.by_index(*entries.get(&path)?).ok()?;
-                let mut out = Vec::with_capacity(entry.size() as usize);
-                entry.read_to_end(&mut out).ok()?;
-                Some(out)
+                let entry = archive.by_index(index).map_err(io::Error::other)?;
+                let size = entry.size();
+                bounded_read(entry, size, cap, &path).map(Some)
             }
         }
     }
@@ -150,15 +250,21 @@ impl Pack {
     /// A text file, decoded as UTF-8 (invalid bytes replaced) without its byte-order mark, with
     /// the chosen option values in its sources.
     pub fn read_text(&self, path: &str) -> Option<String> {
-        let bytes = self.read(path)?;
+        self.read_text_checked(path).ok().flatten()
+    }
+
+    pub fn read_text_checked(&self, path: &str) -> io::Result<Option<String>> {
+        let Some(bytes) = self.read_checked(path)? else {
+            return Ok(None);
+        };
         let text = String::from_utf8_lossy(&bytes);
         let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         let source = !path.ends_with(".properties") && !path.ends_with(".lang");
-        Some(if source && !self.chosen.is_empty() {
+        Ok(Some(if source && !self.chosen.is_empty() {
             crate::options::apply(text, &self.chosen)
         } else {
             text.to_owned()
-        })
+        }))
     }
 
     pub fn exists(&self, path: &str) -> bool {
@@ -279,6 +385,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_zipped_file_past_the_cap_reads_as_missing() {
+        // A deflate bomb: 64 KiB of spaces zip to almost nothing. Read with a 16 KiB cap here
+        // (MAX_FILE in the game), it is refused whatever it declares; the rest of the pack reads.
+        let bytes = zip(&[
+            ("shaders/shaders.properties", vec![b' '; 64 << 10]),
+            ("shaders/lib/common.glsl", b"void main() {}".to_vec()),
+        ]);
+        assert!(bytes.len() < 4 << 10);
+        let pack = Pack::from_zip_bytes("P.zip", bytes).unwrap();
+        assert_eq!(pack.read_capped("shaders.properties", 16 << 10), None);
+        assert_eq!(
+            pack.read_capped("shaders.properties", 64 << 10)
+                .unwrap()
+                .len(),
+            64 << 10
+        );
+        assert_eq!(pack.read("lib/common.glsl").unwrap(), b"void main() {}");
+    }
+
+    #[test]
     fn zip_packs_read_only_the_shaders_folder() {
         let bytes = zip(&[
             ("License.txt", "x"),
@@ -326,5 +452,70 @@ pub(crate) mod tests {
         assert_eq!(pack.list("lang"), ["en_us.lang"]);
         assert!(pack.read("../secret.txt").is_none());
         fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn oversized_zip_metadata_is_rejected_before_entry_allocation() {
+        let mut bytes = zip(&[("shaders/final.fsh", "void main(){}")]);
+        let at = bytes.windows(4).position(|b| b == b"PK\x01\x02").unwrap();
+        bytes[at + 24..at + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let error = match Pack::from_zip_bytes("oversized.zip", bytes) {
+            Ok(_) => panic!("oversized advertised entry accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("final.fsh") && error.contains("256 MiB"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn bounded_reads_limit_actual_decompression_not_only_declared_size() {
+        struct NeverRead;
+        impl Read for NeverRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("oversized metadata must be rejected before read");
+            }
+        }
+        assert!(bounded_read(NeverRead, u64::MAX, 64, "test").is_err());
+        let bytes = zip(&[("shaders/texture.bin", vec![0u8; 4096])]);
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let entry = archive.by_index(0).unwrap();
+        // Even a lying size cannot cause unbounded expansion.
+        assert!(bounded_read(entry, 1, 64, "texture.bin").is_err());
+        assert_eq!(
+            bounded_read(Cursor::new(b"ok"), 2, 64, "small").unwrap(),
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn folder_and_archive_limits_report_clear_errors_without_large_allocations() {
+        let dir = temp_dir("size-limits");
+        fs::create_dir_all(dir.join("shaders")).unwrap();
+        let path = dir.join("shaders/final.fsh");
+        fs::write(&path, "void main(){}").unwrap();
+        let pack = Pack::open(&dir).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_ENTRY_BYTES + 1).unwrap();
+        let pp = crate::preprocess(&pack, "final.fsh", &crate::Macros::standard());
+        assert!(pp.diagnostics.iter().any(|d| d.message.contains("64 MiB")));
+        let error = Pack::open(&dir).err().unwrap().to_string();
+        assert!(
+            error.contains("final.fsh") && error.contains("256 MiB"),
+            "{error}"
+        );
+        let archive = dir.join("large.zip");
+        fs::File::create(&archive)
+            .unwrap()
+            .set_len(MAX_ARCHIVE_BYTES + 1)
+            .unwrap();
+        assert!(
+            Pack::open(&archive)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("512 MiB")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

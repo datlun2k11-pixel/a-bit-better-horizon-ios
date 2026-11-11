@@ -169,6 +169,15 @@ fn compute_programs_receive_initial_contents_and_nonconstant_uniform_initializer
 }
 
 #[test]
+fn common_array_types_preserve_each_uniform_default() {
+    let p =
+        program("uniform float[2] first = float[2](0.125, 0.25), second = float[2](0.5, 0.75);");
+    let f = |x: f32| x.to_bits();
+    assert_eq!(words(&p, "first", 8), [f(0.125), 0, 0, 0, f(0.25), 0, 0, 0]);
+    assert_eq!(words(&p, "second", 8), [f(0.5), 0, 0, 0, f(0.75), 0, 0, 0]);
+}
+
+#[test]
 fn unsupported_double_defaults_keep_programs_and_supported_neighbors() {
     let p = program("uniform double unknown = double(2.0); uniform float kept = 0.625;");
     assert_eq!(words(&p, "unknown", 2), [0, 0]);

@@ -255,18 +255,6 @@ fn shadow_pass_takes_own_model(
     shadow_draws_player && !(shader_pack && spectator)
 }
 
-/// `LivingEntityRenderer.solveBodyRot` for the rider of a living vehicle: the
-/// body faces the vehicle's body, the head turning at most 85 degrees from it,
-/// and past 50 degrees the body turns a fifth of the head's offset along.
-fn rider_body_yaw(head: f32, vehicle_body: f32) -> f32 {
-    let diff = wrap(head - vehicle_body).clamp(-85.0, 85.0);
-    let mut body = head - diff;
-    if diff.abs() > 50.0 {
-        body += diff * 0.2;
-    }
-    body
-}
-
 fn wrap(d: f32) -> f32 {
     let d = d % 360.0;
     if d >= 180.0 {
@@ -292,10 +280,21 @@ impl Game<'_> {
     /// front of) it, pulled in where visual shapes are in the way. Returns the
     /// position, yaw and pitch to render from.
     pub(super) fn camera_view(&mut self, partial: f32) -> Option<(glam::DVec3, f32, f32)> {
+        if self.studio.flying() {
+            return Some((
+                self.studio.freecam.position,
+                self.studio.freecam.yaw,
+                self.studio.freecam.pitch,
+            ));
+        }
         // Minecraft.cameraEntity: a server's spectator camera on a mob or
         // another player.
-        let (entity, descending) = match self.camera_mob() {
-            Some(m) => (super::remote_camera::mob_camera_entity(m), false),
+        let (entity, descending, entity_kind) = match self.camera_mob() {
+            Some(m) => (
+                super::remote_camera::mob_camera_entity(m),
+                false,
+                horizon_world::collision_context::EntityContextKind::Living,
+            ),
             None => {
                 let mut entity = self.player_camera_entity()?;
                 if let Some(position) = self.remote_minecart_rider_position(partial) {
@@ -304,12 +303,16 @@ impl Game<'_> {
                     entity.position = position;
                     entity.previous = position;
                 }
-                (entity, self.player.as_ref()?.shift_key_down)
+                (
+                    entity,
+                    self.player.as_ref()?.shift_key_down,
+                    horizon_world::collision_context::EntityContextKind::Player,
+                )
             }
         };
         let mut view = self.view;
-        // An emote pulls the camera back from the player's face (`game/emotes.rs`).
-        let pull = self.emote_camera_pull(partial);
+        // A hook may pull the camera back (an emote, from the player's face).
+        let pull = self.hooks_camera_distance(partial);
         let kind = match self.camera_type {
             CameraType::FirstPerson => horizon_client::camera::CameraType::FirstPerson,
             CameraType::ThirdPersonBack => horizon_client::camera::CameraType::ThirdPersonBack,
@@ -318,6 +321,7 @@ impl Game<'_> {
         let context = CollisionContext::for_entity(
             CollisionEntity {
                 identity: EntityIdentity(0),
+                kind: entity_kind,
                 y: entity.position[1],
                 descending,
                 main_hand: Some(CollisionItem::EMPTY),
@@ -533,7 +537,8 @@ impl Game<'_> {
             // A living vehicle's rider is drawn from its body
             // (`LivingEntityRenderer.solveBodyRot`).
             Some(RiddenBody::Living(body)) => {
-                m.body_yaw += wrap(rider_body_yaw(yaw, body) - m.body_yaw);
+                m.body_yaw +=
+                    wrap(horizon_client::mobs::riders::solve_body_rot(yaw, body) - m.body_yaw);
             }
             // A minecart's, a cushion's: the body turns as on foot.
             None => {
@@ -638,6 +643,12 @@ impl Game<'_> {
     /// The model's old pitch is the player's `xRotO`, which the turn moves
     /// with `xRot` (`turn_rotation`).
     pub(super) fn turn_player(&mut self, xo: f64, yo: f64) {
+        if self.studio.flying() {
+            self.studio
+                .freecam
+                .turn((xo * 0.15) as f32, (yo * 0.15) as f32);
+            return;
+        }
         let pitch_o = self.player_model.as_ref().map(|m| m.previous_head_pitch);
         let rotation = turn_rotation(self.yaw, self.pitch, pitch_o, xo, yo);
         // The held lead's old look (`LocalPlayer.getRopeHoldPosition`'s
@@ -656,11 +667,9 @@ impl Game<'_> {
             .riding
             .and_then(|id| self.boats.iter().find(|b| b.id == id))
         {
-            let delta = (self.yaw - b.yaw + 180.0).rem_euclid(360.0) - 180.0;
-            let clamped = delta.clamp(-105.0, 105.0) - delta;
-            self.yaw += clamped;
-            // clampRotation moves `yRotO` with the view.
-            self.rope_rot_old.0 += clamped;
+            let old_yaw = self.yaw;
+            self.yaw = super::boats::clamp_player_yaw(self.yaw, b.yaw);
+            self.rope_rot_old.0 += self.yaw - old_yaw;
         }
     }
     /// What the player rides that sets their body's yaw: a boat's yaw, or a
@@ -687,7 +696,7 @@ impl Game<'_> {
     /// `LevelExtractor`'s skip of the camera entity: the player's own body
     /// is drawn unless the camera is in first person, or while it sleeps.
     pub(super) fn own_body_in_view(&self) -> bool {
-        !self.camera_type.first_person() || self.sleeping.is_some()
+        !self.camera_type.first_person() || self.sleeping.is_some() || self.studio.flying()
     }
     /// Whether the player's own model shows in the world view (its body or,
     /// while invisible, only its armour and held items).
@@ -734,6 +743,7 @@ impl Game<'_> {
         let Some(m) = self.player_model.as_ref() else {
             return;
         };
+        self.request_avatar_skin(m, true);
         let eye = self
             .player
             .as_ref()
@@ -742,7 +752,11 @@ impl Game<'_> {
         let light = self.world.light(probe[0], probe[1], probe[2]);
         let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
         let atlas = &self.gui.atlas;
-        let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
+        let lookup = |name: &str| {
+            let rect = atlas.sprites.get(name)?;
+            self.mark_skin_used(name);
+            Some([rect.u0, rect.v0, rect.u1, rect.v1])
+        };
         let start = out.len();
         let body = self.own_body_visible();
         // `native_player_submit`: a native mod's own model for this player,
@@ -754,18 +768,18 @@ impl Game<'_> {
             local: true,
         };
         if body && self.mod_player_geometry(m, who, alpha as f32, camera, packed, out) {
+            if out.len() > start
+                && let Some(skin) = &m.skin
+            {
+                self.mark_skin_used(skin);
+            }
             return;
         }
         // A spectator still draws its own model in third person: the poses'
         // visibility (set by player_model_visibility) hides body parts, and
         // translucent_body marks the body OIT for the ghostly look. Only first
         // person and dead players skip it.
-        let render = if body || self.spectator() {
-            horizon_client::mobs::render::render_with
-        } else {
-            horizon_client::mobs::render::render_layers
-        };
-        render(
+        let items = horizon_client::mobs::render::render_avatar(
             m,
             alpha as f32,
             camera,
@@ -773,8 +787,13 @@ impl Game<'_> {
             packed,
             self.res.mob_data(),
             &self.player_armor_layers(),
+            body || self.spectator(),
+            None,
             out,
         );
+        for item in items {
+            self.mark_rendered_item(item.start, item.end, &item.item);
+        }
         // AvatarRenderer.shouldRenderLayers: a spectator draws no layers.
         if horizon_client::mobs::render::layers_shown(m) {
             let chest = self.armor[1].as_ref().map(|s| &*s.item);
@@ -790,19 +809,8 @@ impl Game<'_> {
                 packed,
                 out,
             );
-            if horizon_cosmetics::enabled() {
-                let base = horizon_client::mobs::render::base_transform(m, alpha as f32, camera);
-                self.cosmetics_geometry(
-                    m,
-                    true,
-                    base,
-                    Some(camera),
-                    alpha as f32,
-                    packed,
-                    false,
-                    out,
-                );
-            }
+            let world = horizon_hooks::players::Pass::World;
+            self.own_layers_geometry(m, world, camera, alpha as f32, packed, out);
             self.player_elytra_geometry(m, chest, camera, alpha as f32, packed, out);
             self.spin_attack_geometry(m, camera, alpha as f32, packed, out);
             self.shoulder_parrots_geometry(m, camera, alpha as f32, packed, out);
@@ -863,6 +871,7 @@ impl Game<'_> {
         {
             return;
         }
+        self.request_avatar_skin(m, true);
         let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
         let x_angle = ((cx - self.cursor.0) / 40.0).atan();
         let y_angle = ((cy - self.cursor.1) / 40.0).atan();
@@ -878,22 +887,21 @@ impl Game<'_> {
         m.previous_head_yaw = m.head_yaw;
         m.head_pitch = -y_angle * 20.0;
         m.previous_head_pitch = m.head_pitch;
-        m.position.y += 0.125 * f64::from(u8::from(m.extra.crouching));
+        m.position.y += 0.125 * f64::from(u8::from(m.visual_crouching()));
         m.previous = m.position;
         let camera = glam::DVec3::new(m.position.x, m.position.y, m.position.z);
         let atlas = &self.gui.atlas;
-        let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
+        let lookup = |name: &str| {
+            let rect = atlas.sprites.get(name)?;
+            self.mark_skin_used(name);
+            Some([rect.u0, rect.v0, rect.u1, rect.v1])
+        };
         let mut verts = Vec::new();
         // A spectator preview still draws its own model: the poses'
         // visibility hides body parts, leaving the head and its layers.
-        let render = if self.own_body_visible() || self.spectator() {
-            horizon_client::mobs::render::render_with
-        } else {
-            horizon_client::mobs::render::render_layers
-        };
         // A screen preview: custom entity model animations see is_in_gui = 1.
         horizon_client::mobs::cem_anim::in_gui(|| {
-            render(
+            horizon_client::mobs::render::render_avatar(
                 &m,
                 1.0,
                 camera,
@@ -901,6 +909,8 @@ impl Game<'_> {
                 240 | 240 << 8,
                 self.res.mob_data(),
                 &self.player_armor_layers(),
+                self.own_body_visible() || self.spectator(),
+                None,
                 &mut verts,
             );
         });
@@ -916,10 +926,8 @@ impl Game<'_> {
             240 | 240 << 8,
             &mut verts,
         );
-        if horizon_cosmetics::enabled() {
-            let base = horizon_client::mobs::render::base_transform(&m, 1.0, camera);
-            self.cosmetics_geometry(&m, true, base, None, 1.0, 240 | 240 << 8, false, &mut verts);
-        }
+        let picture = horizon_hooks::players::Pass::Picture;
+        self.own_layers_geometry(&m, picture, camera, 1.0, 240 | 240 << 8, &mut verts);
         // `WingsLayer` draws through `RenderTypes.armorCutoutNoCull`: the
         // wings' faces show from both sides (the elytra texture is empty on
         // the face that looks at the body).
@@ -929,7 +937,7 @@ impl Game<'_> {
         self.shoulder_parrots_geometry(&m, camera, 1.0, 240 | 240 << 8, &mut verts);
         self.held_item_geometry(&m, camera, 1.0, 240 | 240 << 8, false, None, &mut verts);
         self.head_item_geometry(&m, camera, 1.0, 240 | 240 << 8, false, &mut verts);
-        let height = if m.extra.crouching { 1.5 } else { 1.8 };
+        let height = if m.visual_crouching() { 1.5 } else { 1.8 };
         // PictureInPictureRenderer: the box centre, (size, size, -size);
         // then the translation and Rz(pi) * Rx(y_angle * 20 degrees).
         let gui = glam::Mat4::from_translation(glam::Vec3::new(cx, cy, 0.0))
@@ -942,12 +950,9 @@ impl Game<'_> {
             .as_ref()
             .filter(|p| p.fire_ticks > 0 && !p.spectator)
             .map(|p| (p.dimensions.width, p.dimensions.height));
+        let glints = preview_glint_quads(&verts, gui, wings.clone(), self.glint_frame);
         let quads = player_preview_quads_no_cull(verts, gui, fire, &atlas.sprites, wings);
-        let start = batch.vertices.len();
-        for (_, p, uv, color) in quads {
-            batch.quad_3d(p, uv, color);
-        }
-        batch.depth_since(start, [x0, y0, x1, y1]);
+        emit_preview(batch, quads, glints, [x0, y0, x1, y1]);
     }
     /// The survival inventory's player box (`InventoryScreen`).
     pub(super) fn draw_inventory_player(&self, batch: &mut HudBatch, ox: f32, oy: f32) {
@@ -965,6 +970,50 @@ impl Game<'_> {
     }
 }
 
+/// One EquipmentLayerRenderer wing layer, shared by the world and inventory
+/// preview paths. The equipment file decides whether this layer takes the
+/// player's texture; an OptiFine CIT rule retains its explicit override.
+#[allow(clippy::too_many_arguments)]
+fn render_wing_layer<'a>(
+    model: &horizon_client::mobs::Part,
+    base: glam::Mat4,
+    pose: &dyn Fn(&horizon_client::mobs::Part) -> [f32; 9],
+    sprites: &std::collections::HashMap<String, horizon_client::hud::Rect>,
+    texture: &'a str,
+    undyed: Option<horizon_client::equipment_color::Dyeable>,
+    use_player_texture: bool,
+    player_texture: Option<&'a str>,
+    cit_texture: Option<&'a str>,
+    stack: Option<&horizon_client::items::ItemStack>,
+    light: u32,
+    overlay: u32,
+    out: &mut Vec<horizon_client::mesher::Vertex>,
+) -> Option<(&'a str, std::ops::Range<usize>)> {
+    let color = super::armor_stands::layer_color(undyed, stack);
+    if color == 0 {
+        return None;
+    }
+    let texture = cit_texture
+        .filter(|s| sprites.contains_key(*s))
+        .or_else(|| player_texture.filter(|s| use_player_texture && sprites.contains_key(*s)))
+        .unwrap_or(texture);
+    let rect = sprites.get(texture)?;
+    let start = out.len();
+    horizon_client::mobs::render_model(
+        model,
+        base,
+        pose,
+        [rect.u0, rect.v0, rect.u1, rect.v1],
+        light,
+        overlay,
+        out,
+    );
+    for vertex in &mut out[start..] {
+        vertex.color = color;
+    }
+    Some((texture, start..out.len()))
+}
+
 impl Game<'_> {
     /// `WingsLayer` for a player wearing `chest`.
     pub(super) fn player_elytra_geometry(
@@ -979,14 +1028,26 @@ impl Game<'_> {
         let stack = m.extra.armor[1]
             .as_ref()
             .filter(|s| chest == Some(&*s.item));
+        let mut base = horizon_client::mobs::render::base_transform(m, partial, camera);
+        if chest.is_some()
+            && let Some(delta) =
+                horizon_client::mobs::render::emote_body_delta(m, partial, self.res.mob_data())
+        {
+            base *= delta;
+        }
         self.wings_geometry(
             chest,
             stack,
-            m.cape.as_deref(),
+            horizon_client::skins::wings_texture(
+                m.elytra.as_deref(),
+                m.cape.as_deref(),
+                m.extra.hidden_model_parts & 1 == 0,
+                |location| self.gui.atlas.sprites.contains_key(location),
+            ),
             false,
-            horizon_client::mobs::render::base_transform(m, partial, camera),
+            base,
             m.extra.elytra.angles(partial),
-            m.extra.crouching,
+            m.visual_crouching(),
             light,
             self.wings_overlay(stack),
             out,
@@ -1006,8 +1067,8 @@ impl Game<'_> {
     }
     /// `WingsLayer.submit` for any wearer: the wings of `chest`'s equipment
     /// asset on `base` (the wearer's model transform), `baby` for the baby
-    /// elytra model. `cape` is a player's own cape texture, which has its
-    /// elytra (`WingsLayer.getPlayerElytraTexture`). `stack` is the worn
+    /// elytra model. `cape` is the player's dedicated Elytra texture, else
+    /// their visible cape (`WingsLayer.getPlayerElytraTexture`). `stack` is the worn
     /// stack when known: an OptiFine CIT elytra rule for it replaces the
     /// texture, the cape's too, as OptiFine's `LayerElytra` does.
     #[allow(clippy::too_many_arguments)]
@@ -1024,32 +1085,32 @@ impl Game<'_> {
         overlay: u32,
         out: &mut Vec<horizon_client::mesher::Vertex>,
     ) {
-        let Some(asset) = chest
-            .and_then(|item| self.items().get(item))
-            .and_then(|i| i.equip_asset.as_ref())
+        // The worn stack's own `equippable`, for the chest slot, with an asset
+        // (getEquipmentIfRenderable: anything else counts as nothing worn).
+        let equippable = match stack {
+            Some(s) => horizon_client::item_sync::equippable(s, self.items()),
+            None => chest
+                .and_then(|item| horizon_client::item_sync::item_equippable(item, self.items())),
+        };
+        let Some(asset) = equippable
+            .filter(|e| e.slot == "chest")
+            .and_then(|e| e.asset_id)
         else {
             return;
         };
         let assets = &self.armor_stand_assets;
-        let Some((texture, _)) = assets
-            .equipment
-            .get(asset)
-            .and_then(|k| k.get("wings"))
-            .and_then(|layers| layers.first())
+        let Some(layers) = assets.equipment.get(&asset).and_then(|k| k.get("wings")) else {
+            return;
+        };
+        let Some(model) = assets
+            .player
+            .get(if baby { "elytra_baby" } else { "elytra" })
         else {
             return;
         };
         let sprites = &self.gui.atlas.sprites;
         let rule = stack.and_then(|s| self.cit_worn_rule(horizon_client::cit::Kind::Elytra, s));
-        let rect = horizon_client::cit_armor::wings(rule, cape, |s| sprites.get(s));
-        let (Some(model), Some(rect)) = (
-            assets
-                .player
-                .get(if baby { "elytra_baby" } else { "elytra" }),
-            rect.or_else(|| sprites.get(texture)),
-        ) else {
-            return;
-        };
+        let cit_texture = horizon_client::cit_armor::wings_sprite(rule);
         let base = base * glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.0, 0.125));
         let pose = |part: &horizon_client::mobs::Part| {
             let mut p = part.pose;
@@ -1062,20 +1123,38 @@ impl Game<'_> {
             }
             p
         };
-        horizon_client::mobs::render_model(
-            model,
-            base,
-            &pose,
-            [rect.u0, rect.v0, rect.u1, rect.v1],
-            light,
-            overlay,
-            out,
-        );
-        // The elytra texture's OptiFine emissive overlay (not a cape's), full bright.
-        let glow = cape
-            .and_then(|c| sprites.get(c))
-            .is_none()
-            .then(|| {
+        let start = out.len();
+        let mut layer_overlay = overlay;
+        for (index, (texture, undyed)) in layers.iter().enumerate() {
+            let use_player_texture = assets
+                .wing_player_textures
+                .get(&asset)
+                .and_then(|flags| flags.get(index))
+                .copied()
+                .unwrap_or(false);
+            let Some((texture, vertices)) = render_wing_layer(
+                model,
+                base,
+                &pose,
+                sprites,
+                texture,
+                *undyed,
+                use_player_texture,
+                cape,
+                cit_texture.as_deref(),
+                stack,
+                light,
+                layer_overlay,
+                out,
+            ) else {
+                continue;
+            };
+            if !vertices.is_empty() {
+                // EquipmentLayerRenderer adds foil once, on the first drawn layer.
+                layer_overlay = 0;
+                self.mark_skin_used(texture);
+            }
+            let glow = {
                 let emissive = self
                     .res
                     .mob_data()
@@ -1086,18 +1165,21 @@ impl Game<'_> {
                     .overlay(texture)
                     .and_then(|e| sprites.get(e))
                     .copied()
-            })
-            .flatten();
-        if let Some(g) = glow {
-            horizon_client::mobs::render_model(
-                model,
-                base,
-                &pose,
-                [g.u0, g.v0, g.u1, g.v1],
-                horizon_client::mobs::render::FULL_BRIGHT,
-                0,
-                out,
-            );
+            };
+            if let Some(g) = glow {
+                horizon_client::mobs::render_model(
+                    model,
+                    base,
+                    &pose,
+                    [g.u0, g.v0, g.u1, g.v1],
+                    horizon_client::mobs::render::FULL_BRIGHT,
+                    0,
+                    out,
+                );
+            }
+        }
+        if let Some(item) = chest {
+            self.mark_rendered_item(start, out.len(), item);
         }
     }
     /// `CapeLayer` for a player wearing `chest`: no cape under an elytra's
@@ -1111,6 +1193,9 @@ impl Game<'_> {
         light: u32,
         out: &mut Vec<horizon_client::mesher::Vertex>,
     ) {
+        if m.extra.hidden_model_parts & 1 != 0 || !horizon_client::mobs::render::layers_shown(m) {
+            return;
+        }
         let Some(rect) = m
             .cape
             .as_deref()
@@ -1121,10 +1206,19 @@ impl Game<'_> {
         if horizon_client::mobs::trader::is_invisible(m) {
             return;
         }
-        let layers = chest
-            .and_then(|item| self.res.items().get(item))
-            .and_then(|i| i.equip_asset.as_ref())
-            .and_then(|asset| self.armor_stand_assets.equipment.get(asset));
+        // CapeLayer.hasLayer: the worn stack's own `equippable` asset.
+        let items = self.res.items();
+        let equippable = match m.extra.armor[1]
+            .as_ref()
+            .filter(|s| chest == Some(&*s.item))
+        {
+            Some(s) => horizon_client::item_sync::equippable(s, items),
+            None => chest.and_then(|item| horizon_client::item_sync::item_equippable(item, items)),
+        };
+        let layers = equippable
+            .filter(|e| e.slot == "chest")
+            .and_then(|e| e.asset_id)
+            .and_then(|asset| self.armor_stand_assets.equipment.get(&asset));
         if layers.is_some_and(|k| k.contains_key("wings")) {
             return;
         }
@@ -1132,6 +1226,7 @@ impl Game<'_> {
         if layers.is_some_and(|k| k.contains_key("humanoid")) {
             base *= glam::Mat4::from_translation(glam::Vec3::new(0.0, -0.053125, 0.06875));
         }
+        let start = out.len();
         horizon_client::mobs::render::cape(
             m,
             partial,
@@ -1141,6 +1236,11 @@ impl Game<'_> {
             self.res.mob_data(),
             out,
         );
+        if out.len() > start
+            && let Some(cape) = &m.cape
+        {
+            self.mark_skin_used(cape);
+        }
     }
     /// `Deadmau5EarsLayer` (`AbstractClientPlayer.showExtraEars`): the ears
     /// of a player whose profile name is `deadmau5`, in the player's skin.
@@ -1166,6 +1266,7 @@ impl Game<'_> {
         else {
             return;
         };
+        let start = out.len();
         horizon_client::mobs::render::ears(
             m,
             partial,
@@ -1175,6 +1276,11 @@ impl Game<'_> {
             self.res.mob_data(),
             out,
         );
+        if out.len() > start
+            && let Some(skin) = &m.skin
+        {
+            self.mark_skin_used(skin);
+        }
     }
     /// The entity id the local player has on its server.
     fn own_entity_id(&self) -> i32 {
@@ -1370,6 +1476,82 @@ pub(super) fn player_preview_quads_no_cull(
     quads
 }
 
+/// One glint face of a GUI model: its corners, the face's atlas UV (the mask),
+/// the transformed glint UV, and whether it is the armour's glint.
+pub(super) type PreviewGlint = ([[f32; 3]; 4], [[f32; 2]; 4], [[f32; 2]; 4], bool);
+
+/// `EquipmentLayerRenderer.renderLayers`' glint on a GUI model: the faces of
+/// the layers drawn with a glint render type because their stack `hasFoil`,
+/// `armorCutoutNoCullGlint` and the trim's `trimmedArmorGlint`
+/// (`mobs::render::ARMOR_GLINT`, which `armor_layers` gives a foil piece's
+/// trim too; the model UV in `glint_uv`, scrolled here by
+/// `ARMOR_ENTITY_GLINT_TEXTURING`), and the items' glint (overlays 7, 8 and
+/// 33; `glint_uv` already transformed). Each face is culled and turned as
+/// `player_preview_quads_no_cull` does with it.
+pub(super) fn preview_glint_quads(
+    verts: &[horizon_client::mesher::Vertex],
+    gui: glam::Mat4,
+    no_cull: std::ops::Range<usize>,
+    frame: horizon_client::item_render::GlintFrame,
+) -> Vec<PreviewGlint> {
+    let armor_glint = horizon_client::item_render::Glint {
+        speed: frame.speed,
+        alpha: frame.alpha,
+        millis: frame.millis,
+        scale: 0.16,
+    };
+    let mut out = Vec::new();
+    for (index, q) in verts.as_chunks::<4>().0.iter().enumerate() {
+        let armor = match q[0].layer & 0xffff {
+            horizon_client::mobs::render::ARMOR_GLINT => true,
+            7 | 8 | horizon_client::gfx::TRANSLUCENT_GLINT_ITEM_OVERLAY => false,
+            _ => continue,
+        };
+        let p: [glam::Vec3; 4] =
+            std::array::from_fn(|i| gui.transform_point3(glam::Vec3::from_array(q[i].pos)));
+        let back = (p[1] - p[0]).cross(p[2] - p[0]).z >= 0.0;
+        if back && !no_cull.contains(&(index * 4)) {
+            continue;
+        }
+        let mut pos = p.map(|v| v.to_array());
+        let mut uv: [[f32; 2]; 4] = std::array::from_fn(|i| q[i].uv);
+        let mut glint_uv: [[f32; 2]; 4] = std::array::from_fn(|i| {
+            if armor {
+                armor_glint.uv(q[i].glint_uv)
+            } else {
+                q[i].glint_uv
+            }
+        });
+        if back {
+            pos.reverse();
+            uv.reverse();
+            glint_uv.reverse();
+        }
+        out.push((pos, uv, glint_uv, armor));
+    }
+    out
+}
+
+/// `GuiEntityRenderer.renderToTexture`: a GUI model into `batch` in the box
+/// `clip`, its faces with a depth buffer, then their glint over them in the
+/// same pass.
+pub(super) fn emit_preview(
+    batch: &mut horizon_client::hud::HudBatch,
+    quads: Vec<(f32, [[f32; 3]; 4], [[f32; 2]; 4], u32)>,
+    glints: Vec<PreviewGlint>,
+    clip: [f32; 4],
+) {
+    let start = batch.vertices.len();
+    for (_, p, uv, color) in quads {
+        batch.quad_3d(p, uv, color);
+    }
+    let glint = batch.vertices.len();
+    for (p, uv, glint_uv, armor) in glints {
+        batch.quad_3d_glint(p, uv, glint_uv, armor);
+    }
+    batch.depth_glint_since(start, glint, clip);
+}
+
 /// `Entity.turn` adds the turn to `xRotO` as well as to `xRot`, so the local
 /// player's `getXRot(partialTick)` follows the mouse every frame instead of
 /// easing in over a tick (#3844), while a change the tick made itself (the
@@ -1448,6 +1630,232 @@ fn player_walk_distance(from: Vec3, to: Vec3) -> f32 {
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    #[test]
+    fn wing_equipment_layers_choose_real_vertex_uvs_in_file_order() {
+        use horizon_client::{
+            hud::Rect,
+            mobs::{Part, Polygon},
+        };
+        use std::collections::HashMap;
+        let root = std::env::temp_dir().join(format!(
+            "horizon-wing-layers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("assets/minecraft/equipment")).unwrap();
+        std::fs::write(
+            root.join("assets/minecraft/equipment/fixture.json"),
+            br#"{"layers":{"wings":[
+            {"texture":"minecraft:base","use_player_texture":false},
+            {"texture":"minecraft:overlay","use_player_texture":true}]}}"#,
+        )
+        .unwrap();
+        let assets = super::super::armor_stands::ArmorStandAssets::load(&root, None);
+        let layers = &assets.equipment["minecraft:fixture"]["wings"];
+        let flags = &assets.wing_player_textures["minecraft:fixture"];
+        assert_eq!(flags, &[false, true]);
+        let rect = |x: f32| Rect {
+            u0: x,
+            v0: 0.0,
+            u1: x + 0.125,
+            v1: 0.25,
+            w: 64,
+            h: 32,
+        };
+        let sprites: HashMap<_, _> = [
+            ("entity/equipment/wings/base".into(), rect(0.5)),
+            ("entity/equipment/wings/overlay".into(), rect(0.75)),
+            ("elytra/custom".into(), rect(0.25)),
+            ("capes/offline".into(), rect(0.0)),
+            ("cit/custom".into(), rect(0.875)),
+        ]
+        .into();
+        let model = Part {
+            name: "wing".into(),
+            pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            polygons: vec![Polygon {
+                normal: [0.0, 0.0, 1.0],
+                cull_back: false,
+                vertices: [
+                    [0.0, 0.0, 0.0, 0.0, 0.0],
+                    [16.0, 0.0, 0.0, 1.0, 0.0],
+                    [16.0, 16.0, 0.0, 1.0, 1.0],
+                    [0.0, 16.0, 0.0, 0.0, 1.0],
+                ],
+            }],
+            children: vec![],
+        };
+        for (elytra, show_cape, second_texture) in [
+            (Some("elytra/custom"), false, "elytra/custom"),
+            (Some("elytra/custom"), true, "elytra/custom"),
+            (Some("elytra/not-uploaded"), true, "capes/offline"),
+            (None, true, "capes/offline"),
+            (None, false, "entity/equipment/wings/overlay"),
+        ] {
+            let player = horizon_client::skins::wings_texture(
+                elytra,
+                Some("capes/offline"),
+                show_cape,
+                |s| sprites.contains_key(s),
+            );
+            let mut vertices = Vec::new();
+            for (index, (texture, undyed)) in layers.iter().enumerate() {
+                let (selected, range) = render_wing_layer(
+                    &model,
+                    glam::Mat4::IDENTITY,
+                    &|p| p.pose,
+                    &sprites,
+                    texture,
+                    *undyed,
+                    flags[index],
+                    player,
+                    None,
+                    None,
+                    0xF000F0,
+                    if index == 0 {
+                        horizon_client::mobs::render::ARMOR_GLINT
+                    } else {
+                        0
+                    },
+                    &mut vertices,
+                )
+                .unwrap();
+                let expected = if index == 0 {
+                    "entity/equipment/wings/base"
+                } else {
+                    second_texture
+                };
+                assert_eq!(selected, expected);
+                assert_eq!(
+                    range.len(),
+                    4,
+                    "a missing skin must not remove wing geometry"
+                );
+                let r = sprites[expected];
+                let uvs = [[r.u0, r.v0], [r.u1, r.v0], [r.u1, r.v1], [r.u0, r.v1]];
+                for (vertex, expected_uv) in vertices[range].iter().zip(uvs) {
+                    assert_eq!(vertex.uv, expected_uv);
+                    assert_eq!(vertex.light, 0xF000F0);
+                    assert_eq!(vertex.color, u32::MAX);
+                }
+            }
+            assert_eq!(vertices.len(), 8);
+            // An explicit CIT rule keeps priority even on an equipment layer
+            // that does not opt into player textures.
+            let (selected, range) = render_wing_layer(
+                &model,
+                glam::Mat4::IDENTITY,
+                &|p| p.pose,
+                &sprites,
+                &layers[0].0,
+                None,
+                false,
+                player,
+                Some("cit/custom"),
+                None,
+                0,
+                0,
+                &mut vertices,
+            )
+            .unwrap();
+            assert_eq!(selected, "cit/custom");
+            assert_eq!(range.len(), 4);
+            assert_eq!(vertices[range.start].uv, [0.875, 0.0]);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_dyed_wing_layers_emit_no_vertices_until_a_dye_is_present() {
+        use horizon_client::{
+            equipment_color::Dyeable,
+            hud::Rect,
+            items::ItemStack,
+            mobs::{Part, Polygon},
+        };
+        let model = Part {
+            name: "wing".into(),
+            pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            polygons: vec![Polygon {
+                normal: [0.0, 0.0, 1.0],
+                cull_back: false,
+                vertices: [
+                    [0.0, 0.0, 0.0, 0.0, 0.0],
+                    [16.0, 0.0, 0.0, 1.0, 0.0],
+                    [16.0, 16.0, 0.0, 1.0, 1.0],
+                    [0.0, 16.0, 0.0, 0.0, 1.0],
+                ],
+            }],
+            children: vec![],
+        };
+        let sprites = [(
+            "wing".to_owned(),
+            Rect {
+                u0: 0.0,
+                v0: 0.0,
+                u1: 1.0,
+                v1: 1.0,
+                w: 64,
+                h: 32,
+            },
+        )]
+        .into();
+        let dyeable = Some(Dyeable {
+            color_when_undyed: None,
+        });
+        let mut stack = ItemStack::new("minecraft:elytra", 1);
+        let mut vertices = Vec::new();
+        assert!(
+            render_wing_layer(
+                &model,
+                glam::Mat4::IDENTITY,
+                &|p| p.pose,
+                &sprites,
+                "wing",
+                dyeable,
+                false,
+                None,
+                None,
+                Some(&stack),
+                0xF000F0,
+                0,
+                &mut vertices
+            )
+            .is_none()
+        );
+        assert!(
+            vertices.is_empty(),
+            "invisible layers must not write depth or hide another layer"
+        );
+        stack.data_mut().dyed_color = Some(0);
+        let (_, range) = render_wing_layer(
+            &model,
+            glam::Mat4::IDENTITY,
+            &|p| p.pose,
+            &sprites,
+            "wing",
+            dyeable,
+            false,
+            None,
+            None,
+            Some(&stack),
+            0xF000F0,
+            0,
+            &mut vertices,
+        )
+        .unwrap();
+        assert_eq!(range.len(), 4);
+        assert!(
+            vertices[range]
+                .iter()
+                .all(|vertex| vertex.color == 0xFF00_0000),
+            "an explicitly black dye must remain visible"
+        );
+    }
     #[test]
     fn a_spectators_own_model_stays_out_of_a_shader_packs_shadow_pass() {
         // First person, a shader pack whose shadow pass draws the player: a spectator's head
@@ -1615,6 +2023,66 @@ mod preview_tests {
         assert_eq!(first_away.len(), 1);
     }
 
+    /// #12666: enchanted armour glints on the inventory's player as in the
+    /// world: `armorCutoutNoCullGlint` layers and foil items get a glint face.
+    #[test]
+    fn the_preview_glints_its_enchanted_armour_and_items() {
+        use horizon_client::{item_render::GlintFrame, mesher::Vertex, mobs::render::ARMOR_GLINT};
+        let face = |layer: u32, glint_uv: [f32; 2]| {
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, 1.0], [1.0, -1.0]].map(|[x, y]| Vertex {
+                pos: [x, y, 0.0],
+                uv: [0.5 + x / 4.0, 0.5 + y / 4.0],
+                layer,
+                color: u32::MAX,
+                light: 0,
+                normal: [0; 4],
+                glint_uv,
+            })
+        };
+        let mut away = face(ARMOR_GLINT, [0.25, 0.75]);
+        away.reverse();
+        let verts: Vec<_> = [
+            face(0, [0.0; 2]),
+            face(ARMOR_GLINT, [0.25, 0.75]),
+            face(7, [3.0, 4.0]),
+            // The upper bits carry the HDR tier, not the overlay.
+            face(ARMOR_GLINT | 1 << 16, [0.25, 0.75]),
+            away,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let frame = GlintFrame {
+            millis: 1234.0,
+            speed: 0.5,
+            alpha: 0.75,
+            sprite: true,
+        };
+        let gui = glam::Mat4::IDENTITY;
+        let glints = preview_glint_quads(&verts, gui, 0..0, frame);
+        // The plain face has none; the armour face looking away is culled.
+        assert_eq!(glints.len(), 3);
+        let armor = horizon_client::item_render::Glint {
+            speed: 0.5,
+            alpha: 0.75,
+            millis: 1234.0,
+            scale: 0.16,
+        };
+        let (pos, uv, glint_uv, is_armor) = glints[0];
+        assert!(is_armor);
+        assert_eq!(pos, std::array::from_fn(|i| verts[4 + i].pos));
+        assert_eq!(uv[0], verts[4].uv);
+        // ARMOR_ENTITY_GLINT_TEXTURING scrolls the model UV.
+        assert_eq!(glint_uv[0], armor.uv([0.25, 0.75]));
+        // The item's glint UV is already transformed.
+        assert_eq!((glints[1].2[0], glints[1].3), ([3.0, 4.0], false));
+        assert!(glints[2].3);
+        // A no-cull (wings) face that looks away keeps its glint, turned.
+        let kept = preview_glint_quads(&verts, gui, 16..20, frame);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[3].0[0], verts[16 + 3].pos);
+    }
+
     #[test]
     fn the_inventory_preview_is_lit_as_entity_in_ui() {
         // A face looking at the viewer, up, down, to the right and to the left.
@@ -1685,13 +2153,28 @@ mod preview_tests {
     /// HumanoidArmorLayer is.
     #[test]
     fn an_invisible_body_keeps_its_armour() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client/26.3");
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client/26.3")
+            });
         let Some(kind) = player_type(&root) else {
+            assert!(
+                std::env::var_os("HORIZON_TEST_RESOURCES").is_none(),
+                "explicit test resources have no player model"
+            );
             return;
         };
         let m = Mob::new(1, kind.clone(), Vec3::ZERO, 0.0);
-        let armour = [(&*kind.model, [0.5, 0.5, 0.75, 0.75], u32::MAX, 0, false)];
+        let armour = [(
+            &*kind.model,
+            [0.5, 0.5, 0.75, 0.75],
+            u32::MAX,
+            0,
+            "minecraft:diamond_chestplate".to_owned(),
+            false,
+        )];
         let atlas = |_: &str| Some([0.0, 0.0, 0.25, 0.25]);
         let data = horizon_client::mobs::MobData {
             states: Vec::new(),
@@ -1715,7 +2198,7 @@ mod preview_tests {
             } else {
                 horizon_client::mobs::render::render_layers
             };
-            render(
+            let items = render(
                 &m,
                 1.0,
                 glam::DVec3::ZERO,
@@ -1725,6 +2208,10 @@ mod preview_tests {
                 &armour,
                 &mut out,
             );
+            assert_eq!(items.len(), 1, "the armour keeps its shader item span");
+            assert_eq!(items[0].item, "minecraft:diamond_chestplate");
+            assert!(items[0].start < items[0].end);
+            assert!(items[0].end <= out.len());
             out
         };
         let (shown, hidden) = (draw(true), draw(false));
@@ -1821,7 +2308,9 @@ mod preview_tests {
     /// fifth of the turn.
     #[test]
     fn a_living_vehicles_rider_faces_its_body_within_85_degrees() {
-        let body = |head, vehicle| (super::rider_body_yaw(head, vehicle) * 1000.0).round() / 1000.0;
+        let body = |head, vehicle| {
+            (horizon_client::mobs::riders::solve_body_rot(head, vehicle) * 1000.0).round() / 1000.0
+        };
         assert_eq!(body(60.0, 40.0), 40.0);
         assert_eq!(body(100.0, 40.0), 52.0);
         assert_eq!(body(140.0, 40.0), 72.0);

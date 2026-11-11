@@ -17,14 +17,30 @@ use std::time::{Duration, SystemTime};
 pub const SIZE_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 
 /// The upload screen's numbers: total bytes, bytes handed to the socket, and its cancel.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct UploadProgress {
+    session: Option<std::sync::Arc<super::transport::Cancellation>>,
     total: AtomicU64,
     written: AtomicU64,
     cancelled: AtomicBool,
 }
 
+impl std::fmt::Debug for UploadProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadProgress")
+            .field("cancelled", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
 impl UploadProgress {
+    pub(crate) fn managed(session: std::sync::Arc<super::transport::Cancellation>) -> Self {
+        Self {
+            session: Some(session),
+            ..Self::default()
+        }
+    }
+
     pub fn total(&self) -> u64 {
         self.total.load(Ordering::Relaxed)
     }
@@ -53,6 +69,7 @@ impl UploadProgress {
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+            || self.session.as_ref().is_some_and(|s| s.cancelled())
     }
     /// The body reader's counter and stop flag (`FileUpload`'s `UploadCountingInputStream`).
     pub fn counter(&self) -> &AtomicU64 {
@@ -129,7 +146,17 @@ fn request_upload_info(
             // `requestUploadInfo` returned null: the next try may answer.
             Ok(None) => {}
             Err(RealmsError::Retry(seconds)) => {
-                std::thread::sleep(Duration::from_secs(seconds.min(60)));
+                let until = std::time::Instant::now() + Duration::from_secs(seconds.min(60));
+                while std::time::Instant::now() < until {
+                    if progress.is_cancelled() {
+                        return Err(UploadError::Cancelled);
+                    }
+                    std::thread::sleep(
+                        until
+                            .saturating_duration_since(std::time::Instant::now())
+                            .min(Duration::from_millis(25)),
+                    );
+                }
             }
             Err(e) => return Err(UploadError::Failed(e.text())),
         }

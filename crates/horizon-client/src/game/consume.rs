@@ -23,6 +23,45 @@ type ItemConsumable = Consumable<String, ConsumeEffect>;
 pub(super) const USE_ITEM_COMPLETE_EVENT: i8 = 9;
 
 impl Game<'_> {
+    /// `Consumable.startConsuming`: positive durations begin a held use;
+    /// zero-tick consumables execute onConsume in this interaction, not a later tick.
+    pub(super) fn start_eating(&mut self, info: &ItemInfo) -> bool {
+        let Some(stack) = self.held().cloned() else {
+            return false;
+        };
+        let Some(consumable) = info.consumable.as_ref() else {
+            return false;
+        };
+        if info.food.is_some()
+            && (self.player.is_none() || !self.can_eat(&stack, info.can_always_eat))
+        {
+            return false;
+        }
+        if super::item_use::consumes_at_once(consumable.ticks()) {
+            // Instant use is authoritative on the server; a connected client
+            // receives its resulting inventory instead of consuming twice.
+            if self.remote.is_none() {
+                self.complete_consuming(info, consumable, &stack);
+            }
+        } else {
+            // Also initializes the duration and lets native use hooks adjust it.
+            self.start_using_item();
+        }
+        true
+    }
+
+    /// ItemStack.use/finishUsingItem apply remainder and cooldown side effects
+    /// after onConsume, using the original stack's components even if the hand changed.
+    pub(super) fn complete_consuming(
+        &mut self,
+        info: &ItemInfo,
+        consumable: &ItemConsumable,
+        stack: &ItemStack,
+    ) {
+        self.finish_consuming(info, consumable, stack);
+        self.apply_use_cooldown(stack);
+    }
+
     /// `ServerPlayer.completeUsingItem`: the player's own client is told
     /// first, and completes the use itself (eating the food there too).
     pub(super) fn send_use_item_complete(&mut self) {
@@ -159,8 +198,8 @@ impl Game<'_> {
             player,
             scene: &mut self.world,
             assets: &self.pack.assets,
-            collision_binding: self.collision,
-            resources: self.motion,
+            collision_binding: &self.collision,
+            resources: &self.motion,
             health: &self.health_resources,
         }
         .no_player_collision(bounds)
@@ -279,6 +318,8 @@ impl Game<'_> {
             self.dismount_cart(i);
         } else if let Some(c) = self.cushions.iter().find(|c| c.id == id).cloned() {
             self.get_up_from_cushion(&c);
+        } else if self.seat(id).is_some() {
+            self.get_off_seat();
         } else {
             self.dismount_mount();
         }

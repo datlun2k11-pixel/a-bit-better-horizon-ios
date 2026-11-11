@@ -17,13 +17,11 @@ pub mod http;
 pub mod screen;
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::{
-        Condvar, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak},
 };
 use zip::{CompressionMethod, ZipArchive, write::SimpleFileOptions, write::ZipWriter};
 
@@ -37,130 +35,85 @@ const MAX_PACKED: u64 = 2 << 30;
 const MAX_UNPACKED: u64 = 4 << 30;
 const MAX_ENTRIES: usize = 50_000;
 
-/// Written beside `resources.unpacking` once every entry is out, so a start that finds a tree the
-/// watchdog or a flat battery interrupted never mistakes it for one [`publish`] can finish.
-const SCRATCH_DONE: &str = "resources.unpacking.done";
-
-/// What an import is doing, for a phone's launcher to draw (packaging/ios/Launcher). One archive at
-/// a time is unpacked on a phone, and the launcher asks for this while it is up.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportStatus {
-    /// The archive's file name, as the person who sent it named it.
-    pub label: String,
-    pub files: usize,
-    pub total_files: usize,
-    pub bytes: u64,
-    /// Why the archive could not be installed. It stays until the next import starts.
-    pub error: Option<String>,
+#[derive(Debug, Default)]
+struct HomeGate {
+    busy: Mutex<bool>,
+    ready: Condvar,
 }
 
-static STATUS: Mutex<Option<ImportStatus>> = Mutex::new(None);
-
-/// The archive being unpacked now, or the last one that failed. `None` when nothing is happening.
-pub fn status() -> Option<ImportStatus> {
-    STATUS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
+#[derive(Debug)]
+struct HomeTransaction {
+    gate: Arc<HomeGate>,
 }
 
-fn set_status(status: Option<ImportStatus>) {
-    *STATUS.lock().unwrap_or_else(PoisonError::into_inner) = status;
-}
-
-/// Count one more file out, for the launcher's progress bar.
-fn report_progress(files: usize, bytes: u64) {
-    let mut status = STATUS.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(status) = status.as_mut() {
-        status.files = files;
-        status.bytes = bytes;
-    }
-}
-
-/// Whether the archives that came in through `Documents` are still being installed.
-static BOOT_STARTED: AtomicBool = AtomicBool::new(false);
-static BOOT_DONE: (Mutex<bool>, Condvar) = (Mutex::new(true), Condvar::new());
-
-pub fn boot_importing() -> bool {
-    BOOT_STARTED.load(Ordering::Relaxed)
-        && !*BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Install what a phone's `Documents` holds, on a worker: a prepared tree is hundreds of megabytes and
-/// thousands of files, and unpacking it on the thread that runs the app is what iOS's watchdog kills
-/// (`0x8badf00d`, a black launch screen and a relaunch) before a window ever appears.
-///
-/// Called once, before the event loop; [`wait_for_boot_import`] is how the loader hears it is over.
-pub fn boot(home: &Path) {
-    if !cfg!(any(target_os = "ios", target_os = "android")) || BOOT_STARTED.swap(true, Ordering::Relaxed)
-    {
-        return;
-    }
-    *BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
-    let home = home.to_owned();
-    let spawned = std::thread::Builder::new()
-        .name("horizon-import-boot".into())
-        .spawn(move || {
-            // Also on a panic or an early return: the loader must never wait on a thread that is gone.
-            let _finished = FinishBoot;
-            // A swap that a flat battery or a crash left half done is finished, or the old tree put
-            // back, before anything reads the folder it was working on.
-            match recover(&home) {
-                Ok(Some(path)) => log::info!("Horizon: finished the import at {}", path.display()),
-                Ok(None) => {}
-                Err(error) => log::error!("Horizon: could not finish the last import: {error}"),
-            }
-            // The cable's door: an archive dragged into `Documents` is installed here, so the launch
-            // it was dragged for is the one that finds it.
-            scan(&home);
-        });
-    if let Err(error) = spawned {
-        log::error!("Horizon: could not start the import worker: {error}");
-        finish_boot();
-    }
-}
-
-struct FinishBoot;
-
-impl Drop for FinishBoot {
+impl Drop for HomeTransaction {
     fn drop(&mut self) {
-        finish_boot();
+        *self
+            .gate
+            .busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = false;
+        self.gate.ready.notify_one();
     }
 }
 
-fn finish_boot() {
-    *BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
-    BOOT_DONE.1.notify_all();
+/// Owned access to one resource generation. Cloning extends the same
+/// transaction across worker tails or handoff objects; only dropping its last
+/// clone releases the home. A clone does not acquire another transaction.
+#[derive(Clone, Debug)]
+pub struct HomeAccess {
+    _transaction: Arc<HomeTransaction>,
 }
 
-/// Wait until [`boot`]'s worker is done (at once when there is nothing to do, as on a desktop).
-pub fn wait_for_boot_import() {
-    if !BOOT_STARTED.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut done = BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner);
-    while !*done {
-        done = BOOT_DONE.1.wait(done).unwrap_or_else(PoisonError::into_inner);
-    }
-}
-
-/// The game files a phone has imported, when they are there: `fallback` everywhere else. The
-/// loader resolves the folder before a dropped archive is unpacked (it starts at launch, the loader
-/// on Play), so it asks this again once [`wait_for_boot_import`] says the import is over.
-pub fn imported_resources(fallback: &Path) -> PathBuf {
-    #[cfg(any(target_os = "ios", target_os = "android"))]
-    {
-        let home = std::env::current_dir().unwrap_or_default();
-        let sibling = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("resources")));
-        if let Some(sibling) = sibling
-            && let Some(root) = resources_root(&sibling, Some(&home))
-        {
-            return root;
+/// Acquire access to one existing game home. This waits on the calling thread:
+/// callers must acquire on a worker, not the UI thread. The owned token can then
+/// be moved or cloned to other threads without keeping a borrowed mutex guard.
+///
+/// Canonical aliases share a gate; different homes remain independent. This
+/// coordinates only this process. It is not reentrant: while holding a token,
+/// clone it instead of calling `acquire_home_access`, `with_home_access`,
+/// `install`, or `recover` for that home again.
+pub fn acquire_home_access(home: &Path) -> Result<HomeAccess> {
+    type HomeGates = Mutex<BTreeMap<PathBuf, Weak<HomeGate>>>;
+    static GATES: OnceLock<HomeGates> = OnceLock::new();
+    let home = fs::canonicalize(home)?;
+    let gate = {
+        let mut gates = GATES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Active transactions and their waiters retain a home. Do not retain
+        // every home that was ever used after its operations have all ended.
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        match gates.get(&home).and_then(Weak::upgrade) {
+            Some(gate) => gate,
+            None => {
+                let gate = Arc::new(HomeGate::default());
+                gates.insert(home, Arc::downgrade(&gate));
+                gate
+            }
         }
+    };
+    let mut busy = gate.busy.lock().unwrap_or_else(PoisonError::into_inner);
+    while *busy {
+        busy = gate
+            .ready
+            .wait(busy)
+            .unwrap_or_else(PoisonError::into_inner);
     }
-    fallback.to_owned()
+    *busy = true;
+    drop(busy);
+    Ok(HomeAccess {
+        _transaction: Arc::new(HomeTransaction { gate }),
+    })
+}
+
+/// Run a synchronous operation while holding the home's transaction. Detached
+/// workers must instead acquire and retain `HomeAccess` until all their reads
+/// and any result handoff have finished.
+pub fn with_home_access<T>(home: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _access = acquire_home_access(home)?;
+    operation()
 }
 
 /// What an archive holds, named for the file that says so.
@@ -284,7 +237,7 @@ fn sanitize(name: &str) -> String {
 /// the entry, so a player hears that the archive is strange rather than playing a half-imported
 /// world.
 fn inside(name: &str, prefix: &str) -> Option<PathBuf> {
-    if name.starts_with('/') || name.contains(':') {
+    if name.starts_with('/') || name.contains([':', '\0']) {
         return None;
     }
     let rest = if prefix.is_empty() {
@@ -338,8 +291,6 @@ pub struct Pack {
     /// Every entry above the root the game reads, including the trailing `/`: `""`, `"Horizon/"`, or
     /// `"horizon-client/26.3/"` for somebody who compressed one folder too many.
     prefix: String,
-    /// The files [`unpack`](Self::unpack) will write, for the progress a phone's launcher draws.
-    total_files: usize,
     pub kind: Kind,
 }
 
@@ -352,12 +303,15 @@ impl Pack {
         }
         let archive = ZipArchive::new(File::open(path)?)?;
         // `name_for_index` borrows the archive, so the list is finished before anything is read out.
-        let mut names: Vec<String> = (0..archive.len())
-            .filter_map(|index| {
-                let name = archive.name_for_index(index)?.ok()?.replace('\\', "/");
-                (!name.ends_with('/') && !is_junk(&name)).then_some(name)
-            })
-            .collect();
+        let mut names = Vec::new();
+        for index in 0..archive.len() {
+            if let Some(name) = archive.name_for_index(index) {
+                let name = name?.replace('\\', "/");
+                if !name.ends_with('/') && !is_junk(&name) {
+                    names.push(name);
+                }
+            }
+        }
         if names.len() > MAX_ENTRIES {
             return Err("the archive holds more files than this will unpack".into());
         }
@@ -403,20 +357,18 @@ impl Pack {
                 .filter(|last| !last.is_empty())
                 .unwrap_or(&stem),
         );
-        let total_files = names.len();
         Ok(Self {
             archive,
             path: path.to_owned(),
             item,
             prefix,
-            total_files,
             kind,
         })
     }
 
     /// Read every entry out into `into`, which is created here. Anything that goes wrong removes
     /// `into` again: the game must never see a half tree.
-    fn unpack(&mut self, into: &Path, progress: &mut dyn FnMut(usize, u64)) -> Result<(usize, u64)> {
+    fn unpack(&mut self, into: &Path) -> Result<(usize, u64)> {
         fs::create_dir_all(into)?;
         let mut files = 0;
         let mut written = 0u64;
@@ -452,91 +404,105 @@ impl Pack {
             }
             written += copied;
             files += 1;
-            progress(files, written);
         }
         Ok((files, written))
+    }
+
+    /// A folder-wrapped resource pack must have its resource root promoted to
+    /// the ZIP root before the normal pack repository can see it. Copy compressed
+    /// entries directly: rewriting names does not require inflating HD assets.
+    fn normalize_resource_pack(&mut self, dest: &Path) -> Result<()> {
+        fs::metadata(&self.path)?;
+        let mut entries = BTreeMap::new();
+        for index in 0..self.archive.len() {
+            let file = self.archive.by_index(index)?;
+            let name = file.name()?.replace('\\', "/");
+            if file.is_symlink() {
+                return Err(format!("the archive holds a symbolic link: {name}").into());
+            }
+            if name.ends_with('/') || is_junk(&name) {
+                continue;
+            }
+            let relative = inside(&name, &self.prefix)
+                .ok_or_else(|| format!("the archive holds a path that escapes it: {name}"))?;
+            // The unpacked kinds also give the final entry for a path priority.
+            // Deduplicate after normalization so the ZIP writer need not emit
+            // ambiguous duplicate names, including `a/./b` aliases.
+            entries.insert(relative.to_string_lossy().replace('\\', "/"), index);
+        }
+        if !entries.contains_key(Kind::ResourcePack.marker()) {
+            return Err("the archive has no resource pack metadata at its resource root".into());
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = unique(&dest.with_extension("zip.importing"));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let written = (|| -> Result<()> {
+            let mut output = ZipWriter::new(file);
+            for (name, index) in entries {
+                output.raw_copy_file_rename(self.archive.by_index(index)?, name)?;
+            }
+            let file = output.finish()?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, dest)?;
+            fs::remove_file(&self.path)?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        written
     }
 
     /// Put the archive where the game reads it, under `home` (`Documents` on a phone), and consume
     /// it: a phone does not have 589 MB to spend twice, and what arrives is a copy of something that
     /// is still on the computer that sent it.
-    pub fn install(self, home: &Path) -> Result<Installed> {
-        let label = self
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.item.clone());
-        let total_files = self.total_files;
-        set_status(Some(ImportStatus {
-            label,
-            files: 0,
-            total_files,
-            bytes: 0,
-            error: None,
-        }));
-        let result = self.install_now(home);
-        let mut status = STATUS.lock().unwrap_or_else(PoisonError::into_inner);
-        match &result {
-            Ok(_) => *status = None,
-            // Kept for the launcher to show: a phone's player can read the screen, not the log.
-            Err(error) => {
-                if let Some(status) = status.as_mut() {
-                    status.error = Some(error.to_string());
-                } else {
-                    *status = Some(ImportStatus {
-                        label: String::new(),
-                        files: 0,
-                        total_files: 0,
-                        bytes: 0,
-                        error: Some(error.to_string()),
-                    });
+    pub fn install(mut self, home: &Path) -> Result<Installed> {
+        fs::create_dir_all(home)?;
+        with_home_access(home, || {
+            let archive = self.path.clone();
+            let folder = Path::new(self.kind.folder());
+            let (path, files, bytes) = match self.kind {
+                // A pack stays an archive: the game reads zips straight out of `resourcepacks`
+                // (`packs::discover`), so unpacking one would only lose what vanilla players expect.
+                Kind::ResourcePack => {
+                    let dest = unique(&home.join(folder).join(format!("{}.zip", self.item)));
+                    if self.prefix.is_empty() {
+                        move_file(&archive, &dest)?;
+                    } else {
+                        self.normalize_resource_pack(&dest)?;
+                    }
+                    let bytes = fs::metadata(&dest)?.len();
+                    (dest, 1, bytes)
                 }
-            }
-        }
-        drop(status);
-        result
-    }
-
-    fn install_now(mut self, home: &Path) -> Result<Installed> {
-        let archive = self.path.clone();
-        let folder = Path::new(self.kind.folder());
-        let (path, files, bytes) = match self.kind {
-            // A pack stays an archive: the game reads zips straight out of `resourcepacks`
-            // (`packs::discover`), so unpacking one would only lose what vanilla players expect.
-            Kind::ResourcePack => {
-                let dest = unique(&home.join(folder).join(format!("{}.zip", self.item)));
-                move_file(&archive, &dest)?;
-                let bytes = fs::metadata(&dest)?.len();
-                (dest, 1, bytes)
-            }
-            // A world is never written over: what would be overwritten is the player's own.
-            Kind::World => {
-                let dest = unique(&home.join(folder).join(&self.item));
-                let (files, bytes) = self.unpack(&dest, &mut report_progress)?;
-                fs::remove_file(&archive)?;
-                (dest, files, bytes)
-            }
-            Kind::Resources => {
-                let scratch = home.join("resources.unpacking");
-                let marker = home.join(SCRATCH_DONE);
-                let _ = fs::remove_dir_all(&scratch);
-                let _ = fs::remove_file(&marker);
-                let (files, bytes) = self.unpack(&scratch, &mut report_progress)?;
-                // The marker is what tells a later start that the tree is whole: an unpacking the
-                // watchdog killed is never published as game files.
-                fs::write(&marker, b"")?;
-                let dest = home.join(folder);
-                publish(&scratch, &dest)?;
-                let _ = fs::remove_file(&marker);
-                fs::remove_file(&archive)?;
-                (dest, files, bytes)
-            }
-        };
-        Ok(Installed {
-            kind: self.kind,
-            path,
-            files,
-            bytes,
+                // A world is never written over: what would be overwritten is the player's own.
+                Kind::World => {
+                    let dest = unique(&home.join(folder).join(&self.item));
+                    let (files, bytes) = self.unpack(&dest)?;
+                    fs::remove_file(&archive)?;
+                    (dest, files, bytes)
+                }
+                Kind::Resources => {
+                    let scratch = home.join("resources.unpacking");
+                    let _ = fs::remove_dir_all(&scratch);
+                    let (files, bytes) = self.unpack(&scratch)?;
+                    let dest = home.join(folder);
+                    publish(&scratch, &dest)?;
+                    fs::remove_file(&archive)?;
+                    (dest, files, bytes)
+                }
+            };
+            Ok(Installed {
+                kind: self.kind,
+                path,
+                files,
+                bytes,
+            })
         })
     }
 
@@ -560,6 +526,7 @@ fn publish(scratch: &Path, dest: &Path) -> Result<()> {
         fs::rename(dest, &previous)?;
     }
     fs::rename(scratch, dest)?;
+    horizon_core::prepared_files::invalidate(dest);
     let _ = fs::remove_dir_all(&previous);
     Ok(())
 }
@@ -567,30 +534,28 @@ fn publish(scratch: &Path, dest: &Path) -> Result<()> {
 /// Finish an install that a crash or a flat battery left half done, and report what it put back.
 /// Called at startup, before the game looks for its resources.
 pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
-    let scratch = home.join("resources.unpacking");
-    let marker = home.join(SCRATCH_DONE);
-    let dest = home.join(Kind::Resources.folder());
-    let previous = home.join("resources.previous");
-    // Only a tree the unpacker finished (the marker it wrote last) is whole: anything else was
-    // cut short, and publishing it would hand the game a resources folder with files missing.
-    if marker.is_file() && scratch.is_dir() && !dest.exists() {
-        let _ = fs::remove_file(&marker);
-        fs::rename(&scratch, &dest)?;
-        let _ = fs::remove_dir_all(&previous);
-        return Ok(Some(dest));
+    if !home.exists() {
+        return Ok(None);
     }
-    if !dest.exists() && previous.is_dir() {
-        // The swap never got past putting the old tree aside: put it back.
-        fs::rename(&previous, &dest)?;
+    with_home_access(home, || {
+        let scratch = home.join("resources.unpacking");
+        let dest = home.join(Kind::Resources.folder());
+        let previous = home.join("resources.previous");
+        if scratch.is_dir() && !dest.exists() {
+            fs::rename(&scratch, &dest)?;
+            horizon_core::prepared_files::invalidate(&dest);
+            return Ok(Some(dest));
+        }
+        if !dest.exists() && previous.is_dir() {
+            fs::rename(&previous, &dest)?;
+            horizon_core::prepared_files::invalidate(&dest);
+            return Ok(Some(dest));
+        }
+        // Both landed: the new tree is in place, so what is left over is scratch and the old copy.
         let _ = fs::remove_dir_all(&scratch);
-        let _ = fs::remove_file(&marker);
-        return Ok(Some(dest));
-    }
-    // Both landed: the new tree is in place, so what is left over is scratch and the old copy.
-    let _ = fs::remove_dir_all(&scratch);
-    let _ = fs::remove_file(&marker);
-    let _ = fs::remove_dir_all(&previous);
-    Ok(None)
+        let _ = fs::remove_dir_all(&previous);
+        Ok(None)
+    })
 }
 
 /// `path`, or `path (2)` if it is taken, then `path (3)` and so on.
@@ -832,6 +797,465 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_resource_imports_publish_one_complete_archive() {
+        let home = temp_home("concurrent-resources");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for owner in ["a", "b"] {
+            let archive = home.join(format!("{owner}.zip"));
+            let mut entries = vec![("horizon-resources.json".to_owned(), owner.to_owned())];
+            for index in 0..1500 {
+                entries.push((format!("assets/shared/{index:04}.dat"), owner.repeat(128)));
+            }
+            write_archive(&archive, &entries);
+            let pack = Pack::open(&archive).unwrap();
+            let home = home.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                pack.install(&home).map_err(|e| e.to_string())
+            }));
+        }
+        for worker in workers {
+            let installed = worker.join().unwrap().unwrap();
+            assert_eq!(installed.files, 1501);
+        }
+        let owner = fs::read_to_string(home.join("resources/horizon-resources.json")).unwrap();
+        assert!(matches!(owner.as_str(), "a" | "b"));
+        for index in 0..1500 {
+            assert_eq!(
+                fs::read_to_string(home.join(format!("resources/assets/shared/{index:04}.dat")))
+                    .unwrap(),
+                owner.repeat(128)
+            );
+        }
+        assert!(!home.join("resources.unpacking").exists());
+        assert!(!home.join("resources.previous").exists());
+        assert!(!home.join("a.zip").exists() && !home.join("b.zip").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn concurrent_world_and_pack_imports_keep_each_unique_destination() {
+        for kind in [Kind::World, Kind::ResourcePack] {
+            let home = temp_home(&format!("concurrent-{}", kind.folder()));
+            let barrier = Arc::new(std::sync::Barrier::new(16));
+            let mut workers = Vec::new();
+            for index in 0..16 {
+                let owner = format!("owner-{index}");
+                let source = home.join(format!("source-{index}"));
+                fs::create_dir_all(&source).unwrap();
+                let archive = source.join("Shared.zip");
+                write_archive(
+                    &archive,
+                    &[
+                        (kind.marker(), owner.as_str()),
+                        ("owner.txt", owner.as_str()),
+                    ],
+                );
+                let pack = Pack::open(&archive).unwrap();
+                let home = home.clone();
+                let barrier = barrier.clone();
+                workers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    (owner, pack.install(&home).map_err(|e| e.to_string()))
+                }));
+            }
+            let mut destinations = std::collections::BTreeSet::new();
+            for worker in workers {
+                let (owner, installed) = worker.join().unwrap();
+                let installed = installed.unwrap();
+                assert!(
+                    destinations.insert(installed.path.clone()),
+                    "reused a destination"
+                );
+                let contents = match kind {
+                    Kind::World => fs::read_to_string(installed.path.join("owner.txt")).unwrap(),
+                    Kind::ResourcePack => {
+                        let mut archive =
+                            ZipArchive::new(File::open(&installed.path).unwrap()).unwrap();
+                        let mut contents = String::new();
+                        archive
+                            .by_name("owner.txt")
+                            .unwrap()
+                            .read_to_string(&mut contents)
+                            .unwrap();
+                        contents
+                    }
+                    Kind::Resources => unreachable!(),
+                };
+                assert_eq!(contents, owner);
+            }
+            assert_eq!(destinations.len(), 16);
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_waits_for_an_active_home_transaction_even_through_an_alias() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let base = temp_home("recover-concurrent");
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
+        let alias = {
+            let alias = base.join("alias");
+            std::os::unix::fs::symlink(&home, &alias).unwrap();
+            alias
+        };
+        #[cfg(not(unix))]
+        let alias = home.clone();
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let writer_home = home.clone();
+        let writer = std::thread::spawn(move || {
+            with_home_access(&writer_home, || {
+                let scratch = writer_home.join("resources.unpacking");
+                fs::create_dir_all(&scratch)?;
+                fs::write(scratch.join("horizon-resources.json"), "staged")?;
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+                fs::write(scratch.join("complete.txt"), "complete")?;
+                Ok(())
+            })
+            .map_err(|e| e.to_string())
+        });
+        entered_rx.recv().unwrap();
+        let (started, started_rx) = mpsc::channel();
+        let (finished, finished_rx) = mpsc::channel();
+        let recovery_home = alias.clone();
+        let recovery = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            finished
+                .send(recover(&recovery_home).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let early = finished_rx.recv_timeout(Duration::from_millis(50));
+        release.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        recovery.join().unwrap();
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "recovered a partial transaction"
+        );
+        assert_eq!(
+            finished_rx.recv().unwrap().unwrap(),
+            Some(alias.join("resources"))
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("resources/complete.txt")).unwrap(),
+            "complete"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn detached_and_handoff_clones_keep_import_and_recovery_waiting_until_last_drop() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let home = temp_home("owned-transaction-handoff");
+        fs::create_dir_all(home.join("resources")).unwrap();
+        fs::write(home.join("resources/horizon-resources.json"), "old").unwrap();
+        fs::write(home.join("resources/payload.txt"), "old payload").unwrap();
+        let archive = home.join("new.zip");
+        write_archive(
+            &archive,
+            &[
+                ("horizon-resources.json", "new"),
+                ("payload.txt", "new payload"),
+            ],
+        );
+        let pack = Pack::open(&archive).unwrap();
+        let original = acquire_home_access(&home).unwrap();
+        let handoff = original.clone();
+        let detached_access = original.clone();
+        drop(original);
+        let (tail_started, tail_started_rx) = mpsc::channel();
+        let (finish_tail, finish_tail_rx) = mpsc::channel();
+        let tail_home = home.clone();
+        let tail = std::thread::spawn(move || {
+            let _access = detached_access;
+            tail_started.send(()).unwrap();
+            finish_tail_rx.recv().unwrap();
+            fs::read_to_string(tail_home.join("resources/payload.txt")).unwrap()
+        });
+        tail_started_rx.recv().unwrap();
+        let (writer_started, writer_started_rx) = mpsc::channel();
+        let (written, written_rx) = mpsc::channel();
+        let writer_home = home.clone();
+        let writer = std::thread::spawn(move || {
+            writer_started.send(()).unwrap();
+            written
+                .send(pack.install(&writer_home).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+        let (recovery_started, recovery_started_rx) = mpsc::channel();
+        let (recovered, recovered_rx) = mpsc::channel();
+        let recovery_home = home.clone();
+        let recovery = std::thread::spawn(move || {
+            recovery_started.send(()).unwrap();
+            recovered
+                .send(recover(&recovery_home).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+        writer_started_rx.recv().unwrap();
+        recovery_started_rx.recv().unwrap();
+        let writer_during_tail = written_rx.recv_timeout(Duration::from_millis(50));
+        let recovery_during_tail = recovered_rx.recv_timeout(Duration::from_millis(50));
+        finish_tail.send(()).unwrap();
+        let observed = tail.join().unwrap();
+        let writer_during_handoff = written_rx.recv_timeout(Duration::from_millis(50));
+        let recovery_during_handoff = recovered_rx.recv_timeout(Duration::from_millis(50));
+        drop(handoff);
+        for blocked in [
+            writer_during_tail.map(|_| ()),
+            recovery_during_tail.map(|_| ()),
+            writer_during_handoff.map(|_| ()),
+            recovery_during_handoff.map(|_| ()),
+        ] {
+            assert!(
+                matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)),
+                "an operation escaped a live transaction clone"
+            );
+        }
+        assert_eq!(observed, "old payload");
+        assert_eq!(
+            written_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .kind,
+            Kind::Resources
+        );
+        assert_eq!(
+            recovered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            None
+        );
+        writer.join().unwrap();
+        recovery.join().unwrap();
+        assert_eq!(
+            fs::read_to_string(home.join("resources/horizon-resources.json")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("resources/payload.txt")).unwrap(),
+            "new payload"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn owned_home_access_releases_waiting_imports_on_error_and_unwind() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for panic in [false, true] {
+            let home = temp_home(&format!("owned-transaction-error-{panic}"));
+            let archive = home.join("new.zip");
+            write_archive(&archive, &[("horizon-resources.json", "new")]);
+            let pack = Pack::open(&archive).unwrap();
+            let access = acquire_home_access(&home).unwrap();
+            let (started, started_rx) = mpsc::channel();
+            let (finished, finished_rx) = mpsc::channel();
+            let writer_home = home.clone();
+            let writer = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                finished
+                    .send(pack.install(&writer_home).map_err(|e| e.to_string()))
+                    .unwrap();
+            });
+            started_rx.recv().unwrap();
+            let blocked = finished_rx.recv_timeout(Duration::from_millis(50));
+            let outcome = std::panic::catch_unwind(move || -> Result<()> {
+                let _access = access;
+                if panic {
+                    panic!("resource stage failed");
+                }
+                Err("resource stage failed".into())
+            });
+            assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
+            match outcome {
+                Err(_) => assert!(panic),
+                Ok(Err(_)) => assert!(!panic),
+                Ok(Ok(())) => panic!("the stage unexpectedly succeeded"),
+            }
+            assert_eq!(
+                finished_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                Kind::Resources
+            );
+            writer.join().unwrap();
+            assert_eq!(
+                fs::read_to_string(home.join("resources/horizon-resources.json")).unwrap(),
+                "new"
+            );
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn resource_read_transaction_observes_one_generation_while_an_import_waits() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let home = temp_home("read-transaction");
+        fs::create_dir_all(home.join("resources")).unwrap();
+        fs::write(home.join("resources/horizon-resources.json"), "old").unwrap();
+        fs::write(home.join("resources/payload.txt"), "old payload").unwrap();
+        let archive = home.join("new.zip");
+        write_archive(
+            &archive,
+            &[
+                ("horizon-resources.json", "new"),
+                ("payload.txt", "new payload"),
+            ],
+        );
+        let pack = Pack::open(&archive).unwrap();
+        let (read_first, read_first_rx) = mpsc::channel();
+        let (continue_reading, continue_reading_rx) = mpsc::channel();
+        let reader_home = home.clone();
+        let reader = std::thread::spawn(move || {
+            with_home_access(&reader_home, || {
+                let first =
+                    fs::read_to_string(reader_home.join("resources/horizon-resources.json"))?;
+                read_first.send(first.clone()).unwrap();
+                continue_reading_rx.recv().unwrap();
+                let payload = fs::read_to_string(reader_home.join("resources/payload.txt"))?;
+                Ok((first, payload))
+            })
+            .map_err(|e| e.to_string())
+        });
+        assert_eq!(read_first_rx.recv().unwrap(), "old");
+        let (started, started_rx) = mpsc::channel();
+        let (completed, completed_rx) = mpsc::channel();
+        let writer_home = home.clone();
+        let writer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            completed
+                .send(pack.install(&writer_home).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let early = completed_rx.recv_timeout(Duration::from_millis(50));
+        continue_reading.send(()).unwrap();
+        let observed = reader.join().unwrap().unwrap();
+        writer.join().unwrap();
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "replaced resources during a read transaction"
+        );
+        assert_eq!(observed, ("old".to_owned(), "old payload".to_owned()));
+        let installed = completed_rx.recv().unwrap().unwrap();
+        assert_eq!(installed.path, home.join("resources"));
+        assert_eq!(
+            fs::read_to_string(installed.path.join("horizon-resources.json")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            fs::read_to_string(installed.path.join("payload.txt")).unwrap(),
+            "new payload"
+        );
+        assert!(!archive.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn separate_import_homes_can_make_progress_independently() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let base = temp_home("independent-homes");
+        let first = base.join("first");
+        let second = base.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            with_home_access(&first, || {
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .map_err(|e| e.to_string())
+        });
+        entered_rx.recv().unwrap();
+        let (finished, finished_rx) = mpsc::channel();
+        let other = std::thread::spawn(move || {
+            with_home_access(&second, || {
+                fs::write(second.join("progress.txt"), "ready")?;
+                finished.send(()).unwrap();
+                Ok(())
+            })
+            .map_err(|e| e.to_string())
+        });
+        let independent = finished_rx.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        other.join().unwrap().unwrap();
+        assert!(
+            independent.is_ok(),
+            "another home was unnecessarily blocked"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn replacing_game_files_invalidates_the_previous_prepared_cache() {
+        let home = temp_home("prepared-cache-replace");
+        let root = home.join("resources");
+        fs::create_dir_all(root.join("assets/minecraft/textures/block")).unwrap();
+        fs::write(root.join("horizon-resources.json"), r#"{"schema":7}"#).unwrap();
+        let member = "assets/minecraft/textures/block/grass.png";
+        fs::write(root.join(member), b"old pixels").unwrap();
+        horizon_core::prepared_files::write(&root).unwrap();
+        let previous = horizon_core::prepared_files::open(&root).unwrap();
+        let archive = home.join("new.zip");
+        write_archive(&archive, PREPARED);
+        Pack::open(&archive).unwrap().install(&home).unwrap();
+        assert_eq!(
+            horizon_core::prepared_files::read(&root.join(member)).unwrap(),
+            b"png"
+        );
+        assert_eq!(previous.read(member).unwrap().unwrap(), b"old pixels");
+        horizon_core::prepared_files::invalidate(&root);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn desktop_prepared_binary_is_optional_after_mobile_import() {
+        let home = temp_home("desktop-prepared-cache");
+        let desktop = home.join("desktop");
+        fs::create_dir_all(desktop.join("assets/minecraft/textures/block")).unwrap();
+        fs::write(desktop.join("horizon-resources.json"), r#"{"schema":7}"#).unwrap();
+        let member = "assets/minecraft/textures/block/grass.png";
+        fs::write(desktop.join(member), b"portable pixels").unwrap();
+        horizon_core::prepared_files::write(&desktop).unwrap();
+        let archive = home.join("prepared.zip");
+        pack(&desktop, &archive, |_, _| {}).unwrap();
+        let installed = Pack::open(&archive).unwrap().install(&home).unwrap();
+        assert!(
+            installed
+                .path
+                .join(horizon_core::prepared_files::FILE_NAME)
+                .is_file()
+        );
+        // The cache names its original root; the original files remain portable.
+        assert!(horizon_core::prepared_files::open(&installed.path).is_none());
+        assert_eq!(
+            horizon_core::prepared_files::read(&installed.path.join(member)).unwrap(),
+            b"portable pixels"
+        );
+        horizon_core::prepared_files::invalidate(&installed.path);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn a_folder_wrapped_archive_means_the_same_thing() {
         // Compressing a folder on a desktop puts the folder's name in front of every entry.
         let home = temp_home("wrapped");
@@ -917,6 +1341,192 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
+    fn texture_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 2, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&[1, 2, 3, 255, 97, 38, 19, 17])
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        bytes
+    }
+
+    fn pack_metadata() -> String {
+        format!(
+            r#"{{"pack":{{"description":"wrapped","pack_format":{}}}}}"#,
+            crate::packs::RESOURCE_FORMAT.0
+        )
+    }
+
+    fn assert_pack_repository_reads_texture(home: &Path, expected: &[u8]) {
+        let vanilla = home.join("vanilla");
+        fs::create_dir_all(&vanilla).unwrap();
+        let packs = crate::packs::discover(&vanilla, &home.join("resourcepacks"));
+        assert_eq!(
+            packs.len(),
+            1,
+            "installed ZIP was not discovered as a resource pack"
+        );
+        let overlay = home.join("overlay");
+        crate::packs::build_overlay(&vanilla, &packs, &overlay).unwrap();
+        assert_eq!(
+            fs::read(overlay.join("assets/test/textures/item/probe.png")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn generated_resource_pack_archive_round_trips_into_the_repository() {
+        let home = temp_home("resource-pack-round-trip");
+        let source = home.join("FancyPack");
+        fs::create_dir_all(source.join("assets/test/textures/item")).unwrap();
+        let pixels = texture_png();
+        fs::write(source.join("pack.mcmeta"), pack_metadata()).unwrap();
+        fs::write(source.join("assets/test/textures/item/probe.png"), &pixels).unwrap();
+        let archive = home.join("packed.zip");
+        assert_eq!(
+            pack(&source, &archive, |_, _| {}).unwrap().kind,
+            Kind::ResourcePack
+        );
+        fs::remove_dir_all(source).unwrap();
+        let imported = Pack::open(&archive).unwrap();
+        assert_eq!(imported.prefix, "FancyPack/");
+        assert_eq!(imported.install(&home).unwrap().kind, Kind::ResourcePack);
+        assert!(!archive.exists());
+        assert_pack_repository_reads_texture(&home, &pixels);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn one_and_two_folder_resource_packs_keep_compressed_assets_at_the_zip_root() {
+        for (case, prefix) in ["Outer/", "Outer/Inner/"].into_iter().enumerate() {
+            let home = temp_home(&format!("resource-pack-prefix-{case}"));
+            let archive = home.join("wrapped.zip");
+            let pixels = texture_png();
+            let mut zip = ZipWriter::new(File::create(&archive).unwrap());
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            for (name, bytes) in [
+                ("pack.mcmeta", pack_metadata().into_bytes()),
+                ("assets/test/textures/item/probe.png", pixels.clone()),
+            ] {
+                zip.start_file(format!("{prefix}{name}"), options).unwrap();
+                zip.write_all(&bytes).unwrap();
+            }
+            zip.finish().unwrap();
+            let imported = Pack::open(&archive).unwrap();
+            assert_eq!(imported.prefix, prefix);
+            let installed = imported.install(&home).unwrap();
+            let mut normalized = ZipArchive::new(File::open(&installed.path).unwrap()).unwrap();
+            assert_eq!(
+                normalized
+                    .by_name("assets/test/textures/item/probe.png")
+                    .unwrap()
+                    .compression(),
+                CompressionMethod::Deflated
+            );
+            assert!(normalized.by_name(&format!("{prefix}pack.mcmeta")).is_err());
+            drop(normalized);
+            assert_pack_repository_reads_texture(&home, &pixels);
+            assert_eq!(fs::read_dir(home.join("resourcepacks")).unwrap().count(), 1);
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn normalizing_a_wrapped_pack_preserves_the_last_duplicate_entry() {
+        let home = temp_home("resource-pack-duplicates");
+        let archive = home.join("wrapped.zip");
+        write_archive(
+            &archive,
+            &[
+                ("Wrap/pack.mcmeta", pack_metadata()),
+                ("Wrap/assets/test/probeA.txt", "first".to_owned()),
+                ("Wrap/assets/test/probeB.txt", "last".to_owned()),
+            ],
+        );
+        // ZipWriter refuses duplicate names. Rename the second entry in its
+        // local and central headers without changing their encoded lengths.
+        let mut bytes = fs::read(&archive).unwrap();
+        for at in 0..=bytes.len() - b"probeB.txt".len() {
+            if bytes[at..].starts_with(b"probeB.txt") {
+                bytes[at..at + b"probeA.txt".len()].copy_from_slice(b"probeA.txt");
+            }
+        }
+        fs::write(&archive, bytes).unwrap();
+        let installed = Pack::open(&archive).unwrap().install(&home).unwrap();
+        let mut zip = ZipArchive::new(File::open(installed.path).unwrap()).unwrap();
+        let mut contents = String::new();
+        zip.by_name("assets/test/probeA.txt")
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "last");
+        assert_eq!(zip.len(), 2);
+        drop(zip);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_flat_resource_pack_keeps_its_original_archive_bytes() {
+        let home = temp_home("resource-pack-flat-bytes");
+        let archive = home.join("flat.zip");
+        write_archive(&archive, &[("pack.mcmeta", pack_metadata())]);
+        let original = fs::read(&archive).unwrap();
+        let imported = Pack::open(&archive).unwrap();
+        assert!(imported.prefix.is_empty());
+        let installed = imported.install(&home).unwrap();
+        assert_eq!(fs::read(installed.path).unwrap(), original);
+        assert!(!archive.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn invalid_wrapped_resource_packs_keep_the_original_without_publishing() {
+        for symlink in [false, true] {
+            let home = temp_home(&format!("resource-pack-invalid-{symlink}"));
+            let archive = home.join("wrapped.zip");
+            let mut zip = ZipWriter::new(File::create(&archive).unwrap());
+            let options = SimpleFileOptions::default();
+            zip.start_file("Wrap/pack.mcmeta", options).unwrap();
+            zip.write_all(pack_metadata().as_bytes()).unwrap();
+            if symlink {
+                zip.add_symlink("Wrap/assets/link", "../../outside", options)
+                    .unwrap();
+            } else {
+                zip.start_file("Wrap/../outside", options).unwrap();
+                zip.write_all(b"outside").unwrap();
+            }
+            zip.finish().unwrap();
+            let original = fs::read(&archive).unwrap();
+            assert!(Pack::open(&archive).unwrap().install(&home).is_err());
+            assert_eq!(fs::read(&archive).unwrap(), original);
+            assert!(!home.join("resourcepacks").exists());
+            assert!(!home.join("outside").exists());
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_wrapped_resource_pack_destination_keeps_the_original() {
+        let home = temp_home("resource-pack-write-failure");
+        let archive = home.join("wrapped.zip");
+        write_archive(&archive, &[("Wrap/pack.mcmeta", pack_metadata())]);
+        let original = fs::read(&archive).unwrap();
+        // An existing file blocks the destination directory on every platform.
+        fs::write(home.join("resourcepacks"), b"keep me").unwrap();
+        assert!(Pack::open(&archive).unwrap().install(&home).is_err());
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        assert_eq!(fs::read(home.join("resourcepacks")).unwrap(), b"keep me");
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 2);
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn paths_that_escape_are_refused() {
         assert_eq!(inside("a/b.png", ""), Some(PathBuf::from("a/b.png")));
@@ -928,6 +1538,7 @@ mod tests {
         assert!(inside("a/../../out", "").is_none());
         assert!(inside("/etc/passwd", "").is_none());
         assert!(inside("C:/Windows/system.ini", "").is_none());
+        assert!(inside("assets/test/invalid\0.png", "").is_none());
         assert!(inside("", "").is_none());
     }
 
@@ -940,26 +1551,8 @@ mod tests {
             "{}",
         )
         .unwrap();
-        fs::write(home.join(SCRATCH_DONE), "").unwrap();
         assert_eq!(recover(&home).unwrap(), Some(home.join("resources")));
         assert!(home.join("resources/horizon-resources.json").is_file());
-        assert!(!home.join(SCRATCH_DONE).exists());
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn a_scratch_tree_cut_short_is_not_published() {
-        // The unpacker writes the marker last: without it the tree is missing files.
-        let home = temp_home("partial-scratch");
-        fs::create_dir_all(home.join("resources.unpacking")).unwrap();
-        fs::write(
-            home.join("resources.unpacking/horizon-resources.json"),
-            "{}",
-        )
-        .unwrap();
-        assert_eq!(recover(&home).unwrap(), None);
-        assert!(!home.join("resources").exists());
-        assert!(!home.join("resources.unpacking").exists());
         fs::remove_dir_all(home).unwrap();
     }
 

@@ -3,15 +3,15 @@
 //! beside glass and leaves, back faces, cardinal shading and max(self, above)
 //! light.
 use super::{
-    Info, MeshTables, Padded, SectionMesh, TerrainVertex, fluid_face, lighting, pack_coords,
-    pack_rgb, pi,
+    Info, MeshTables, Padded, QuadLighting, QuadState, SectionMesh, TerrainVertex, fluid_face,
+    lighting, pack_coords, pack_rgb, pi,
 };
 use horizon_core::{
     geometry::{Axis, Direction, VoxelShape, trig},
     position::BlockPos,
 };
 use horizon_world::{
-    fluid::{FluidKind, FluidState},
+    fluid::{FluidState, FluidTemplate},
     fluid_flow::{FluidFlowWorld, flow_at},
 };
 use std::{convert::Infallible, sync::OnceLock};
@@ -24,6 +24,19 @@ const EPSILON: f32 = 0.001;
 const X_STEP: isize = 1;
 const P_STEP: isize = super::P as isize;
 const UP: isize = super::step_index([0, 1, 0]);
+
+/// The `QuadLighting` of a fluid face from its vertex colours: `raw` is the
+/// fluid's tint at full brightness and `shaded` the colour the face is drawn
+/// with. Fluids have no AO. The emission bits in the alpha of both (lava)
+/// are dropped: the alpha here is 255.
+fn quad_lighting(raw: u32, shaded: u32) -> QuadLighting {
+    let opaque = |color: u32| color & 0x00FF_FFFF | 0xFF00_0000;
+    QuadLighting {
+        tint: opaque(raw),
+        shaded_tint: opaque(shaded),
+        no_directional: [opaque(raw); 4],
+    }
+}
 
 /// For the occlusion face toward `direction`: the height from the bottom over
 /// which its slice flush with the `direction` side covers the whole width
@@ -208,17 +221,18 @@ pub(super) fn splits_north_east(nw: f32, ne: f32, sw: f32, se: f32) -> bool {
     along_nw < along_ne || along_nw == 0.0
 }
 /// Emits one fluid cell at section-relative `[x, y, z]`.
-/// `(nether, shader_pack_lighting, separate_ao, shader_pack)`: the Nether's face shading, only the
-/// up-face value when a shader pack lights the faces (`Mesher::shader_pack_lighting`), whether to
-/// keep pure alpha for separate AO, and whether a `shaders/` pack draws the terrain
-/// (`Mesher::shader_pack`: tops split as Iris splits them, [`splits_north_east`]).
+/// `(nether, shader_pack_lighting, separate_ao, shader_pack)`: the Nether's face shading,
+/// the selected lighting policy, and whether an Iris-format pack draws terrain.
+/// AO is carried by quad sidecars so native alpha remains HDR-compatible; shader packs
+/// select the observed fluid-top diagonal through `splits_north_east`.
 pub(super) fn tesselate(
     tables: &MeshTables,
-    (nether, shader_pack_lighting, separate_ao, shader_pack): (bool, bool, bool, bool),
+    (nether, shader_pack_lighting, _separate_ao, shader_pack): (bool, bool, bool, bool),
     pad: &Padded,
     water_color: u32,
     out: &mut SectionMesh,
     [x, y, z]: [i32; 3],
+    state_id: u32,
 ) {
     use horizon_assets::model::Direction as D;
     let cardinal = |d: D| {
@@ -251,7 +265,8 @@ pub(super) fn tesselate(
     if !render_up && !render_down && !sides.iter().any(|&s| s) {
         return;
     }
-    let water = matches!(kind, FluidKind::Water | FluidKind::FlowingWater);
+    // A mod fluid looks like its template until it has its own model (#6301 step 6).
+    let water = kind.template() == FluidTemplate::Water;
     let tint = if water {
         water_color & 0xFF_FFFF
     } else {
@@ -264,11 +279,7 @@ pub(super) fn tesselate(
     };
     let color = |by: f32| {
         let rgb = [16, 8, 0].map(|shift| lighting::scale((tint >> shift & 255) as i32, by) as u32);
-        if separate_ao {
-            pack_rgb(rgb)
-        } else {
-            crate::mesher::emitting(pack_rgb(rgb), emission)
-        }
+        crate::mesher::emitting(pack_rgb(rgb), emission)
     };
     let height = |step: isize| -> f32 {
         let s = at(step);
@@ -340,30 +351,40 @@ pub(super) fn tesselate(
     } else {
         (tables.lava_still, tables.lava_flow, None)
     };
-    let target = if water {
-        &mut out.translucent
+    let (target, states, sprite_layers) = if water {
+        (
+            &mut out.translucent,
+            &mut out.translucent_states,
+            &mut out.sprite_layers,
+        )
     } else {
-        &mut out.solid
+        (
+            &mut out.solid,
+            &mut out.solid_states,
+            &mut out.sprite_layers,
+        )
     };
-    let mut sprite_layers = Vec::new();
+    let quad_state = QuadState::new(state_id, [x, y, z], true);
     let mut quad = |v: [([f32; 3], [f32; 2]); 4],
                     layer: u16,
-                    color: u32,
+                    shade: f32,
                     light: u16,
                     back: bool,
                     face: usize| {
         if tables.is_animated(layer) && !sprite_layers.contains(&layer) {
             sprite_layers.push(layer);
         }
-        let color = if separate_ao {
-            color
-        } else {
-            fluid_face(color, face)
+        let shaded = fluid_face(color(shade), face);
+        let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, shaded, light);
+        let state = QuadState {
+            lighting: Some(quad_lighting(color(1.0), shaded)),
+            ..quad_state
         };
-        let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, color, light);
-        target.extend([vertex(v[0]), vertex(v[1]), vertex(v[2]), vertex(v[3])]);
+        target.extend(v.map(vertex));
+        states.push(state);
         if back {
-            target.extend([vertex(v[0]), vertex(v[3]), vertex(v[2]), vertex(v[1])]);
+            target.extend([v[0], v[3], v[2], v[1]].map(vertex));
+            states.push(state);
         }
     };
     let (fx, fy, fz) = (x as f32, y as f32, z as f32);
@@ -417,7 +438,7 @@ pub(super) fn tesselate(
         quad(
             corners,
             layer,
-            color(cardinal(D::Up)),
+            cardinal(D::Up),
             light(0),
             backward,
             Direction::Up as usize,
@@ -433,7 +454,7 @@ pub(super) fn tesselate(
                 ([fx, y0, fz + 1.0], [0.0, 1.0]),
             ],
             still,
-            color(cardinal(D::Down)),
+            cardinal(D::Down),
             light(-UP),
             false,
             Direction::Down as usize,
@@ -491,13 +512,12 @@ pub(super) fn tesselate(
                 ([x0, fy + bottom, z0], [0.0, 0.5]),
             ],
             layer,
-            color(up_shade * side),
+            up_shade * side,
             side_light,
             !is_overlay,
             d as usize,
         );
     }
-    out.sprite_layers.extend(sprite_layers);
 }
 
 #[cfg(test)]
@@ -571,5 +591,28 @@ mod tests {
         assert_eq!(coverage(&slab, Direction::South), 0.5);
         assert_eq!(coverage(&slab, Direction::Down), 1.0);
         assert_eq!(coverage(&slab, Direction::Up), 0.0);
+    }
+    #[test]
+    fn water_lighting_is_the_biome_tint_without_shade_or_emission_bits() {
+        // Water biome tint (63, 118, 228) and the same shaded by 0.5
+        // (31, 59, 114), both with the emission bits of the bright HDR tier in the alpha.
+        let raw = crate::mesher::emitting(pack_rgb([63, 118, 228]), crate::mesher::BRIGHT);
+        let shaded = crate::mesher::emitting(pack_rgb([31, 59, 114]), crate::mesher::BRIGHT);
+        assert_eq!((raw >> 24, shaded >> 24), (0xFC, 0xFC));
+        let l = quad_lighting(raw, shaded);
+        assert_eq!(l.tint, 0xFFE4_763F);
+        assert_eq!(l.shaded_tint, 0xFF72_3B1F);
+        // No AO and no directional shade apart from `shaded_tint`.
+        assert_eq!(l.no_directional, [0xFFE4_763F; 4]);
+    }
+    #[test]
+    fn lava_lighting_is_white_and_opaque_despite_full_emission() {
+        let white = crate::mesher::emitting(pack_rgb([255; 3]), crate::mesher::VERY_BRIGHT);
+        let shaded = crate::mesher::emitting(pack_rgb([127; 3]), crate::mesher::VERY_BRIGHT);
+        assert_eq!(white >> 24, 0xFB);
+        let l = quad_lighting(white, shaded);
+        assert_eq!(l.tint, 0xFFFF_FFFF);
+        assert_eq!(l.shaded_tint, 0xFF7F_7F7F);
+        assert_eq!(l.no_directional, [0xFFFF_FFFF; 4]);
     }
 }

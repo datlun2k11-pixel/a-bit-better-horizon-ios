@@ -93,6 +93,9 @@ impl Config {
         if let Some(v) = var("RELAY_MAX_HOSTS_PER_ADDRESS") {
             c.rates.hosts_per_address = v;
         }
+        if let Some(v) = var("RELAY_MAX_OPEN_PER_ADDRESS") {
+            c.rates.open_per_address = v;
+        }
         if let Some(v) = var("RELAY_MAX_BRIDGES") {
             c.max_bridges = v;
         }
@@ -110,6 +113,12 @@ impl Config {
         }
         if let Some(v) = var::<f64>("RELAY_GLOBAL_UNKNOWN_PER_MIN") {
             c.global_unknown_per_min = v;
+        }
+        if let Some(v) = var::<f64>("RELAY_NAMEPLATE_UNKNOWN_PER_MIN") {
+            c.rates.nameplate_unknown_per_min = v;
+        }
+        if let Some(v) = var::<f64>("RELAY_NAMEPLATE_UNKNOWN_BURST") {
+            c.rates.nameplate_unknown_burst = v;
         }
         if let Some(v) = var::<u8>("RELAY_PER_ADDRESS_LIMITS") {
             c.per_address = v != 0;
@@ -161,6 +170,14 @@ impl Net {
                 .filter(|p| *p <= bits)
                 .ok_or_else(|| format!("{text:?}: the prefix is 0 to {bits}"))?,
         };
+        // The socket peer is normalized to IPv4 on a dual-stack listener.
+        // Normalize an explicitly mapped IPv4 range too, or even an exact
+        // ::ffff:a.b.c.d load-balancer address would never match itself.
+        let mapped = match address {
+            std::net::IpAddr::V6(v6) if prefix >= 96 => v6.to_ipv4_mapped(),
+            _ => None,
+        };
+        let (address, prefix) = mapped.map_or((address, prefix), |v4| (v4.into(), prefix - 96));
         Ok(Self { address, prefix })
     }
 
@@ -404,29 +421,63 @@ fn unmap(peer: SocketAddr) -> SocketAddr {
     }
 }
 
+/// A connection counted against its address's cap ([`limits::Limiter::open_connection`]), given
+/// back however the connection ends.
+struct OpenSlot<'a>(&'a State, std::net::IpAddr);
+impl<'a> OpenSlot<'a> {
+    fn take(state: &'a State, ip: std::net::IpAddr) -> Option<Self> {
+        // Decided with the lock released before a slot exists: a refused one must never be built,
+        // its Drop would give back a place it never took (and lock the limiter again).
+        let open = locked(&state.limiter).open_connection(ip);
+        open.then(|| Self(state, ip))
+    }
+}
+impl Drop for OpenSlot<'_> {
+    fn drop(&mut self) {
+        locked(&self.0.limiter).close_connection(self.1);
+    }
+}
+
 fn handle(state: &Arc<State>, mut stream: TcpStream, peer: SocketAddr) -> io::Result<()> {
     if state.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
     let mut peer = unmap(peer);
-    // The first line (and an HTTP request) within `first_line` in all.
-    let first_line = horizon_friends::deadline(&stream, state.config.first_line)?;
-    stream.set_read_timeout(Some(state.config.first_line))?;
-    let _ = stream.set_nodelay(true);
-    let mut line = wire::read_line(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
-    if state.config.proxy_protocol {
-        if !state
+    if state.config.proxy_protocol
+        && !state
             .config
             .proxy_from
             .iter()
             .any(|net| net.contains(peer.ip()))
-        {
-            // Not from our load balancer: its PROXY line would be the client's own say.
+    {
+        // Reject before waiting for a line: an unlisted peer must not hold a
+        // connection slot (or a first-line watchdog) open by sending nothing.
+        return Ok(());
+    }
+    // Counted per address before anything is read: past its cap a connection is closed at once,
+    // not held for `first_line` with one of the relay's global slots. Behind the PROXY protocol the
+    // client's address is the line the load balancer sends on connect, so it's counted after it.
+    let mut _open = None;
+    if !state.config.proxy_protocol {
+        let Some(slot) = OpenSlot::take(state, peer.ip()) else {
             return Ok(());
-        }
+        };
+        _open = Some(slot);
+    }
+    // The first line (and an HTTP request) within `first_line` in all.
+    let first_line = horizon_friends::deadline(&stream, state.config.first_line)?;
+    stream.set_read_timeout(Some(state.config.first_line))?;
+    let _ = stream.set_nodelay(true);
+    let _ = horizon_friends::set_tcp_keepalive(&stream);
+    let mut line = wire::read_line(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+    if state.config.proxy_protocol {
         peer = proxy_line(&line)
             .map(unmap)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no PROXY line"))?;
+        let Some(slot) = OpenSlot::take(state, peer.ip()) else {
+            return Ok(());
+        };
+        _open = Some(slot);
         line = wire::read_line(&mut stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
     }
     if line.starts_with(b"GET ") {
@@ -632,10 +683,13 @@ fn join(
 ) -> io::Result<()> {
     let now = Instant::now();
     state.joins.fetch_add(1, Ordering::Relaxed);
-    // The global budget for unknown codes is checked before the lookup, so a
-    // refusal says nothing about whether the nameplate exists.
-    let allowed =
-        locked(&state.limiter).allow_join(peer.ip(), now) && locked(&state.global_unknown).has(now);
+    // The budgets for unknown codes (the site's, then the global one) are checked before the
+    // lookup, so a refusal says nothing about whether the nameplate exists. The site's comes
+    // first: emptying the global budget takes many sites, not the /64s of one home's /56.
+    let allowed = {
+        let mut limiter = locked(&state.limiter);
+        limiter.allow_join(peer.ip(), now) && limiter.site_unknown_has(peer.ip(), now)
+    } && locked(&state.global_unknown).has(now);
     if !allowed {
         state.rate_limited.fetch_add(1, Ordering::Relaxed);
         return refuse(&mut stream, ErrorCode::RateLimited);
@@ -643,6 +697,15 @@ fn join(
     let Some(nameplate) = code::parse_nameplate(nameplate) else {
         return refuse(&mut stream, ErrorCode::BadRequest);
     };
+    // The nameplate's own budget: what one address set can take of the global unknown budget for
+    // a single short code. Checked before the lookup like the other budgets, so a refusal says
+    // nothing about whether the code exists. It counts unknown short codes only, so a wrong secret
+    // for an existing code stays the host's limit (five, then it retires the code), not the
+    // relay's.
+    if !locked(&state.limiter).nameplate_unknown_has(&nameplate, now) {
+        state.rate_limited.fetch_add(1, Ordering::Relaxed);
+        return refuse(&mut stream, ErrorCode::RateLimited);
+    }
     let session = random_u64();
     let (atx, arx) = sync_channel(1);
     let lookup = {
@@ -679,7 +742,12 @@ fn join(
         Lookup::Found(tx, slot) => (tx, slot),
         Lookup::Unknown => {
             state.unknown.fetch_add(1, Ordering::Relaxed);
-            locked(&state.limiter).unknown(peer.ip(), now);
+            {
+                let mut limiter = locked(&state.limiter);
+                limiter.unknown(peer.ip(), now);
+                limiter.nameplate_unknown_take(&nameplate, now);
+                limiter.site_unknown_take(peer.ip(), now);
+            }
             locked(&state.global_unknown).try_take(now);
             return refuse(&mut stream, ErrorCode::UnknownCode);
         }
@@ -774,6 +842,7 @@ fn bridge(
         for s in [&guest, &host] {
             s.set_read_timeout(Some(state.config.idle))?;
             let _ = s.set_nodelay(true);
+            let _ = horizon_friends::set_tcp_keepalive(s);
         }
         let (g, h, st) = (guest.try_clone()?, host.try_clone()?, state.clone());
         let up = std::thread::Builder::new()
@@ -788,7 +857,7 @@ fn bridge(
 fn copy(state: &State, mut from: TcpStream, mut to: TcpStream) {
     let rate = state.config.session_rate;
     let mut bucket = Bucket::new(rate, (rate / 2.0).max(16384.0), Instant::now());
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = [0u8; 16 * 1024];
     loop {
         let n = match from.read(&mut buf) {
             Ok(0) | Err(_) => break,

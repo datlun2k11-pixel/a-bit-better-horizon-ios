@@ -113,6 +113,7 @@ impl Game<'_> {
                 invisible: false,
                 check_interval: 0,
                 custom_name: None,
+                random: horizon_client::random_source::entity(),
             });
         } else if kind == "minecraft:cushion" {
             // BlockAttachedEntity.pos: `BlockPos.containing` of the spawn.
@@ -204,12 +205,7 @@ impl Game<'_> {
                 let Some(f) = self.item_frames.iter_mut().find(|f| f.id == id) else {
                     continue;
                 };
-                match (index, value) {
-                    (0, Value::Byte(flags)) => f.invisible = (*flags as u8 & 0x20) != 0,
-                    (8, Value::Id(d)) => f.facing = (*d).clamp(0, 5) as u8,
-                    (10, Value::Int(r)) => f.rotation = r.rem_euclid(8) as u8,
-                    _ => {}
-                }
+                apply_frame_metadata(f, *index, value);
                 if let Some(item) = item {
                     f.item = item;
                 }
@@ -332,7 +328,7 @@ impl Game<'_> {
     pub(super) fn turn_remote_object(&mut self, id: i32, yaw: Option<f32>, on_ground: bool) {
         let id = id as u32;
         // The boat the player drives turns here (isLocalInstanceAuthoritative).
-        let driven = self.riding.filter(|&id| self.controls_boat(id));
+        let driven = self.riding.filter(|id| self.remote_controls_boat(*id));
         if let Some(b) = self.boats.iter_mut().find(|b| b.id == id) {
             if Some(id) == driven {
                 return;
@@ -390,7 +386,7 @@ impl Game<'_> {
             }
         }
         // The boat the player drives moves here, not where the server says.
-        let driven = self.riding.filter(|&id| self.controls_boat(id));
+        let driven = self.riding.filter(|id| self.remote_controls_boat(*id));
         for b in &mut self.boats {
             if Some(b.id) == driven {
                 continue;
@@ -415,7 +411,14 @@ impl Game<'_> {
         let at = |p: Vec3| [p.x, p.y, p.z];
         let mut out = Vec::new();
         for b in &self.boats {
-            out.push(json!({"id": b.id, "kind": b.entity_type(), "position": at(b.position), "yaw": b.yaw}));
+            let passengers = self.remote.as_ref().and_then(|r| r.passengers.get(&b.id));
+            let seat = self
+                .remote
+                .as_ref()
+                .and_then(|r| self.remote_passenger_seat(b.id, r.entity_id))
+                .map(|(index, _)| index);
+            out.push(json!({"id": b.id, "kind": b.entity_type(), "position": at(b.position), "yaw": b.yaw,
+                "passengers": passengers, "passenger_seat": seat, "controlling": self.remote_controls_boat(b.id)}));
         }
         for c in &self.carts {
             out.push(
@@ -468,10 +471,15 @@ impl Game<'_> {
         self.remote_knots.clear();
         self.carts.clear();
         self.boats.clear();
+        if let Some(r) = self.remote.as_mut() {
+            r.passengers.clear();
+            r.first_passenger = false;
+        }
         self.armor_stands.clear();
         self.cushions.clear();
         self.item_frames.clear();
         self.paintings.clear();
+        self.bolts.clear();
         self.orbs.clear();
     }
 
@@ -501,9 +509,52 @@ impl Game<'_> {
     }
 }
 
+/// ItemFrame inherits Entity's shared flags, including invisibility. Updates
+/// are partial: unrelated metadata must leave the last visibility unchanged.
+fn apply_frame_metadata(frame: &mut ItemFrame, index: u8, value: &Value) {
+    match (index, value) {
+        (0, Value::Byte(flags)) => frame.invisible = flags & 0x20 != 0,
+        (8, Value::Id(direction)) => frame.facing = (*direction).clamp(0, 5) as u8,
+        (10, Value::Int(rotation)) => frame.rotation = rotation.rem_euclid(8) as u8,
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_visibility_follows_partial_metadata_and_can_be_reset() {
+        for glow in [false, true] {
+            let mut frame = ItemFrame {
+                id: 7,
+                pos: [0, 64, 0],
+                facing: 3,
+                glow,
+                item: None,
+                rotation: 0,
+                drop_chance: 1.0,
+                fixed: false,
+                invisible: false,
+                check_interval: 0,
+                custom_name: None,
+                random: horizon_client::random_source::entity(),
+            };
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x20));
+            assert!(frame.invisible);
+            apply_frame_metadata(&mut frame, 8, &Value::Id(4));
+            apply_frame_metadata(&mut frame, 10, &Value::Int(3));
+            assert!(frame.invisible);
+            assert_eq!((frame.facing, frame.rotation), (4, 3));
+            // Other shared flags do not imply invisibility.
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x40));
+            assert!(!frame.invisible);
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0x20));
+            apply_frame_metadata(&mut frame, 0, &Value::Byte(0));
+            assert!(!frame.invisible);
+        }
+    }
 
     #[test]
     fn rot_lerp_takes_the_short_way_round() {

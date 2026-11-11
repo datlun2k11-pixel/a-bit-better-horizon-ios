@@ -92,7 +92,7 @@ struct Run<'p> {
     out: Preprocessed,
     code: Vec<String>,
     /// Files already read: a guarded header is included many times.
-    texts: HashMap<String, Option<String>>,
+    texts: HashMap<String, Result<Option<String>, String>>,
 }
 
 impl Run<'_> {
@@ -100,9 +100,11 @@ impl Run<'_> {
         let cached = self
             .texts
             .entry(path.to_owned())
-            .or_insert_with(|| self.pack.read_text(path));
-        let Some(text) = cached.clone() else {
-            return self.diagnose(from, &format!("can't find `{path}`"));
+            .or_insert_with(|| self.pack.read_text_checked(path).map_err(|e| e.to_string()));
+        let text = match cached.clone() {
+            Ok(Some(text)) => text,
+            Ok(None) => return self.diagnose(from, &format!("can't find `{path}`")),
+            Err(error) => return self.diagnose(from, &format!("{path}: {error}")),
         };
         let file = match self.out.files.iter().position(|f| f == path) {
             Some(i) => i,

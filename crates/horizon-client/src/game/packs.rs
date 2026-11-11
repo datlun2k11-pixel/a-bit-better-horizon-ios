@@ -14,9 +14,9 @@ use horizon_client::{
     text::{Style, Text},
 };
 use std::{
-    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 /// Where overlay roots are built (beside options.txt).
@@ -31,6 +31,7 @@ pub fn packs_dir() -> PathBuf {
         .join("resourcepacks")
 }
 mod folder;
+pub(super) mod transaction;
 
 /// `Util.getPlatform().openPath`: the system file manager on the folder.
 pub fn open_folder(dir: &Path) {
@@ -52,16 +53,35 @@ pub fn open_uri(uri: &str) {
 }
 /// The resource root to load from, given the vanilla root, the selection and
 /// a server's packs, which go on top (`Pack.Position.TOP`, fixed).
-pub fn startup_root(
+pub(super) fn startup_root_leased(
     vanilla: &Path,
+    base: &Path,
     selected: &[String],
     server: &[Pack],
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<(PathBuf, horizon_assets::root_lease::RootLease)> {
     let all = packs::discover(vanilla, &packs_dir());
     let mut enabled = packs::enabled(&all, selected);
     enabled.extend_from_slice(server);
-    packs::resource_root(vanilla, &enabled, &cache_dir())
+    packs::resource_root_leased(base, &enabled, &cache_dir())
 }
+/// Player/server packs sit above immutable mod content, retaining both roots
+/// and catalogue metadata until the last lazy reader of this generation exits.
+pub(super) fn overlay_content(
+    vanilla: &Path,
+    selected: &[String],
+    server: &[Pack],
+    content: Arc<super::mods::PreparedContent>,
+) -> horizon_client::Result<Arc<super::mods::PreparedContent>> {
+    let (root, lease) = startup_root_leased(vanilla, &content.root, selected, server)?;
+    Ok(Arc::new(super::mods::PreparedContent {
+        root,
+        catalog: content.catalog.clone(),
+        selection: content.selection.clone(),
+        lease: horizon_assets::root_lease::RootLease::combine([lease, content.lease.clone()]),
+        data_changed: content.data_changed,
+    }))
+}
+
 fn info(p: &Pack) -> PackInfo {
     let built_in = !p.id.starts_with("file/");
     PackInfo {
@@ -135,6 +155,29 @@ pub(super) fn pack_infos(vanilla: &Path, server: &[Pack]) -> Vec<PackInfo> {
     infos.push(vanilla_info(vanilla));
     infos
 }
+/// The folder packs' Polytone config entries (#11486), by pack id, for those that have some:
+/// what the Pack Options page edits.
+pub(super) fn pack_configs(vanilla: &Path) -> std::collections::BTreeMap<String, packs::Configs> {
+    packs::discover(vanilla, &packs_dir())
+        .into_iter()
+        .filter(|p| !p.polytone_configs.entries().is_empty())
+        .map(|p| (p.id, p.polytone_configs))
+        .collect()
+}
+/// The player changed Pack Options: `chosen` replaces their choices for `entries`, kept in
+/// `polytone-configs.json`.
+pub(super) fn save_pack_options(
+    entries: &[String],
+    chosen: std::collections::BTreeMap<String, packs::ConfigValue>,
+) {
+    let mut all = packs::polytone_choices();
+    all.retain(|id, _| !entries.contains(id));
+    all.extend(chosen);
+    if let Err(e) = packs::save_polytone_choices(&packs::polytone_choices_file(), &all) {
+        log::warn!("could not save the pack options: {e}");
+    }
+    packs::set_polytone_choices(all);
+}
 impl Game<'_> {
     pub(super) fn vanilla_root(&self) -> PathBuf {
         if self.ui.vanilla_root.as_os_str().is_empty() {
@@ -164,10 +207,12 @@ impl Game<'_> {
     /// (`PackSelectionScreen` makes its `PackSelectionModel` from them).
     pub(super) fn refresh_pack_lists(&mut self) {
         let infos = pack_infos(&self.vanilla_root(), &self.server_packs.active);
+        let configs = pack_configs(&self.vanilla_root());
         let browsing = self.settings.extras.pack_browser;
         let o = &mut self.ui.options;
         o.pack_browser = browsing;
         o.pack_infos = infos;
+        o.pack_configs = configs;
         o.pack_selection = self.settings.resource_packs.clone();
         o.pack_screen = None;
     }
@@ -211,6 +256,7 @@ impl Game<'_> {
             let selection = self.settings.resource_packs.clone();
             let infos = pack_infos(&self.vanilla_root(), &self.server_packs.active);
             self.ui.options.pack_infos = infos;
+            self.ui.options.pack_configs = pack_configs(&self.vanilla_root());
             self.ui.options.pack_selection = selection;
             self.ui.options.pack_screen = None;
         }
@@ -220,7 +266,10 @@ impl Game<'_> {
         // until those resources exist, then apply the latest selection once.
         // A reload already under its overlay finishes first (vanilla's
         // `pendingReload`, which `runTick` starts once the overlay is gone).
-        if reload_waits(self.rest_loader.is_some(), self.pack_reload.is_some()) {
+        if reload_waits(
+            self.pack_context_loading(),
+            self.pack_reload.is_some() || self.content_reload_busy(),
+        ) {
             self.pending_pack_reload = true;
             return;
         }
@@ -268,42 +317,98 @@ impl Game<'_> {
     /// progress meanwhile, and the overlay takes no input (`LoadingOverlay`),
     /// so what is held is released (`KeyMapping.releaseAll`).
     pub(super) fn spawn_pack_reload(&mut self, kind: ReloadKind) -> std::io::Result<()> {
-        self.keys.clear();
-        self.physical_keys.clear();
-        self.left = false;
-        self.right = false;
+        let selection = self.requested_mod_selection();
+        self.spawn_pack_reload_using(kind, selection)
+    }
+    fn spawn_pack_reload_using(
+        &mut self,
+        kind: ReloadKind,
+        selection: (
+            super::mods::catalog::Selection,
+            Arc<super::mods::catalog::Catalog>,
+        ),
+    ) -> std::io::Result<()> {
+        self.begin_reload_input_block();
         let vanilla = self.vanilla_root();
         if self.ui.vanilla_root.as_os_str().is_empty() {
             self.ui.vanilla_root = vanilla.clone();
         }
-        let (selected, server, mods, dev_mods) = (
+        let (selected, server) = (
             self.settings.resource_packs.clone(),
             self.server_packs.active.clone(),
-            self.applied_mods(),
-            self.options.dev_mods.clone(),
         );
+        let (mods, catalog) = selection;
+        let previous = self.pack.content.clone();
+        let rollback_root = self.options.resources.clone();
+        let needs_rollback = (self.integrated.is_some()
+            || (self.remote.is_none() && !self.world_root.as_os_str().is_empty()))
+            && previous
+                .as_ref()
+                .is_some_and(|content| content.selection != mods);
         let (assets, res, context) = (
             self.pack.assets.clone(),
             self.res.clone(),
             self.pack.context.clone(),
         );
         let (unicode, japanese) = (self.settings.force_unicode, self.settings.japanese_glyphs);
+        let import_home = horizon_client::import::home();
         self.pack_reload = Some(PackReload::spawn(kind, move |progress| {
-            stage_pack(
-                &vanilla, &selected, &server, &mods, &dev_mods, &assets, &res, &context, unicode,
+            let home_access = if import_home.is_dir() {
+                Some(
+                    horizon_client::import::acquire_home_access(&import_home)
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
+            let mut staged = stage_pack(
+                &vanilla, &selected, &server, &mods, catalog, &assets, &res, &context, unicode,
                 japanese, progress,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|error| error.to_string())?;
+            // The frame-thread application still reads metadata from this
+            // generation. Transfer ownership instead of acquiring there.
+            staged.home_access = home_access.clone();
+            if needs_rollback {
+                let mut rollback = stage_root(
+                    &vanilla,
+                    rollback_root,
+                    previous,
+                    &assets,
+                    &res,
+                    &context,
+                    unicode,
+                    japanese,
+                    progress,
+                )
+                .map_err(|error| error.to_string())?;
+                rollback.home_access = home_access;
+                staged.rollback = Some(Box::new(rollback));
+            }
+            Ok(staged)
         })?);
         Ok(())
     }
+    /// World entry now runs on the integrated server, whose preparation captures
+    /// the current pack context. A deferred entry still waiting for rest tables
+    /// has the same restriction; only swap once that handoff has completed.
+    fn pack_context_loading(&self) -> bool {
+        self.rest_loader.is_some()
+            || self.pending_entry.is_some()
+            || self.integrated_starting.is_some()
+    }
+
     /// `LoadingOverlay.tick` once the reload is done: the staged pack is
     /// applied on the render thread, and its outcome goes to whoever asked
     /// (`reloadResourcePacks`' callback, or `PackReloadConfig.Callbacks`).
     pub(super) fn drive_pack_reload(&mut self) {
+        self.poll_content_reload();
+        if self.content_reload_busy() {
+            return;
+        }
         // World preparation captures the current pack context. Do not swap
         // its atlas until that world has installed its streaming state.
-        if self.rest_loader.is_some() {
+        if self.pack_context_loading() {
             return;
         }
         let Some((kind, staged)) = self.pack_reload.as_mut().and_then(PackReload::finished) else {
@@ -315,11 +420,18 @@ impl Game<'_> {
         if kind == ReloadKind::Selection && self.pending_pack_reload {
             return;
         }
-        let result =
-            staged.and_then(|staged| self.apply_staged_pack(staged).map_err(|e| e.to_string()));
+        if let Ok(staged) = staged {
+            self.begin_content_reload(kind, staged);
+        } else {
+            self.finish_content_reload(kind, staged.map(|_| ()));
+        }
+    }
+    fn finish_content_reload(&mut self, kind: ReloadKind, result: Result<(), String>) {
+        if result.is_ok() {
+            self.mods_reloaded(true);
+        }
         match kind {
             ReloadKind::Selection => {
-                self.mods_reloaded(result.is_ok());
                 if let Err(e) = result {
                     self.selection_reload_failed(&e);
                 }
@@ -336,33 +448,29 @@ impl Game<'_> {
     /// the swap (`ReloadInstance`'s application listeners).
     pub(super) fn apply_staged_pack(&mut self, staged: StagedPack) -> horizon_client::Result<()> {
         let StagedPack {
+            rollback: _rollback,
+            home_access: _home_access,
             root,
             gui,
             pack,
             textures,
             cem,
+            equipment,
+            particle_definitions,
+            waypoint_styles,
+            villager_hats,
             block_entity_shapes,
             sounds,
             ui_metadata,
             language,
         } = staged;
+        // The packs' Polytone creative tab modifiers.
+        let tab_modifiers = horizon_client::polytone_creative_tabs::TabModifier::read_all(&root);
+        self.creative_screen.set_pack_modifiers(tab_modifiers);
         // Keep the working GPU resources, and hand its window surface over.
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
         }
-        // A phone's GPU memory is the app's own (unified), and Jetsam counts it: holding the
-        // old textures and world meshes while the new pack's upload doubled the footprint at
-        // a reload, and an HD pack with a world behind it ran the phone out (the device lost
-        // with "Out of memory" at the first texture upload). So the old renderer goes before
-        // the new one exists; the device this builds is Metal's, which takes a new one on the
-        // same window, where a replaced Vulkan device could cost the swapchain.
-        let previous = if cfg!(target_os = "ios") {
-            drop(self.renderer.take());
-            horizon_threads::release_free_memory();
-            None
-        } else {
-            self.renderer.as_ref()
-        };
         let renderer = match self
             .window
             .clone()
@@ -372,12 +480,16 @@ impl Game<'_> {
                     self.options.offscreen,
                     &pack,
                     &gui,
-                    previous,
+                    self.renderer.as_ref(),
                     Some(textures),
                     self.settings.horizon.api,
                     self.settings.horizon.translucent_batching,
-                    self.settings.horizon.wide_frame(),
+                    &self.settings.horizon,
                     super::shader_packs::picked_pack_shape(&self.settings),
+                    self.renderer
+                        .as_ref()
+                        .map(|r| r.display_reading())
+                        .unwrap_or_default(),
                     (
                         self.settings.file.int("textureFiltering"),
                         self.settings.file.int("maxAnisotropyBit"),
@@ -388,16 +500,6 @@ impl Game<'_> {
         {
             Ok(renderer) => renderer,
             Err(error) => {
-                // The phone gave its old renderer up before this build: give it one on the
-                // packs the screen was drawing, so the failure is still reported on a screen.
-                if cfg!(target_os = "ios") && self.renderer.is_none() {
-                    if let Some(window) = self.window.clone() {
-                        if let Ok(restored) = self.new_renderer(window) {
-                            self.renderer = Some(restored);
-                            self.apply_ui_settings();
-                        }
-                    }
-                }
                 if let Some(renderer) = &mut self.renderer {
                     renderer.recreate_surface().map_err(|restore| {
                         format!(
@@ -409,11 +511,12 @@ impl Game<'_> {
             }
         };
         // Everything loaded: switch over.
-        self.waypoint_styles = horizon_client::locator_bar::WaypointStyles::load(&root);
-        self.armor_stand_assets.reload_trims(&root);
+        self.waypoint_styles = waypoint_styles;
+        self.armor_stand_assets.apply_resources(equipment);
         self.random_tick_sections.clear();
         self.portals.sections.clear();
         self.options.resources = root.clone();
+        self.falling_vertices.get_mut().clear();
         self.pack = pack;
         self.gui = gui;
         // The new atlas's skin and map slots are blank: players and maps
@@ -428,8 +531,11 @@ impl Game<'_> {
         self.kept_block_entities.get_mut().clear();
         // The atlas's sprites moved: the particle engine re-reads every rect
         // and the packs' sprite sets, or every particle draws a stale region.
-        self.particles
-            .reload(&root, &self.gui.atlas.sprites, &self.gui.atlas.translucent);
+        self.particles.reload_prepared(
+            &particle_definitions,
+            &self.gui.atlas.sprites,
+            &self.gui.atlas.translucent,
+        );
         horizon_client::ui_theme::reset_atlas();
         // Villager hats come from the pack's texture metadata (shared data, swapped in place).
         *self
@@ -437,8 +543,7 @@ impl Game<'_> {
             .mob_data()
             .villager_hats
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            horizon_client::mobs::villager_hats::VillagerHats::load(&root);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = villager_hats;
         *self
             .res
             .mob_data()
@@ -480,7 +585,11 @@ impl Game<'_> {
             lang::Language::load(&[&root], &code)
         });
         self.refresh_remote_language();
+        self.invalidate_pvp_hud();
         self.audio.reload_with(&root, sounds);
+        if let Some(content) = &self.pack.content {
+            self.audio.retain_root_lease(content.lease.clone());
+        }
         self.clear_lod();
         // A pack that may replace leaf models falls back to `Off` before the
         // reload marks every section dirty.
@@ -520,8 +629,8 @@ pub(super) fn stage_pack(
     vanilla_root: &Path,
     selected: &[String],
     server: &[Pack],
-    mods_enabled: &BTreeSet<String>,
-    dev_mods: &[PathBuf],
+    mods: &super::mods::catalog::Selection,
+    catalog: Arc<super::mods::catalog::Catalog>,
     assets: &Arc<Assets>,
     res: &Resources,
     context: &WorkerContext,
@@ -529,8 +638,33 @@ pub(super) fn stage_pack(
     japanese: bool,
     progress: &super::Progress,
 ) -> horizon_client::Result<StagedPack> {
-    let root = startup_root(vanilla_root, selected, server)?;
-    let root = super::mods::content_root(&root, mods_enabled, dev_mods);
+    let content = super::mods::rebuild_content(vanilla_root, mods, catalog)?;
+    let content = overlay_content(vanilla_root, selected, server, content)?;
+    let root = content.root.clone();
+    stage_root(
+        vanilla_root,
+        root,
+        Some(content),
+        assets,
+        res,
+        context,
+        force_unicode,
+        japanese,
+        progress,
+    )
+}
+
+fn stage_root(
+    vanilla_root: &Path,
+    root: PathBuf,
+    content: Option<Arc<super::mods::PreparedContent>>,
+    assets: &Arc<Assets>,
+    res: &Resources,
+    context: &WorkerContext,
+    force_unicode: bool,
+    japanese: bool,
+    progress: &super::Progress,
+) -> horizon_client::Result<StagedPack> {
     progress.set(1);
     // The world's models and sprites and the GUI atlas read the same root and nothing of
     // each other: about a second each, side by side.
@@ -568,7 +702,7 @@ pub(super) fn stage_pack(
         panorama: Arc::new(panorama.unwrap_or_else(|p| std::panic::resume_unwind(p))),
     };
     progress.set(2);
-    let pack = PackResources::load(
+    let mut pack = PackResources::load(
         &root,
         assets.clone(),
         render,
@@ -576,19 +710,32 @@ pub(super) fn stage_pack(
         context.biomes.clone(),
         context.light.clone(),
     )?;
+    pack.content = content;
     let textures = prepare_renderer_textures(&pack);
     let cem = Arc::new(horizon_client::mobs::cem::CemModels::load(
         &root,
         res.mob_types(),
     ));
     let block_entity_shapes = res.block_entity_render().shapes_for(&root);
+    // Equipment and trim JSON must describe the same staged resource generation
+    // as the atlas, and must not be reopened during render-thread application.
+    let equipment = super::armor_stands::ArmorStandAssets::load(&root, None);
+    let particle_definitions = horizon_client::particles::PreparedParticles::load(&root);
+    let waypoint_styles = horizon_client::locator_bar::WaypointStyles::load(&root);
+    let villager_hats = horizon_client::mobs::villager_hats::VillagerHats::load(&root);
     progress.set(3);
     Ok(StagedPack {
+        rollback: None,
+        home_access: None,
         root,
         gui,
         pack,
         textures,
         cem,
+        equipment,
+        particle_definitions,
+        waypoint_styles,
+        villager_hats,
         block_entity_shapes,
         sounds,
         ui_metadata,
@@ -599,12 +746,21 @@ pub(super) fn stage_pack(
 /// Everything a pack reload builds on the CPU (`apply_staged_pack` finishes
 /// it on the render thread).
 pub(super) struct StagedPack {
+    rollback: Option<Box<StagedPack>>,
+    /// Acquired on the CPU worker, released after application or discard.
+    home_access: Option<horizon_client::import::HomeAccess>,
     pub root: PathBuf,
     pub gui: UiResources,
     pub pack: PackResources,
     pub textures: PreparedTextures,
     /// The packs' custom entity models (OptiFine CEM).
     pub cem: Arc<horizon_client::mobs::cem::CemModels>,
+    /// Parsed on the CPU worker; application retains the Game's prepared models.
+    pub equipment: super::armor_stands::ArmorStandAssets,
+    /// CPU-prepared descriptors; application only binds the new atlas and state.
+    pub particle_definitions: horizon_client::particles::PreparedParticles,
+    pub waypoint_styles: horizon_client::locator_bar::WaypointStyles,
+    pub villager_hats: horizon_client::mobs::villager_hats::VillagerHats,
     /// The block entities' models, the packs' custom entity models over vanilla's.
     pub block_entity_shapes: Arc<horizon_client::block_entity_render::BlockEntityShapes>,
     /// The root's sound events, GUI sprite metadata and current language.
@@ -641,11 +797,29 @@ pub(super) struct PackReload {
     pub(super) progress: super::Progress,
     kind: ReloadKind,
     handle: Option<std::thread::JoinHandle<StageResult>>,
+    /// When the overlay went up. `LoadingOverlay.fadeInStart`, set on the
+    /// first frame it draws.
+    started: Instant,
+    /// How long the overlay stays up before the reload may be applied.
+    hold: Duration,
 }
+/// `LoadingOverlay.isReadyToFadeOut`: a reload started from inside the game
+/// (`fadeIn`) is not ready while `Util.getMillis() - fadeInStart < 1000L`, so
+/// a pack that stages in a few frames still shows its overlay for a second
+/// instead of flashing.
+pub(super) const OVERLAY_HOLD: Duration = Duration::from_millis(1000);
 impl PackReload {
     /// Starts `stage` on its own thread and returns at once.
     fn spawn(
         kind: ReloadKind,
+        stage: impl FnOnce(&super::Progress) -> StageResult + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::spawn_holding(kind, OVERLAY_HOLD, stage)
+    }
+    /// `spawn` with the overlay's hold spelled out, so a test need not wait it.
+    fn spawn_holding(
+        kind: ReloadKind,
+        hold: Duration,
         stage: impl FnOnce(&super::Progress) -> StageResult + Send + 'static,
     ) -> std::io::Result<Self> {
         let progress = super::Progress::with(&RELOAD_LINES);
@@ -657,6 +831,8 @@ impl PackReload {
             progress,
             kind,
             handle: Some(handle),
+            started: Instant::now(),
+            hold,
         })
     }
     /// Drain a completed worker during native engine shutdown, without applying it.
@@ -676,9 +852,10 @@ impl PackReload {
     pub(super) fn kind(&self) -> ReloadKind {
         self.kind
     }
-    /// The staged pack once the worker is done (taken once); none while it runs.
+    /// The staged pack once the worker is done and the overlay has had its
+    /// second (taken once); none while either is outstanding.
     fn finished(&mut self) -> Option<(ReloadKind, StageResult)> {
-        if !self.handle.as_ref()?.is_finished() {
+        if self.started.elapsed() < self.hold || !self.handle.as_ref()?.is_finished() {
             return None;
         }
         let staged = self
@@ -740,6 +917,36 @@ mod tests {
             staged.err().as_deref(),
             Some("the pack reload worker panicked")
         );
+    }
+
+    /// `LoadingOverlay.isReadyToFadeOut`: a reload that stages at once still
+    /// keeps its overlay up - the 1000 ms `fadeInStart` gate - so a small pack
+    /// does not flash the Mojang logo for a frame or two.
+    #[test]
+    fn a_fast_reload_keeps_the_overlay_up_before_it_applies() {
+        assert_eq!(OVERLAY_HOLD, Duration::from_millis(1000));
+        let mut quick = PackReload::spawn_holding(ReloadKind::Selection, Duration::ZERO, |_| {
+            Err("staged".into())
+        })
+        .unwrap();
+        assert_eq!(wait(&mut quick).0, ReloadKind::Selection);
+        // A hold no test machine outlasts, however loaded: the worker is done long
+        // before the overlay has had its time.
+        let hold = Duration::from_secs(3600);
+        let mut held =
+            PackReload::spawn_holding(ReloadKind::Selection, hold, |_| Err("staged".into()))
+                .unwrap();
+        for _ in 0..500 {
+            if held.handle.as_ref().is_some_and(|h| h.is_finished()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(held.handle.as_ref().is_some_and(|h| h.is_finished()));
+        assert!(held.finished().is_none(), "the overlay is still up");
+        // Once the hold has passed, the staged pack is handed over.
+        held.hold = Duration::ZERO;
+        assert_eq!(wait(&mut held).0, ReloadKind::Selection);
     }
 
     #[test]

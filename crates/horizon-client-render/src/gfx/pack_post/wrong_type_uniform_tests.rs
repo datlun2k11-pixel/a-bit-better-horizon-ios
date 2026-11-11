@@ -54,3 +54,38 @@ fn built_ins_declared_with_another_type_read_zero() {
         assert_eq!(p, [0, 32, 11, 255]);
     }
 }
+
+#[test]
+fn boolean_built_ins_reject_vector_matrix_shapes_and_keep_nonzero_scalars() {
+    let Some(gpu) = Fixture::new() else { return };
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, source) in [
+        ("final.vsh", VERTEX),
+        (
+            "final.fsh",
+            "#version 130\nuniform bool cameraPosition;\nuniform bool gbufferModelView;\nuniform bool near;\nvoid main(){gl_FragColor=vec4(float(cameraPosition),float(gbufferModelView),float(near),1.0);}",
+        ),
+    ] {
+        zip.start_file(
+            format!("shaders/{name}"),
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(source.as_bytes()).unwrap();
+    }
+    let pack = horizon_shaders::Pack::from_zip_bytes(
+        "original-boolean-uniform-shapes",
+        zip.finish().unwrap().into_inner(),
+    )
+    .unwrap();
+    let mut macros = horizon_shaders::Macros::standard();
+    let (properties, _) = horizon_shaders::read_properties(&pack, &mut macros);
+    let parsed = horizon_shaders::load_post(&pack, "", &properties, &macros, &Default::default());
+    assert!(parsed.complete, "{:?}", parsed.notes);
+    let mut post = gpu.build(parsed);
+    // The native GL reference rejects vec3/mat4 -> bool, keeping their initial
+    // false value. The positive fractional near plane is scalar and converts true.
+    for pixel in gpu.render(&mut post, [8, 8]) {
+        assert_eq!(pixel, [0, 0, 255, 255]);
+    }
+}

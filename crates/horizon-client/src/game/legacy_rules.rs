@@ -1,11 +1,12 @@
 //! Legacy combat rules on the worlds this game serves (`horizon_client::legacy_combat`): the
-//! server side of `Player.attack` with 1.8.9's damage, critical hits, no attack cooldown and
-//! no sweep. Off by default; a window that plays on a server (`remote`) never uses them.
+//! server side of `Player.attack` with legacy-inspired damage, critical hits, no attack cooldown
+//! and no sweep. This opt-in hybrid retains modern items, Riptide and mace behavior. Off by
+//! default; a window that plays on a server (`remote`) never uses these hosted-world rules.
 use super::Game;
 use horizon_client::legacy_combat;
 
 impl Game<'_> {
-    /// Whether the hits this game resolves follow 1.8.9: legacy rules are on and this game
+    /// Whether this game resolves hits using the opt-in legacy-inspired rules: this game
     /// is the server (its own server thread, a LAN host, a dedicated server).
     pub(super) fn legacy_rules(&self) -> bool {
         self.remote.is_none() && self.settings.extras.pvp.combat.rules
@@ -77,5 +78,88 @@ impl Game<'_> {
             blind: self.potions.effects.get("blindness").is_some(),
             riding: self.riding.is_some(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        Audio, Game, Options, Progress, Settings, execution_role::ExecutionRole, load_resources,
+    };
+    use horizon_client::{items::ItemStack, motion::PlayerMotion};
+    use horizon_core::geometry::Vec3;
+    use horizon_protocol::connection::Pipe;
+
+    fn equip_axe(game: &mut Game<'_>) {
+        let mut player = PlayerMotion::new(&game.motion, Vec3::ZERO).unwrap();
+        player.ground.on_ground = true;
+        game.player = Some(player);
+        game.selected = 0;
+        game.inventory[0] = Some(ItemStack::new("minecraft:diamond_axe", 1));
+        // Exercise production equipment attribute installation and hand state,
+        // rather than setting a damage scalar to the expected answer.
+        game.tick_hand();
+        game.apply_equipment();
+        game.attack_ticks = 100;
+    }
+
+    /// The saved host preference must never select legacy damage on either
+    /// of two successive remote sessions. A native full-charge diamond axe
+    /// deals 9; the explicit hosted 1.8 rules deal 7.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn host_legacy_rules_do_not_follow_the_player_into_remote_sessions() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES")
+                .expect("set HORIZON_TEST_RESOURCES to prepared resources"),
+        );
+        let mut settings = Settings::default();
+        settings.extras.pvp.combat.rules = true;
+        settings.extras.pvp.combat.legacy = true;
+        settings.extras.pvp.combat.sounds = true;
+        let loaded = load_resources(
+            root.clone(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            true,
+            &Progress::new(),
+            &mut |_, _| unreachable!("no menu handoff"),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = ExecutionRole::Client;
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&root),
+            None,
+        )
+        .unwrap();
+        equip_axe(&mut game);
+        assert_eq!(game.melee_damage("minecraft:player", true).0, 7.0);
+
+        for name in ["LegacyTransitionA", "LegacyTransitionB"] {
+            let (client, server) = Pipe::pair();
+            game.connect_local(client, name).unwrap();
+            equip_axe(&mut game);
+            assert!(game.settings.extras.pvp.combat.rules);
+            assert_eq!(game.melee_damage("minecraft:player", true).0, 9.0);
+            // A fresh attack remains cooldown-scaled despite the saved rule.
+            game.attack_ticks = 0;
+            let uncharged = game.melee_damage("minecraft:player", true).0;
+            assert!(uncharged > 0.0 && uncharged < 9.0, "{uncharged}");
+            game.leave_server(None).unwrap();
+            server.shutdown();
+        }
+        assert!(game.settings.extras.pvp.combat.rules);
+        equip_axe(&mut game);
+        assert_eq!(game.melee_damage("minecraft:player", true).0, 7.0);
     }
 }

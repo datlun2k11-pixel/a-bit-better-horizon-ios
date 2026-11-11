@@ -1,8 +1,10 @@
 # How Horizon is built
 
+> Mobile installation, signing and support are documented in the [iOS/iPadOS README](../README.md). The desktop launcher, release-signature and infrastructure details below are shared upstream background; report mobile problems in [the mobile fork](https://github.com/heyskylo/horizon-ios/issues).
+
 Who writes Horizon, how changes are checked, and why it is safe to run. You can check every claim on this page in the repository, and anything not done yet is marked as not done.
 
-This page is also on the website: [playhorizon.dev/docs/how-horizon-is-built](https://playhorizon.dev/docs/how-horizon-is-built). The longer version, with what is still missing, is [Security](security.md).
+Upstream background is available on the engine’s website: [playhorizon.dev/docs/how-horizon-is-built](https://playhorizon.dev/docs/how-horizon-is-built). The longer version, with what is still missing, is [Security](security.md).
 
 ## Who builds it
 
@@ -21,8 +23,8 @@ Not every line is read by a person. Instead, every change is checked against the
 
 ## Why it's safe to run
 
-- **Open source.** All of the code is public on [GitHub](https://github.com/horizon-rust/horizon), under the MIT licence.
-- **Built from the public code.** Releases are built by GitHub Actions, the build service of GitHub, from the public source. Linux and Windows are built on GitHub's machines, and macOS on Ludovic's Mac mini, which runs GitHub Actions jobs. Every build log is [public](https://github.com/horizon-rust/horizon/actions/workflows/release.yml).
+- **Open source.** All of the code is public on [GitHub](https://github.com/heyskylo/horizon-ios), under the MIT licence.
+- **Built from the public code.** Releases are built by GitHub Actions, the build service of GitHub, from the public source. This fork’s iOS/iPadOS builds use its iOS workflow; upstream desktop builds have their own infrastructure. Every build log is [public](https://github.com/heyskylo/horizon-ios/actions/workflows/ios.yml).
 - **Signed checksums.** Every release has a `SHA256SUMS` file, a fingerprint of each download, and `SHA256SUMS.sig`, a signature of that list made with Horizon's release key, which only release builds from main can use. The launcher and `horizon-server update` check both before they install anything, and refuse a file that does not match. The very first server install with `install.sh` checks the fingerprint but not the signature.
 - **Not yet signed by Apple or Microsoft.** The macOS app is not notarized by Apple, because it is not signed with a paid Apple developer account, so macOS asks you to confirm the first time ([Install](https://playhorizon.dev/docs/install#download-the-launcher) shows how). The Windows programs are not code-signed either, so Windows may warn you too.
 - **Mods are off by default, and reviewed.** A content mod is data and runs no code. A native mod is Rust code with your rights, not sandboxed: the launcher builds it only after a warning and your OK, in a game of its own, and the registry lists one only after a maintainer has read its source. See [Mods](mods.md) and [Native mods](native-mods.md).
@@ -30,12 +32,12 @@ Not every line is read by a person. Instead, every change is checked against the
 
 ## What it doesn't contain
 
-- **No Minecraft files.** Horizon contains no Minecraft code, assets or data, and never downloads them. The launcher builds the game files on your computer from your own copy of Minecraft: Java Edition 26.3. A check that runs on every pull request (`tools/check_public_tree.py`) keeps game files and decompiled code out of the repository and its history.
-- **Other projects' code only when their license allows it.** Since 24 October 2026, Horizon's code is written from Minecraft 26.3 itself and public documentation. Since 30 October 2026 it may also use another project's source, but only under one of the licenses listed there (MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, ISC, zlib, 0BSD, MIT-0, Unlicense, the CC0-1.0 public-domain dedication), credited in the pull request and in THIRD_PARTY_NOTICES.md; GPL, LGPL, MPL, unlicensed and closed projects stay off limits, even to read ([the rule](../CONTRIBUTING.md#only-original-code-or-code-whose-license-allows-it)). On 24 October shader packs were removed ([#1561](https://github.com/horizon-rust/horizon/pull/1561)), after a developer of Iris showed that our shader pack code had been written from Iris's source. They are being written again from a description of the pack format only.
+- **No Minecraft files.** Horizon contains no Minecraft code or assets. The launcher builds the game files on your computer from your own copy of Minecraft: Java Edition 26.3: an install you already have, or the game downloaded from Mojang's servers for your signed-in account, which must own it. The tables that convert the block and item ids of pre-1.13 worlds are made the same way: `horizon-prepare` reads them from your jar. A check that runs on every pull request (`tools/check_public_tree.py`) keeps game files and decompiled code out of the repository and its history.
+- **Other projects' code only when their license allows it.** Since 24 October 2026, Horizon's code is written from Minecraft 26.3 itself and public documentation. Since 30 October 2026 it may also use another project's source, but only under one of the licenses listed there (MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, ISC, zlib, 0BSD, MIT-0, Unlicense, the CC0-1.0 public-domain dedication), credited in the pull request and in THIRD_PARTY_NOTICES.md; GPL, LGPL, MPL, unlicensed and closed projects stay off limits, even to read ([the rule](../CONTRIBUTING.md#only-original-code-or-code-whose-license-allows-it)). On 24 October shader packs were removed ([#1561](https://github.com/horizon-rust/horizon/pull/1561)), after a developer of Iris showed that our shader pack code had been written from Iris's source. They came back in `crates/horizon-shaders`, first written from a description of the pack format. In November, code translated from OpenJDK (GPL) was found in `horizon-core`'s math functions and in `horizon-world`'s copy of Java's `HashMap` ([#6741](https://github.com/horizon-rust/horizon/issues/6741)). Both were written again without OpenJDK's sources: the math from Sun's fdlibm C sources, the `HashMap` from a description of its behaviour. [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md#code-removed-for-its-license) lists all three, for anyone holding an older version.
 
 ## Check it yourself
 
-- **Read the code and its checks.** [The source](https://github.com/horizon-rust/horizon), [the checks on every pull request](https://github.com/horizon-rust/horizon/actions/workflows/ci.yml) and [the release builds](https://github.com/horizon-rust/horizon/actions/workflows/release.yml).
+- **Read the code and its checks.** [The source](https://github.com/heyskylo/horizon-ios), [the mobile build checks](https://github.com/heyskylo/horizon-ios/actions/workflows/ios.yml) and [the iOS build workflow](https://github.com/heyskylo/horizon-ios/actions/workflows/ios.yml).
 - **Compare the fingerprints.** Put a release's files and its `SHA256SUMS` in one folder and run `sha256sum -c SHA256SUMS --ignore-missing` (on macOS `shasum -a 256 -c SHA256SUMS --ignore-missing`, on Windows `Get-FileHash <file>` in PowerShell). Each file should say `OK`.
 - **Check the signature.** Download a whole release into a folder, then from a clone of the repository run `cargo run -p horizon-release-sign -- verify --tag <tag> <folder>`. The public key is in `crates/horizon-release-sign/release-keys.txt`.
 - **Build it yourself.** The README explains how to [build from source](../README.md#build-from-source).

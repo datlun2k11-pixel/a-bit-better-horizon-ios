@@ -95,8 +95,8 @@ impl Game<'_> {
             player: &mut body,
             scene: &mut self.world,
             assets: &self.pack.assets,
-            collision_binding: self.collision,
-            resources: self.motion,
+            collision_binding: &self.collision,
+            resources: &self.motion,
             health: &self.health_resources,
         }
         .replayed_tick(keys, sprints(&input))
@@ -161,7 +161,7 @@ impl Game<'_> {
         }
         let mut scene = SceneCollisions {
             world: &self.world,
-            binding: self.collision,
+            binding: &self.collision,
             subject: None,
         };
         let Ok(scan) = BlockCollisionScan::new(

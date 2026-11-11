@@ -1,6 +1,31 @@
 //! Startup shared by the gameplay library and its executable.
 use crate::{crash, game, logging};
 
+/// Start the game where a phone lets it write.
+///
+/// iOS hands an app a working directory of `/`, which is read-only, while the game builds its world saves,
+/// its `options.txt`, its `.horizon-cache` and its `resourcepacks/` from `current_dir()` -- so every one of
+/// those is a path it cannot create. The writable place is the app's data container, and `$HOME` names it,
+/// so the fix is one call made before anything reads a path: work in `Documents`. The launcher runs the game
+/// inside its game home instead; a phone has no launcher, and `Documents` is the folder the Files app shows,
+/// which is where a player drops a resource pack or a world.
+///
+/// Prepared resources are looked for by `Options::read`, which checks a `resources/` beside the
+/// executable first and then the `resources/` that `horizon_client::import` unpacks into this very
+/// folder -- so both the assets shipped in the bundle and the ones carried in by a player are found
+/// with no argument to pass.
+#[cfg(target_os = "ios")]
+fn into_app_sandbox() -> Result<std::path::PathBuf, String> {
+    let documents = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| std::path::PathBuf::from(home).join("Documents"))
+        .ok_or("iOS gave this app no HOME")?;
+    let describe = |error: std::io::Error| format!("{}: {error}", documents.display());
+    std::fs::create_dir_all(&documents).map_err(describe)?;
+    std::env::set_current_dir(&documents).map_err(describe)?;
+    Ok(documents)
+}
+
 /// Start the game. The executable supplies the allocator and retains the mod API marker.
 pub fn main() {
     main_with(Default::default());
@@ -8,37 +33,45 @@ pub fn main() {
 
 /// Start the game with trait mods in dispatch order.
 pub fn main_with(mods: crate::mod_api::Mods) {
-    boot_stage("entry");
     // First: a trait injection into anything below (logging, the crash handler) calls its mod.
     if crate::mod_api::MODS.set(mods).is_err() {
         log::warn!("Trait mods already installed; ignoring the second list");
     }
-    boot_stage("mods installed");
     horizon_threads::configure_allocator();
-    boot_stage("allocator");
     // Before the event loop: iOS asks for the AirPlay scene's delegate by name when a display connects.
     horizon_airplay::register();
-    boot_stage("airplay registered");
     horizon_airplay::audio::start();
-    boot_stage("airplay audio");
     #[cfg(target_os = "ios")]
     let documents = match into_app_sandbox() {
         Ok(documents) => documents,
         Err(error) => {
-            boot_stage(&format!("no sandbox: {error}"));
             eprintln!("Horizon: {error}");
             std::process::exit(1);
         }
     };
-    #[cfg(target_os = "ios")]
-    boot_stage(&format!("sandbox {}", documents.display()));
     // `android_main` already moved into the app's files folder.
     #[cfg(target_os = "android")]
     let documents = std::env::current_dir().unwrap_or_default();
+
+    crate::horizon_look::give();
+    // OptiFine's and Polytone's pack formats (platform, docs/layers.md), before any pack loads.
+    horizon_client::pack_formats::install();
+    // horizon-extras (docs/forking.md): without the feature, no Horizon Settings or Mods page.
+    if !cfg!(feature = "horizon-extras") {
+        horizon_client::options_ui::HORIZON_EXTRAS
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     horizon_client::telemetry::mark_start();
+    // Opt-in telemetry keeps each crash report (docs/telemetry.md), whatever the mode.
+    crash::on_report(horizon_client::telemetry::keep_crash);
+    // Crates above the engine registered their hooks before this (horizon-official's `main`),
+    // then the Horizon parts still in this crate; none registers after this point.
+    game::player_hooks::register();
+    horizon_hooks::engine::seal();
+    // The text crates ship (`horizon_hooks::lang`), loaded with the game's own languages.
+    horizon_client::lang::install_crate_files(horizon_hooks::lang::engine::all());
     horizon_client::spans::startup::init(std::time::Instant::now());
     horizon_client::spans::trace::start_from_env();
-    boot_stage("telemetry");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let game_args = args.iter().take_while(|a| *a != "--dedicated");
     let help = game_args
@@ -48,10 +81,6 @@ pub fn main_with(mods: crate::mod_api::Mods) {
     if let Some(dir) = game_args.clone().skip_while(|a| *a != "--home").nth(1) {
         logging::set_game_home(std::path::absolute(dir).unwrap_or_else(|_| dir.into()));
     }
-    // A phone has no cable to download the app container with: its log and crash reports sit in
-    // Documents beside the saves, where the Files app can hand them to a bug report.
-    #[cfg(target_os = "ios")]
-    logging::set_game_home(documents.clone());
     // The dedicated server logs in its own folder (--game-dir's), as vanilla's does; the game in its home.
     let (home, side, thread) = if args.iter().any(|a| a == "--dedicated") {
         let folder = game_args
@@ -75,7 +104,6 @@ pub fn main_with(mods: crate::mod_api::Mods) {
     };
     // Before the log opens, so a mod's injection hears its first lines.
     logging::set_line_hook(crate::native_client_hooks::native_log_line);
-    boot_stage(&format!("home {}", home.display()));
     if !help {
         logging::init(
             logging::player_dir_override().unwrap_or(home.as_path()),
@@ -83,25 +111,26 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         );
         // The log's first line names the build, so a bug report that carries the log says which one it was.
         log::info!("Horizon {}", crash::version());
-        // winit's side of the keyboard (what asked for it, what was typed) has no log of its own
-        // on a phone: it goes to the console, which a bug report's zip does not carry. This puts it
-        // in `latest.log` beside the game's own lines.
-        #[cfg(target_os = "ios")]
-        winit::platform::ios::set_log_hook(Some(|line| {
-            log::info!(target: "horizon_winit", "{line}")
-        }));
-        boot_stage("log open");
         crash::install(home.clone(), side);
-        boot_stage("crash handler");
-        // What a phone does with its files before the game looks for them, once the log can say so.
-        // On a worker: unpacking an archive takes long enough that the iOS watchdog would kill a
-        // launch that did it here, before the window even exists. The launcher shows its progress,
-        // and the resource loader waits for it.
-        #[cfg(any(target_os = "ios", target_os = "android"))]
-        {
-            crate::import::boot(&documents);
-            boot_stage("import started");
+        // The Microsoft account a last start kept (the title screen's face button), signed in again.
+        #[cfg(not(target_os = "ios"))]
+        if side == "client" {
+            horizon_client::msa::restore(&home);
         }
+    }
+    // What a phone does with its files before the game looks for them, once the log can say so.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    if !help {
+        // A swap that a flat battery or a crash left half done is finished, or the old tree put back,
+        // before anything reads the folder it was working on.
+        match horizon_client::import::recover(&documents) {
+            Ok(Some(path)) => log::info!("Horizon: finished the import at {}", path.display()),
+            Ok(None) => {}
+            Err(error) => log::error!("Horizon: could not finish the last import: {error}"),
+        }
+        // The cable's door: an archive dragged into `Documents` is installed here, so the launch it was
+        // dragged for is the one that finds it. `scan` says what it took and what it left alone.
+        horizon_client::import::scan(&documents);
     }
     let renderers = crate::mod_api::mods()
         .iter()
@@ -196,6 +225,26 @@ pub fn main_with(mods: crate::mod_api::Mods) {
                 cancel,
             );
         },
+        player_chat_v2: |player, name, level, message, replies, cancel| {
+            crate::mod_api::dispatch_player_chat_v2(
+                crate::mod_api::mods(),
+                player,
+                name,
+                level,
+                message,
+                replies,
+                cancel,
+            );
+        },
+        chat_decorate: |player, name, message, decorated| {
+            crate::mod_api::dispatch_chat_decorate(
+                crate::mod_api::mods(),
+                player,
+                name,
+                message,
+                decorated,
+            );
+        },
         sound_play: |sound, volume, pitch, cancel| {
             crate::mod_api::dispatch_sound_play(
                 crate::mod_api::mods(),
@@ -241,6 +290,14 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         },
         living_jump: |entity, kind| {
             crate::mod_api::dispatch_living_jump(crate::mod_api::mods(), entity, kind);
+        },
+        living_death_message: |entity, kind, message| {
+            crate::mod_api::dispatch_living_death_message(
+                crate::mod_api::mods(),
+                entity,
+                kind,
+                message,
+            );
         },
         register_goals: |mob| {
             crate::mod_api::dispatch_register_goals(crate::mod_api::mods(), mob);
@@ -300,10 +357,7 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         log::warn!("Native sound hook already installed; keeping the first callback");
     }
     raise_open_file_limit();
-    boot_stage("hooks installed");
-    boot_stage("game loop");
     if let Err(error) = game::run_with() {
-        boot_stage(&format!("game loop failed: {error}"));
         // A bad command line is the caller's mistake, not a crash: no report.
         let usage = error.is::<game::UsageError>();
         log::error!("Horizon: {error}");
@@ -325,49 +379,8 @@ pub fn main_with(mods: crate::mod_api::Mods) {
             game::exit_code::ERROR
         });
     }
+    horizon_hooks::engine::shutdown();
     logging::flush();
-}
-
-/// Write one startup stage to `Documents/horizon-boot.log`, the first call truncating it.
-///
-/// A phone cannot be watched with a console and the game's own log may never open (a crash before
-/// `logging::init`, a lock a stale instance holds), so the stages are written straight to the folder
-/// the Files app shows, flushed one by one, to say where a launch stopped.
-fn boot_stage(step: &str) {
-    #[cfg(target_os = "ios")]
-    boot::stage(step);
-    #[cfg(not(target_os = "ios"))]
-    let _ = step;
-}
-
-#[cfg(target_os = "ios")]
-mod boot {
-    use std::io::Write;
-    use std::sync::{
-        OnceLock,
-        atomic::{AtomicBool, Ordering},
-    };
-
-    static OPENED: AtomicBool = AtomicBool::new(false);
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-
-    pub fn stage(step: &str) {
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let path = std::path::Path::new(&home).join("Documents/horizon-boot.log");
-        let first = !OPENED.swap(true, Ordering::Relaxed);
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).write(true).truncate(first);
-        // Later stages append, or every open would rewrite the file from its start.
-        options.append(!first);
-        let Ok(mut file) = options.open(&path) else {
-            return;
-        };
-        let start = START.get_or_init(std::time::Instant::now);
-        let _ = writeln!(file, "[{:8.3}] {step}", start.elapsed().as_secs_f64());
-        let _ = file.flush();
-    }
 }
 
 /// The JVM raises its open-file limit to the hard limit as it starts
@@ -405,29 +418,3 @@ fn raise_open_file_limit() {
         }
     }
 }
-
-/// Start the game where a phone lets it write.
-///
-/// iOS hands an app a working directory of `/`, which is read-only, while the game builds its world saves,
-/// its `options.txt`, its `.horizon-cache` and its `resourcepacks/` from `current_dir()` -- so every one of
-/// those is a path it cannot create. The writable place is the app's data container, and `$HOME` names it,
-/// so the fix is one call made before anything reads a path: work in `Documents`. The launcher runs the game
-/// inside its game home instead; a phone has no launcher, and `Documents` is the folder the Files app shows,
-/// which is where a player drops a resource pack or a world.
-///
-/// Prepared resources are looked for by `Options::read`, which checks a `resources/` beside the
-/// executable first and then the `resources/` that `horizon_client::import` unpacks into this very
-/// folder -- so both the assets shipped in the bundle and the ones carried in by a player are found
-/// with no argument to pass.
-#[cfg(target_os = "ios")]
-fn into_app_sandbox() -> Result<std::path::PathBuf, String> {
-    let documents = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| std::path::PathBuf::from(home).join("Documents"))
-        .ok_or("iOS gave this app no HOME")?;
-    let describe = |error: std::io::Error| format!("{}: {error}", documents.display());
-    std::fs::create_dir_all(&documents).map_err(describe)?;
-    std::env::set_current_dir(&documents).map_err(describe)?;
-    Ok(documents)
-}
-

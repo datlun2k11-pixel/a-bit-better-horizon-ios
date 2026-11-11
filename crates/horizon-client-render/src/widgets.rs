@@ -14,6 +14,8 @@ pub enum Cursor {
     Arrow,
     PointingHand,
     NotAllowed,
+    /// `CursorTypes.RESIZE_NS`: a scroller held vertically (`MerchantScreen`).
+    ResizeNs,
 }
 
 thread_local! {
@@ -45,7 +47,7 @@ pub fn take_cursor() -> Cursor {
 }
 
 /// A labelled widget in GUI pixels (the coordinates screens take input in).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Widget {
     pub label: String,
     pub x: f32,
@@ -99,12 +101,18 @@ thread_local! {
     static TARGETS: RefCell<(Vec<Target>, Vec<Target>, u64)> = const { RefCell::new((Vec::new(), Vec::new(), 0)) };
     /// The buttons drawn since the last `end_frame` that declared their job, and the last frame's.
     static ACTIONS: RefCell<(Vec<DeclaredAction>, Vec<DeclaredAction>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    static POINTER_BINDINGS: RefCell<(Vec<PointerBinding>, Vec<PointerBinding>)> = const { RefCell::new((Vec::new(), Vec::new())) };
     /// The pad drives, so declared buttons show their glyph (labels leave it room).
     static ACTION_GLYPHS: Cell<bool> = const { Cell::new(false) };
     /// The screen the buttons in `ACTIONS` were declared on, the same two frames.
     static ACTION_SCREENS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// The lists drawn with a scrollbar since `end_frame`, and the last frame's.
     static SCROLL_AREAS: RefCell<(Vec<ScrollArea>, Vec<ScrollArea>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The steps screens declared since `end_frame` ([`focus_link`]), and the last frame's.
+    static FOCUS_LINKS: RefCell<(Vec<FocusLink>, Vec<FocusLink>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The targets whose value left and right step ([`steps_value`]) since `end_frame`, and the
+    /// last frame's.
+    static STEPPERS: RefCell<(Vec<[f32; 4]>, Vec<[f32; 4]>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// Splitscreen: one player's buttons and focus targets, kept aside while another player's game
@@ -117,6 +125,9 @@ pub struct Saved(
     bool,
     (u64, u64),
     (Vec<ScrollArea>, Vec<ScrollArea>),
+    (Vec<PointerBinding>, Vec<PointerBinding>),
+    (Vec<FocusLink>, Vec<FocusLink>),
+    (Vec<[f32; 4]>, Vec<[f32; 4]>),
 );
 
 /// This thread's buttons and targets, leaving none.
@@ -128,6 +139,9 @@ pub fn take() -> Saved {
         ACTION_GLYPHS.take(),
         ACTION_SCREENS.take(),
         SCROLL_AREAS.take(),
+        POINTER_BINDINGS.take(),
+        FOCUS_LINKS.take(),
+        STEPPERS.take(),
     )
 }
 
@@ -136,9 +150,64 @@ pub fn put(saved: Saved) {
     WIDGETS.set(saved.0);
     TARGETS.set(saved.1);
     SCROLL_AREAS.set(saved.5);
+    FOCUS_LINKS.set(saved.7);
+    STEPPERS.set(saved.8);
     ACTIONS.set(saved.2);
     ACTION_GLYPHS.set(saved.3);
     ACTION_SCREENS.set(saved.4);
+    POINTER_BINDINGS.set(saved.6);
+}
+
+#[derive(Clone, Debug)]
+struct PointerBinding {
+    rect: [f32; 4],
+    key: String,
+}
+
+/// The drawn control and action identity where a tap began. Async list refreshes
+/// must not turn a delayed tap into an action on another item or another screen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PointerGuard {
+    screen: u64,
+    widget: Option<Widget>,
+    bindings: Vec<String>,
+}
+
+/// Associate an opaque, stable action identity with a rectangle while drawing.
+/// This metadata is neither shown nor narrated; use an item ID, not its row index.
+pub fn pointer_binding(rect: [f32; 4], key: impl Into<String>) {
+    if !rect.iter().all(|value| value.is_finite()) || rect[2] <= 0.0 || rect[3] <= 0.0 {
+        return;
+    }
+    POINTER_BINDINGS.with_borrow_mut(|(current, _)| {
+        if current.len() < 512 {
+            current.push(PointerBinding {
+                rect,
+                key: key.into(),
+            });
+        }
+    });
+}
+
+pub fn capture_pointer(at: (f32, f32)) -> PointerGuard {
+    let contains = |rect: [f32; 4]| {
+        at.0 >= rect[0] && at.1 >= rect[1] && at.0 < rect[0] + rect[2] && at.1 < rect[1] + rect[3]
+    };
+    PointerGuard {
+        screen: ACTION_SCREENS.get().1,
+        widget: WIDGETS.with_borrow(|(_, last, _)| {
+            last.iter()
+                .rev()
+                .find(|widget| contains([widget.x, widget.y, widget.w, widget.h]))
+                .cloned()
+        }),
+        bindings: POINTER_BINDINGS.with_borrow(|(_, last)| {
+            last.iter()
+                .filter(|binding| contains(binding.rect))
+                .map(|binding| binding.key.clone())
+                .collect()
+        }),
+    }
 }
 
 /// A button's job on its screen. A screen declares it ([`crate::ui::action_button`]) and the
@@ -282,6 +351,8 @@ pub fn cover_frame() {
     TARGETS.with_borrow_mut(|(current, _, _)| current.clear());
     ACTIONS.with_borrow_mut(|(current, _)| current.clear());
     SCROLL_AREAS.with_borrow_mut(|(current, _)| current.clear());
+    FOCUS_LINKS.with_borrow_mut(|(current, _)| current.clear());
+    STEPPERS.with_borrow_mut(|(current, _)| current.clear());
 }
 
 /// This frame drew a list with something to scroll, in `rect`, scrolled `amount`
@@ -313,6 +384,50 @@ pub fn over_scroll_area(at: (f32, f32)) -> (f32, f32) {
             _ => at,
         }
     })
+}
+
+/// A step the arrows and the D-pad take that the rectangles don't show: `down` (else up) from
+/// a focus whose middle is in `from`, to the target at `to`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FocusLink {
+    pub from: [f32; 4],
+    pub down: bool,
+    pub to: [f32; 4],
+}
+
+/// Down (or up) from what is in `from` goes to `to`: a screen whose layout puts the next control
+/// off to one side, where vanilla's step would pass it by (the settings shell's search field over
+/// its list, on a screen with no page list).
+pub fn focus_link(from: [f32; 4], down: bool, to: [f32; 4]) {
+    FOCUS_LINKS.with_borrow_mut(|(current, _)| current.push(FocusLink { from, down, to }));
+}
+
+/// Where the last drawn frame said a step `down` (else up) from `focus` goes, if it said.
+pub fn linked_step(focus: [f32; 4], down: bool) -> Option<[f32; 4]> {
+    let [x, y, w, h] = focus;
+    let middle = (x + w / 2.0, y + h / 2.0);
+    FOCUS_LINKS.with_borrow(|(_, last)| {
+        last.iter()
+            .find(|l| {
+                let [lx, ly, lw, lh] = l.from;
+                l.down == down
+                    && (lx..lx + lw).contains(&middle.0)
+                    && (ly..ly + lh).contains(&middle.1)
+            })
+            .map(|l| l.to)
+    })
+}
+
+/// Left and right on the target at `rect` step its value, back and on, rather than move the focus
+/// (the settings shell's choices, whose `<` `>` say so): Right as a press, Left as a Shift press.
+pub fn steps_value(rect: [f32; 4]) {
+    STEPPERS.with_borrow_mut(|(current, _)| current.push(rect));
+}
+
+/// Whether the last drawn frame said left and right step the value of the target at `focus`.
+pub fn last_steps_value(focus: [f32; 4]) -> bool {
+    let same = |rect: &[f32; 4]| rect.iter().zip(focus).all(|(a, b)| (a - b).abs() < 0.5);
+    STEPPERS.with_borrow(|(_, last)| last.iter().any(same))
 }
 
 /// The focus targets of the last drawn frame.
@@ -388,8 +503,17 @@ pub fn end_frame(frames: u64) {
             ACTIONS.with_borrow_mut(|(current, last)| {
                 *last = std::mem::take(current);
             });
+            POINTER_BINDINGS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
             ACTION_SCREENS.set((ACTION_SCREENS.get().0, ACTION_SCREENS.get().0));
             SCROLL_AREAS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
+            FOCUS_LINKS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
+            STEPPERS.with_borrow_mut(|(current, last)| {
                 *last = std::mem::take(current);
             });
             NARRATION.with_borrow_mut(|(current, last)| {
@@ -1257,6 +1381,47 @@ pub fn find(widgets: &[Widget], label: &str) -> Result<Widget, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_pointer_keeps_the_painted_action_identity_across_redraws() {
+        let _ = take();
+        let rect = [10.0, 10.0, 80.0, 20.0];
+        let draw = |frame, key| {
+            set_action_screen(7);
+            record("Remove", rect, true);
+            pointer_binding(rect, key);
+            end_frame(frame);
+        };
+        draw(1, "realm:1:player-a:remove");
+        let intent = capture_pointer((20.0, 20.0));
+        draw(2, "realm:1:player-a:remove");
+        assert_eq!(capture_pointer((20.0, 20.0)), intent);
+        draw(3, "realm:1:player-b:remove");
+        let changed = capture_pointer((20.0, 20.0));
+        assert_ne!(changed, intent);
+        // The screen and visible caption alone do not identify a player.
+        let saved = take();
+        assert_ne!(capture_pointer((20.0, 20.0)), changed);
+        put(saved);
+        assert_eq!(capture_pointer((20.0, 20.0)), changed);
+    }
+
+    #[test]
+    fn a_delayed_pointer_does_not_follow_a_new_screen_or_disabled_control() {
+        let _ = take();
+        set_action_screen(7);
+        record("Done", [10.0, 10.0, 80.0, 20.0], true);
+        end_frame(1);
+        let intent = capture_pointer((20.0, 20.0));
+        set_action_screen(7);
+        record("Done", [10.0, 10.0, 80.0, 20.0], false);
+        end_frame(2);
+        assert_ne!(capture_pointer((20.0, 20.0)), intent);
+        set_action_screen(8);
+        record("Done", [10.0, 10.0, 80.0, 20.0], true);
+        end_frame(3);
+        assert_ne!(capture_pointer((20.0, 20.0)), intent);
+    }
 
     fn w(label: &str) -> Widget {
         Widget {

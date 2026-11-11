@@ -3,11 +3,16 @@ use super::*;
 
 pub(super) struct WorldRequest {
     pub save_root: PathBuf,
+    pub allowlist: PathBuf,
+    pub session_lock: Option<horizon_client::save::SessionLock>,
     pub folder: String,
     pub name: Option<String>,
     pub seed: Option<i64>,
     pub creative: bool,
     pub create: Option<horizon_client::title::WorldOptions>,
+    /// The account the world opens under, for an integrated server
+    /// (`IntegratedServer.getSingleplayerProfile`): its name and UUID.
+    owner: Option<(String, u128)>,
 }
 
 pub(super) struct PreparedWorld {
@@ -21,6 +26,9 @@ pub(super) struct PreparedWorld {
     pub session_lock: horizon_client::save::SessionLock,
     pub rand_sequences: horizon_client::random_sequences::RandomSequences,
     pub locator: Option<Arc<VanillaTerrain>>,
+    /// The owner's offline UUID and the account's, when an older world moved its
+    /// owner at open (`playerdata::migrate_owner`): entities migrate as they load.
+    pub owner_migration: Option<(u128, u128)>,
 }
 
 impl WorldRequest {
@@ -33,12 +41,23 @@ impl WorldRequest {
     ) -> Result<Self> {
         Ok(Self {
             save_root: std::env::current_dir()?.join("saves").join(folder),
+            allowlist: std::env::current_dir()?.join("saves/allowed_symlinks.txt"),
+            session_lock: None,
             folder: folder.to_owned(),
             name: name.map(str::to_owned),
             seed,
             creative,
             create: create.cloned(),
+            owner: None,
         })
+    }
+
+    /// The account this world opens under (`IntegratedServer.getSingleplayerProfile`):
+    /// a world older builds made under the offline profile moves its owner to it at
+    /// open. A dedicated server has no single-player owner and leaves it unset.
+    pub fn owned_by(mut self, player: &str, owner: u128) -> Self {
+        self.owner = Some((player.to_owned(), owner));
+        self
     }
 
     pub fn prepare(
@@ -92,54 +111,28 @@ impl WorldRequest {
     ) -> Result<PreparedWorld> {
         let Self {
             save_root,
+            allowlist,
+            session_lock,
             folder,
             name,
             seed,
             creative,
             create,
+            owner,
         } = self;
         let name = name.as_deref();
         let create = create.as_ref();
-        // openWorldLoadLevelData: level data that does not read is RecoverWorldDataScreen's to
-        // handle (the title screen shows it); a world opened another way must not become a
-        // new one with a random seed under the same name.
-        // The dedicated server's `Main` takes level.dat_old without asking
-        // (`getUnfixedDataTagWithFallback`): there is no world list to recover from.
-        if options.dedicated.is_some()
-            && horizon_client::save::fall_back_to_level_dat_old(&save_root)
-        {
-            log::warn!(
-                "Horizon: level.dat of \"{folder}\" did not read; level.dat_old took its place"
-            );
-        }
-        if let Some(issue) = horizon_client::save::level_data_needs_recovery(&save_root) {
-            let why = match issue {
-                horizon_client::save::DatIssue::Missing => "level.dat is missing".to_owned(),
-                horizon_client::save::DatIssue::Unreadable(why) => why,
-            };
-            return Err(format!(
-                "Failed to load world \"{folder}\": its level data does not read ({why}). \
-                 Open it from the world list to try restoring level.dat_old."
-            )
-            .into());
-        }
-        // LevelSummary.isCompatible, which the dedicated server's `Main` checks before it fixes
-        // a world: a world from another series is refused, never upgraded in place.
-        if let Some(version) = horizon_client::save::incompatible_version(&save_root) {
-            let version = if version.is_empty() {
-                "unknown".to_owned()
-            } else {
-                version
-            };
-            return Err(format!(
-                "Failed to load world \"{folder}\": it was last played in version {version}, \
-                 which cannot be opened in this version."
-            )
-            .into());
-        }
-        horizon_client::save::upgrade_older_world_with(&save_root, upgrade)?;
-        horizon_client::save::migrate_legacy(&save_root)?;
-        let session_lock = horizon_client::save::SessionLock::acquire(&save_root)?;
+        let session_lock = match session_lock {
+            Some(lock) => lock,
+            None => horizon_client::save::SessionLock::acquire_validated(&save_root, &allowlist)?,
+        };
+        let session_lock = prepare_world_storage(
+            &save_root,
+            &folder,
+            options.dedicated.is_some(),
+            upgrade,
+            session_lock,
+        )?;
         // RandomSequences: the world's data/minecraft/random_sequences.dat.
         let rand_sequences =
             horizon_client::save::read_dat(&save_root.join("data/minecraft/random_sequences.dat"))
@@ -165,6 +158,28 @@ impl WorldRequest {
             ..Level::default()
         });
         let mut level = level;
+        // `IntegratedServer.setSingleplayerProfile`: a world older Horizon builds made
+        // under the offline profile moves its owner to the account at open — the player
+        // file, its `UUID` and level.dat's `singleplayer_uuid`. Its entities follow as
+        // their chunks load (`owner_migration`, `entity_nbt::migrate_player_uuid`).
+        let owner_migration = owner.and_then(|(player, account)| {
+            let old = horizon_protocol::crypto::offline_uuid(&player);
+            (old != account).then(|| {
+                if created {
+                    // `IntegratedServer.initServer` saves with the profile before the first
+                    // tick: a world made under the account names it from its first level.dat.
+                    level.player_uuid = Some(horizon_client::lan::playerdata::uuid_ints(account));
+                } else if horizon_client::lan::playerdata::migrate_owner(
+                    &save_root, &mut level, old, account,
+                ) {
+                    log::info!(
+                        "Horizon: \"{folder}\" was made under the offline profile; \
+                         its owner moved to the account's UUID"
+                    );
+                }
+                (old, account)
+            })
+        });
         // CreateWorldScreen's choices, before streaming reads the generator.
         if created && let Some(o) = create {
             level.hardcore = o.hardcore;
@@ -222,6 +237,15 @@ impl WorldRequest {
             level.dimension = d.clone();
             level.position = None;
         }
+        // The bounded registry-loader leaf slice: fail world preparation before streaming,
+        // rather than letting the flat-generator fallback swallow a selected pack's codec error.
+        let (overrides, _) = worldgen_overrides_of(
+            &save_root,
+            &options.resources,
+            res.biomes(),
+            &level.enabled_features,
+        );
+        overrides.validate_fill_layers(pack.assets.registry)?;
         let dim = Dim::from_id(&level.dimension);
         let shapes = level_shapes(&save_root, res.biomes());
         let shape = shapes.get(dim.id());
@@ -242,9 +266,13 @@ impl WorldRequest {
         let mut world = World::new(res.facts().air, level.seed);
         world.attachments = save.load_attachments();
         world.shape = shape;
-        world.fast_lava = dim == Dim::Nether;
+        world.fast_lava = horizon_world::dimension_type::DimensionFacts::of_builtin_level(
+            horizon_core::LevelKey::builtin_or_overworld(dim.id()),
+        )
+        .fast_lava;
         world.game_time = level.time;
         world.day_time = options.time.unwrap_or(level.day_time);
+        world.end_clock = level.end_clock.unwrap_or(level.time);
         world.weather = level.weather;
         if let Some(w) = options.weather.as_deref() {
             // /weather: clear, rain or thunder for a long duration.
@@ -274,8 +302,56 @@ impl WorldRequest {
             session_lock,
             rand_sequences,
             locator,
+            owner_migration,
         })
     }
+}
+
+/// LevelStorageAccess creates its DirectoryLock before reading/recovering or upgrading level data.
+/// Keep that ownership through every mutation and return it with the prepared world.
+fn prepare_world_storage(
+    save_root: &std::path::Path,
+    folder: &str,
+    dedicated: bool,
+    upgrade: &horizon_world::datafix::progress::UpgradeProgress,
+    session_lock: horizon_client::save::SessionLock,
+) -> Result<horizon_client::save::SessionLock> {
+    // openWorldLoadLevelData: level data that does not read is RecoverWorldDataScreen's to
+    // handle (the title screen shows it); a world opened another way must not become a
+    // new one with a random seed under the same name.
+    // The dedicated server's `Main` takes level.dat_old without asking
+    // (`getUnfixedDataTagWithFallback`): there is no world list to recover from.
+    if dedicated && horizon_client::save::fall_back_to_level_dat_old(save_root) {
+        log::warn!("Horizon: level.dat of \"{folder}\" did not read; level.dat_old took its place");
+    }
+    if let Some(issue) = horizon_client::save::level_data_needs_recovery(save_root) {
+        let why = match issue {
+            horizon_client::save::DatIssue::Missing => "level.dat is missing".to_owned(),
+            horizon_client::save::DatIssue::Unreadable(why) => why,
+        };
+        return Err(format!(
+            "Failed to load world \"{folder}\": its level data does not read ({why}). \
+         Open it from the world list to try restoring level.dat_old."
+        )
+        .into());
+    }
+    // LevelSummary.isCompatible, which the dedicated server's `Main` checks before it fixes
+    // a world: a world from another series is refused, never upgraded in place.
+    if let Some(version) = horizon_client::save::incompatible_version(save_root) {
+        let version = if version.is_empty() {
+            "unknown".to_owned()
+        } else {
+            version
+        };
+        return Err(format!(
+            "Failed to load world \"{folder}\": it was last played in version {version}, \
+         which cannot be opened in this version."
+        )
+        .into());
+    }
+    horizon_client::save::upgrade_older_world_with(save_root, upgrade)?;
+    horizon_client::save::migrate_legacy(save_root)?;
+    Ok(session_lock)
 }
 
 pub(super) struct WorldLoader {
@@ -326,7 +402,7 @@ enum Preload {
         left: Option<std::time::Instant>,
     },
     /// A world opened: the data is the world's now, and stays.
-    Used,
+    Used(Option<std::thread::JoinHandle<()>>),
 }
 
 static PRELOAD: std::sync::Mutex<Preload> = std::sync::Mutex::new(Preload::Idle);
@@ -347,12 +423,14 @@ pub(super) fn preload_world_data(
 ) {
     let mut preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
     match &mut *preload {
-        Preload::Used => {}
+        Preload::Used(_) => {}
         Preload::Idle if on_world_screens => {
             let resources = resources.to_owned();
+            let root_lease = horizon_assets::root_lease::lease_for(&resources);
             let spawned = std::thread::Builder::new()
                 .name("World data preload".into())
                 .spawn(move || {
+                    let _root_lease = root_lease;
                     horizon_threads::behind_server();
                     let sync = spawn_sync_preload(&resources, true);
                     // Errors are left for the world opening to report.
@@ -418,10 +496,13 @@ pub(super) fn preload_launch_world(
     };
     let world_root = dir.join("saves").join(folder);
     let resources = resources.to_owned();
+    let root_lease = horizon_assets::root_lease::lease_for(&resources);
     let spawned = std::thread::Builder::new()
         .name("World data preload".into())
         .spawn(move || {
+            let _root_lease = root_lease;
             // Not behind the server: the world's opening waits for it.
+            let _step = startup::step("world.preload");
             let started = std::time::Instant::now();
             let sync = spawn_sync_preload(&resources, false);
             // Errors are left for the world opening to report. The world's
@@ -492,25 +573,99 @@ fn join_sync_preload(sync: Option<std::thread::JoinHandle<()>>, resources: &std:
     }
 }
 
-/// A world opens: what `preload_world_data` read is the world's from now on.
-pub(super) fn world_data_used() {
-    *PRELOAD.lock().unwrap_or_else(|e| e.into_inner()) = Preload::Used;
-}
+/// Writers of the prepared-file cache belong to the engine session too.
+static PREPARED_WRITERS: std::sync::Mutex<Vec<(PathBuf, std::thread::JoinHandle<()>)>> =
+    std::sync::Mutex::new(Vec::new());
 
-/// Whether the preload thread is done, for the launcher handoff: the app
-/// waits on it before taking the process back, so nothing keeps reading.
-pub(super) fn shutdown_preload() -> bool {
-    let preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
-    match &*preload {
-        Preload::Started { thread, .. } => thread.is_finished(),
-        Preload::Idle | Preload::Used => true,
+/// Build the optional packed-file cache without holding the window thread up.
+/// Shutdown keeps every handle until its writer is done, before imports can replace the root.
+pub(super) fn write_prepared_files(
+    root: PathBuf,
+    home_access: Option<horizon_client::import::HomeAccess>,
+) {
+    use horizon_core::prepared_files;
+    if prepared_files::open(&root).is_some() || !root.join("horizon-resources.json").is_file() {
+        return;
+    }
+    let mut writers = PREPARED_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    if writers
+        .iter()
+        .any(|(path, thread)| path == &root && !thread.is_finished())
+    {
+        return;
+    }
+    let tracked_root = root.clone();
+    let spawned = std::thread::Builder::new()
+        .name("Prepared data file".into())
+        .spawn(move || {
+            // Continue the resource generation's finite transaction; this
+            // background cache writer must not race an import either.
+            let _home_access = home_access;
+            horizon_threads::idle_current();
+            let started = Instant::now();
+            match prepared_files::write(&root) {
+                Ok(()) => {
+                    prepared_files::invalidate(&root);
+                    log::info!(
+                        "Horizon: wrote {} in {} ms",
+                        prepared_files::FILE_NAME,
+                        started.elapsed().as_millis()
+                    );
+                }
+                Err(e) => log::info!("Horizon: {} not written: {e}", prepared_files::FILE_NAME),
+            }
+        });
+    match spawned {
+        Ok(thread) => writers.push((tracked_root, thread)),
+        Err(e) => log::info!("Horizon: {} not written: {e}", prepared_files::FILE_NAME),
     }
 }
 
-/// Back to the launcher: the world's preloaded data is not needed while the
-/// launcher shows, so hand the memory back.
+/// Call after producers (resource loading and the integrated server) have stopped.
+pub(super) fn shutdown_prepared_files() -> bool {
+    let mut writers = PREPARED_WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    if writers.iter().any(|(_, writer)| !writer.is_finished()) {
+        return false;
+    }
+    for (_, writer) in writers.drain(..) {
+        let _ = writer.join();
+    }
+    true
+}
+
+/// A world opens: what `preload_world_data` read is the world's from now on.
+pub(super) fn world_data_used() {
+    let mut preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = std::mem::replace(&mut *preload, Preload::Idle);
+    *preload = Preload::Used(match previous {
+        Preload::Started { thread, .. } => Some(thread),
+        Preload::Used(thread) => thread,
+        Preload::Idle => None,
+    });
+}
+
+/// Keep the preload's handle through world entry so engine shutdown can drain it.
+pub(super) fn shutdown_preload() -> bool {
+    let mut preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let running = match &*preload {
+        Preload::Started { thread, .. } | Preload::Used(Some(thread)) => !thread.is_finished(),
+        _ => false,
+    };
+    if running {
+        return false;
+    }
+    match std::mem::replace(&mut *preload, Preload::Idle) {
+        Preload::Started { thread, .. } | Preload::Used(Some(thread)) => {
+            let _ = thread.join();
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Called after the engine and its streaming pools are gone.
 pub(super) fn release_world_data() {
-    *PRELOAD.lock().unwrap_or_else(|e| e.into_inner()) = Preload::Idle;
+    horizon_core::prepared_files::invalidate_all();
     horizon_client::vanillagen::forget_shared_data();
     horizon_client::structure_blocks::forget_loot_data();
     super::lan::forget_sync_data();
@@ -557,6 +712,12 @@ pub(super) fn packed_biomes(
         .filter_map(|id| packs.iter().find(|p| &p.id == id))
         .collect();
     let (overrides, _) = horizon_client::datapack::worldgen_overrides(&enabled, |_| true);
+    // The mods' spawns too: their biome modifiers go over the packs' biomes.
+    let overrides = horizon_client::vanillagen::biome_modifiers_over_packs(
+        &resources.join("worldgen"),
+        &overrides,
+    )
+    .unwrap_or(overrides);
     let packed: Vec<(String, serde_json::Value)> = overrides
         .entries("biomes")
         .filter_map(|(id, json)| Some((id.to_owned(), serde_json::from_str(json).ok()?)))
@@ -855,12 +1016,19 @@ pub(super) fn make_streaming(
         }
         // Chunks an older version saved: the new chunks around them blend in.
         if dim == Dim::Overworld {
-            inner.set_old_world(Arc::new(horizon_client::old_world::SavedOldWorld::new(
+            let old = Arc::new(horizon_client::old_world::SavedOldWorld::new(
                 save.clone(),
                 pack.assets.clone(),
                 res.biomes().clone(),
                 inner.generator_data().clone(),
-            )));
+            ));
+            // Saves of this folder take the old chunks' calculated blending data when
+            // they are requested; a weak link, as the old world holds the folder.
+            let weak = Arc::downgrade(&old);
+            save.set_blending_lookup(Box::new(move |x, z| {
+                weak.upgrade().and_then(|old| old.calculated(x, z))
+            }));
+            inner.set_old_world(old);
         }
         inner.set_reference_file(world_root.join("data").join(format!(
             "horizon_structure_references_{}.json",
@@ -889,6 +1057,7 @@ pub(super) fn make_streaming(
     streaming.biome_blend = settings.biome_blend;
     streaming.smooth_lighting = settings.smooth_lighting;
     streaming.cutout_leaves = settings.cutout_leaves;
+    streaming.opaque_ice = settings.horizon.opaque_ice;
     streaming.leaf_culling = settings
         .horizon
         .leaf_culling_effective(&settings.resource_packs);
@@ -905,6 +1074,163 @@ pub(super) fn make_streaming(
 mod tests {
     use super::*;
 
+    fn storage_fixture(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-storage-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn locked_world_cannot_be_recovered_or_migrated() {
+        use horizon_world::nbt::Tag;
+        let root = storage_fixture("locked");
+        std::fs::write(root.join("level.dat"), b"broken current data").unwrap();
+        horizon_client::save::write_dat(
+            &root.join("level.dat_old"),
+            Tag::compound([(
+                "Data",
+                Tag::compound([
+                    ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+                    ("LevelName", Tag::String("recovery fixture".into())),
+                ]),
+            )]),
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("region")).unwrap();
+        std::fs::write(root.join("region/r.0.0.mca"), b"legacy region").unwrap();
+        let old = std::fs::read(root.join("level.dat_old")).unwrap();
+        let held = horizon_client::save::SessionLock::acquire(&root).unwrap();
+        let progress = horizon_world::datafix::progress::UpgradeProgress::new();
+        let error = prepare_storage_fixture(&root, true, &progress)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("already open"));
+        assert_eq!(
+            std::fs::read(root.join("level.dat")).unwrap(),
+            b"broken current data"
+        );
+        assert_eq!(std::fs::read(root.join("level.dat_old")).unwrap(), old);
+        assert!(root.join("region/r.0.0.mca").is_file());
+        assert!(!root.join("dimensions").exists());
+        drop(held);
+        let opened = prepare_storage_fixture(&root, true, &progress).unwrap();
+        assert!(horizon_client::save::level_data_needs_recovery(&root).is_none());
+        assert!(
+            root.join("dimensions/minecraft/overworld/region/r.0.0.mca")
+                .is_file()
+        );
+        drop(opened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn prepare_storage_fixture(
+        root: &std::path::Path,
+        dedicated: bool,
+        progress: &horizon_world::datafix::progress::UpgradeProgress,
+    ) -> Result<horizon_client::save::SessionLock> {
+        let lock = horizon_client::save::SessionLock::acquire_validated(
+            root,
+            &root.join("allowed_symlinks.txt"),
+        )?;
+        prepare_world_storage(root, "fixture", dedicated, progress, lock)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forbidden_session_link_is_rejected_before_target_is_written() {
+        let root = storage_fixture("symlink");
+        let target = root.with_extension("sentinel");
+        std::fs::write(&target, b"must survive opening").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("session.lock")).unwrap();
+        let progress = horizon_world::datafix::progress::UpgradeProgress::new();
+        let error = prepare_storage_fixture(&root, false, &progress)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("forbidden symbolic links"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"must survive opening");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(target).unwrap();
+    }
+
+    #[test]
+    fn incompatible_world_is_not_upgraded_or_migrated() {
+        use horizon_world::nbt::Tag;
+        let root = storage_fixture("incompatible");
+        horizon_client::save::write_dat(
+            &root.join("level.dat"),
+            Tag::compound([(
+                "Data",
+                Tag::compound([
+                    ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+                    (
+                        "Version",
+                        Tag::compound([
+                            ("Series", Tag::String("other-series".into())),
+                            ("Name", Tag::String("incompatible fixture".into())),
+                        ]),
+                    ),
+                ]),
+            )]),
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("region")).unwrap();
+        std::fs::write(root.join("region/r.0.0.mca"), b"legacy region").unwrap();
+        let before = std::fs::read(root.join("level.dat")).unwrap();
+        let progress = horizon_world::datafix::progress::UpgradeProgress::new();
+        let error = prepare_storage_fixture(&root, false, &progress)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("incompatible fixture"));
+        assert_eq!(std::fs::read(root.join("level.dat")).unwrap(), before);
+        assert!(root.join("region/r.0.0.mca").is_file());
+        assert!(!root.join("dimensions").exists());
+        assert!(!horizon_client::save::SessionLock::is_locked(&root));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_preparation_releases_world_lock() {
+        let root = storage_fixture("failed");
+        std::fs::write(root.join("level.dat"), b"broken current data").unwrap();
+        let progress = horizon_world::datafix::progress::UpgradeProgress::new();
+        assert!(prepare_storage_fixture(&root, false, &progress).is_err());
+        assert!(!horizon_client::save::SessionLock::is_locked(&root));
+        let retry = horizon_client::save::SessionLock::acquire(&root).unwrap();
+        drop(retry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn used_preload_is_still_drained_before_shutdown() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            wait.recv().unwrap();
+        });
+        *PRELOAD.lock().unwrap() = Preload::Started { thread, left: None };
+        world_data_used();
+        assert!(!shutdown_preload());
+        release.send(()).unwrap();
+        loop {
+            let ready = match &*PRELOAD.lock().unwrap() {
+                Preload::Used(Some(thread)) => thread.is_finished(),
+                _ => panic!("preload handle lost"),
+            };
+            if ready {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(shutdown_preload());
+        assert!(matches!(*PRELOAD.lock().unwrap(), Preload::Idle));
+        assert!(shutdown_preload());
+    }
     #[test]
     fn worker_panics_reach_the_client() {
         let loader = WorldLoader {
@@ -920,5 +1246,221 @@ mod tests {
     fn prepared_world_can_cross_threads() {
         fn send<T: Send>() {}
         send::<PreparedWorld>();
+    }
+}
+
+#[cfg(test)]
+mod unused_feature_startup_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires prepared resources and scratch homes/cwd"]
+    fn actual_world_prepare_rejects_unused_invalid_feature() {
+        let resources = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+        let settings = Settings::default();
+        let loaded = load_resources(
+            resources.clone(),
+            None,
+            &resources,
+            &settings,
+            Instant::now(),
+            false,
+            true,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = resources;
+        options.execution_role = execution_role::ExecutionRole::IntegratedServer;
+        for (case, height) in [("valid", 0), ("invalid", -1)] {
+            let root = std::env::current_dir().unwrap().join(case);
+            let pack = root.join("datapacks/h259");
+            std::fs::create_dir_all(pack.join("data/h259/worldgen/feature")).unwrap();
+            std::fs::write(pack.join("pack.mcmeta"), r#"{"pack":{"description":"H259 unused feature","min_format":[121,0],"max_format":[121,0]}}"#).unwrap();
+            let json = format!(
+                r#"{{"type":"minecraft:fill_layer","height":{height},"state":"minecraft:stone"}}"#
+            );
+            std::fs::write(
+                pack.join("data/h259/worldgen/feature/unused_probe.json"),
+                &json,
+            )
+            .unwrap();
+            let mut level = Level {
+                seed: 259,
+                data_packs: Some((vec!["vanilla".into(), "file/h259".into()], vec![])),
+                ..Level::default()
+            };
+            level.write(&root).unwrap();
+            horizon_client::save::write_world_gen_settings(
+                &root,
+                259,
+                horizon_client::save::WorldGen {
+                    preset: horizon_client::save::WorldPreset::Flat,
+                    structures: false,
+                    bonus_chest: false,
+                },
+            )
+            .unwrap();
+            let (overrides, _) = worldgen_overrides_of(
+                &root,
+                &options.resources,
+                loaded.resources.biomes(),
+                &level.enabled_features,
+            );
+            assert_eq!(
+                overrides
+                    .entries("features")
+                    .find(|(id, _)| *id == "h259:unused_probe")
+                    .unwrap()
+                    .1,
+                json
+            );
+            assert!(overrides.entries("placed_features").next().is_none());
+            assert_eq!(
+                horizon_client::save::WorldGen::read(&root).unwrap().preset,
+                horizon_client::save::WorldPreset::Flat
+            );
+            let request = WorldRequest {
+                allowlist: std::env::current_dir()
+                    .unwrap()
+                    .join("saves/allowed_symlinks.txt"),
+                session_lock: None,
+                save_root: root,
+                folder: case.into(),
+                name: None,
+                seed: Some(259),
+                creative: false,
+                create: None,
+                owner: None,
+            };
+            let result = request.prepare(
+                &loaded.resources,
+                &loaded.pack,
+                &options,
+                &settings,
+                &horizon_world::datafix::progress::UpgradeProgress::new(),
+            );
+            if height == 0 {
+                assert!(result.is_ok(), "valid unused registry entry must prepare");
+                drop(result);
+            } else {
+                let error = match result {
+                    Ok(_) => panic!(
+                        "unused invalid h259:unused_probe was accepted by actual world preparation"
+                    ),
+                    Err(error) => error.to_string(),
+                };
+                assert!(error.contains("h259:unused_probe"), "{error}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unused_feature_preservation_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires prepared resources and scratch homes/cwd"]
+    fn startup_leaf_preservation_other_id_and_unrelated_feature() {
+        let resources = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+        let settings = Settings::default();
+        let loaded = load_resources(
+            resources.clone(),
+            None,
+            &resources,
+            &settings,
+            Instant::now(),
+            false,
+            true,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = resources;
+        options.execution_role = execution_role::ExecutionRole::IntegratedServer;
+        let root = std::env::current_dir().unwrap().join("preservation");
+        let pack = root.join("datapacks/h259");
+        let entries = pack.join("data/controls/worldgen/feature");
+        std::fs::create_dir_all(&entries).unwrap();
+        std::fs::write(pack.join("pack.mcmeta"), r#"{"pack":{"description":"H259 preservation controls","min_format":[121,0],"max_format":[121,0]}}"#).unwrap();
+        let leaf = r#"{"type":"minecraft:fill_layer","height":1,"state":"minecraft:stone"}"#;
+        let unrelated = r#"{"type":"minecraft:no_op"}"#;
+        std::fs::write(entries.join("another_id.json"), leaf).unwrap();
+        std::fs::write(entries.join("unrelated.json"), unrelated).unwrap();
+        let mut level = Level {
+            seed: 259,
+            data_packs: Some((vec!["vanilla".into(), "file/h259".into()], vec![])),
+            ..Level::default()
+        };
+        level.write(&root).unwrap();
+        horizon_client::save::write_world_gen_settings(
+            &root,
+            259,
+            horizon_client::save::WorldGen {
+                preset: horizon_client::save::WorldPreset::Flat,
+                structures: false,
+                bonus_chest: false,
+            },
+        )
+        .unwrap();
+        let (mut overrides, _) = worldgen_overrides_of(
+            &root,
+            &options.resources,
+            loaded.resources.biomes(),
+            &level.enabled_features,
+        );
+        assert_eq!(
+            overrides.entries("features").collect::<Vec<_>>(),
+            vec![
+                ("controls:another_id", leaf),
+                ("controls:unrelated", unrelated),
+            ]
+        );
+        // Labeled native preservation controls, not additional Java runtime coverage.
+        overrides
+            .validate_fill_layers(loaded.pack.assets.registry)
+            .unwrap();
+        // The existing winning-entry map still owns precedence, not the validation phase.
+        overrides.set(
+            "features",
+            "controls:another_id",
+            r#"{"type":"minecraft:fill_layer","height":-1,"state":"minecraft:stone"}"#.into(),
+        );
+        let error = overrides
+            .validate_fill_layers(loaded.pack.assets.registry)
+            .unwrap_err();
+        assert!(error.to_string().contains("controls:another_id"));
+        overrides.set("features", "controls:another_id", leaf.into());
+        overrides
+            .validate_fill_layers(loaded.pack.assets.registry)
+            .unwrap();
+        let request = WorldRequest {
+            allowlist: std::env::current_dir()
+                .unwrap()
+                .join("saves/allowed_symlinks.txt"),
+            session_lock: None,
+            save_root: root,
+            folder: "preservation".into(),
+            name: None,
+            seed: Some(259),
+            creative: false,
+            create: None,
+            owner: None,
+        };
+        assert!(
+            request
+                .prepare(
+                    &loaded.resources,
+                    &loaded.pack,
+                    &options,
+                    &settings,
+                    &horizon_world::datafix::progress::UpgradeProgress::new(),
+                )
+                .is_ok(),
+            "preservation: other-id leaf and unrelated no_op must still prepare"
+        );
     }
 }

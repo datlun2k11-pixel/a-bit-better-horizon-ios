@@ -240,9 +240,29 @@ impl Game<'_> {
             self.pvp.combo.hurt(id, by_me, now);
         }
     }
-    /// Whether the effects widget replaces vanilla's effect icons (`Hud.extractEffects`).
+    /// Replace vanilla's effect icons only when the custom widget's corner can draw.
     pub(super) fn pvp_effects_shown(&self) -> bool {
-        self.settings.extras.pvp.hud.effects
+        let hud = self.settings.extras.pvp.hud;
+        hud.effects && self.native_corner_shown(hud.effects_corner)
+    }
+    /// Text and measured widths belong to the current language/font atlas.
+    /// Forget those caches without resetting combat or chat-search state.
+    pub(super) fn invalidate_pvp_hud(&mut self) {
+        let state = &mut self.pvp;
+        state.armour.clear();
+        state.effects.clear();
+        state.held.clear();
+        state.ping.clear();
+        state.coords.clear();
+        state.server.clear();
+        state.combo_count.clear();
+        state.fps.clear();
+        state.cps.clear();
+        state.keys.cps.clear();
+        state.keys.labels.clear();
+        state.clock.clear();
+        state.reach_shown.clear();
+        state.speed_shown.clear();
     }
     /// The HUD widgets that are on, after the minimap and before mods' boxes. Each rebuilds its
     /// lines only when what it shows changed.
@@ -256,8 +276,12 @@ impl Game<'_> {
         // What each widget shows, read before its cache is borrowed.
         let armour: [Option<(Arc<str>, u32, u32)>; 4] = std::array::from_fn(|i| {
             let s = self.armor[i].as_ref()?;
-            let max = self.items().get(&s.item).map_or(0, |i| i.max_damage);
-            Some((s.item.clone(), s.damage, max))
+            let item_max = self.items().get(&s.item).map_or(0, |i| i.max_damage);
+            Some((
+                s.item.clone(),
+                s.damage_value(item_max),
+                s.max_damage(item_max),
+            ))
         });
         let held = if hud.held { self.held_count() } else { None };
         let multiplayer = self.remote.is_some() && !self.has_singleplayer_server();

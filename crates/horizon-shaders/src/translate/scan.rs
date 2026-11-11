@@ -53,6 +53,8 @@ pub(super) struct Stage<'p> {
     pub(super) attributes: Vec<(String, String, String)>,
     /// A gbuffers-style program: the matrices are the frame's, not the quad's.
     pub(super) gbuffers: bool,
+    /// `normals` and `specular` are paged maps (`GbuffersInputs::paged_maps`).
+    pub(super) paged_maps: bool,
     /// The pack's fragment outputs, declared again with their locations.
     pub(super) frag_outs: Vec<(u32, String)>,
     /// Narrow outputs copied into their vec4 after the pack's `main`.
@@ -77,6 +79,8 @@ pub(super) struct Stage<'p> {
     pub(super) sampler_functions: HashMap<String, Vec<bool>>,
     /// The pack's structs: each member's type and name with its array suffix.
     pub(super) structs: HashMap<String, Vec<(String, String)>>,
+    /// `out struct S { .. } s;`: the qualifiers and `S`, read with the declarators after `}`.
+    struct_qualifiers: Vec<usize>,
     pub(super) outputs: BTreeSet<u32>,
     pub(super) frag_coord: bool,
     /// Tokens written differently, by index.
@@ -316,10 +320,14 @@ fn reversed_array_dimensions(ty: &str) -> String {
 
 impl<'p> Stage<'p> {
     pub(super) fn scan(pp: &'p Preprocessed, kind: ShaderStage) -> Self {
+        // Naga accepts arrays on the common type and applies that type to every
+        // comma-separated declarator. Moving those dimensions onto the first name
+        // loses them for subsequent variables (and can change nested array shapes).
+        let tokens = lex(&pp.code);
         let mut s = Stage {
             kind,
             pp,
-            tokens: lex(&pp.code),
+            tokens,
             removed: Vec::new(),
             uniforms: Vec::new(),
             defaults: Vec::new(),
@@ -340,9 +348,11 @@ impl<'p> Stage<'p> {
             trinary: Vec::new(),
             sampler_functions: HashMap::new(),
             structs: HashMap::new(),
+            struct_qualifiers: Vec::new(),
             outputs: BTreeSet::new(),
             frag_coord: false,
             gbuffers: false,
+            paged_maps: false,
             replaced: HashMap::new(),
             inits: Vec::new(),
             globals: BTreeSet::new(),
@@ -588,9 +598,26 @@ impl<'p> Stage<'p> {
 
     /// A statement at global scope, tokens `from..to` (without its `;`, or before a `{`).
     pub(super) fn global(&mut self, from: usize, to: usize, body: bool) {
-        let words: Vec<usize> = (from..to)
+        let mut words: Vec<usize> = (from..to)
             .filter(|&i| significant(self.tokens[i]))
             .collect();
+        // A struct defined in an interface declaration (GLSL 4.60, 4.1.8): `flat out struct S
+        // { .. } s;` declares `s` as `flat out S s;` would, after the definition.
+        let pending = std::mem::take(&mut self.struct_qualifiers);
+        if body {
+            if let Some(s) = words.iter().position(|&i| self.tokens[i] == "struct")
+                && let Some(&name) = words.get(s + 1)
+                && words[..s]
+                    .iter()
+                    .any(|&i| matches!(self.tokens[i], "in" | "out" | "varying"))
+            {
+                self.struct_qualifiers = words[..s].to_vec();
+                self.struct_qualifiers.push(name);
+                return;
+            }
+        } else {
+            words.splice(0..0, pending);
+        }
         // A prototype: a `(` before any `=`, and no storage qualifier.
         let paren = words
             .iter()
@@ -673,6 +700,23 @@ impl<'p> Stage<'p> {
         let mut declarators: Vec<(String, String)> = Vec::new();
         let mut defaults = String::new();
         let mut j = k + 1;
+        let mut common_array = String::new();
+        while words.get(j).is_some_and(|&i| self.tokens[i] == "[") {
+            let mut depth = 0;
+            while let Some(&i) = words.get(j) {
+                let token = self.tokens[i];
+                common_array.push_str(token);
+                j += 1;
+                match token {
+                    "[" => depth += 1,
+                    "]" => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
         while let Some(&n) = words.get(j) {
             let name = self.tokens[n].to_owned();
             let mut array = String::new();
@@ -704,8 +748,11 @@ impl<'p> Stage<'p> {
                             .map(|&i| self.tokens[i])
                             .collect::<Vec<_>>()
                             .join(" ");
-                        write!(defaults, "const {ty} hz_default_{name}{array} = {value}; ")
-                            .unwrap();
+                        write!(
+                            defaults,
+                            "const {ty} hz_default_{name}{array}{common_array} = {value}; "
+                        )
+                        .unwrap();
                         self.defaults.push((name.clone(), n));
                     }
                     break;
@@ -714,6 +761,8 @@ impl<'p> Stage<'p> {
                 j += 1;
             }
             j += 1;
+            // Name dimensions are outermost: `float[2] values[3]` is [3][2].
+            array.push_str(&common_array);
             declarators.push((name, array));
         }
         let fragment = self.kind == ShaderStage::Fragment;
@@ -1134,5 +1183,28 @@ impl<'p> Stage<'p> {
             self.sampler_functions
                 .insert(self.tokens[name].to_owned(), params);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::translate::Target;
+    use crate::translate::tests::program;
+
+    #[test]
+    fn a_struct_defined_in_a_varyings_declaration_is_a_varying() {
+        // GLSL 4.60, 4.1.8: the qualifiers before `struct` apply to the declarators after `}`.
+        let vsh = "#version 120\nflat varying struct P { vec2 a; vec2 b; } p, q;\nvoid main() {\n    \
+                   gl_Position = ftransform();\n    p.a = vec2(1.0);\n    q.b = vec2(2.0);\n}\n";
+        let fsh = "#version 120\nflat varying struct P { vec2 a; vec2 b; } p, q;\n\
+                   void main() { gl_FragData[0] = vec4(p.a, q.b); }\n";
+        let p = program(
+            &[("composite.vsh", vsh), ("composite.fsh", fsh)],
+            Target::Buffers,
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        // `p` and `q`, each packed into one slot.
+        let inputs = p.fragment.entry_points[0].function.arguments.len();
+        assert_eq!(inputs, 2, "{inputs} inputs");
     }
 }

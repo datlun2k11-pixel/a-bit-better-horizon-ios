@@ -1,6 +1,19 @@
 //! Android's way in: NativeActivity loads `libhorizon_android.so` (crates/horizon-android) and calls
-//! `android_main` on its own thread, where `main` then runs as it does on every other platform.
+//! `android_main` on its own thread, where the shared entry runs as on every other platform.
+use std::sync::OnceLock;
 use winit::platform::android::activity::AndroidApp;
+
+#[cfg(not(any(feature = "system-allocator", feature = "alloc-census")))]
+#[global_allocator]
+static ALLOCATOR: horizon_threads::Allocator = horizon_threads::ALLOCATOR;
+#[cfg(all(feature = "alloc-census", not(feature = "system-allocator")))]
+#[global_allocator]
+static ALLOCATOR: horizon_threads::CensusAllocator = horizon_threads::CensusAllocator;
+
+static MOD_API_LEVEL: [u8; 27] = horizon_mods::api_level::MARK;
+
+/// The activity, for `game::event_loop`.
+pub(crate) static APP: OnceLock<AndroidApp> = OnceLock::new();
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
@@ -17,6 +30,7 @@ fn android_main(app: AndroidApp) {
         let _ = std::env::set_current_dir(&files);
         unsafe { std::env::set_var("HOME", files) };
     }
-    let _ = horizon_client::ANDROID_APP.set(app);
-    crate::main();
+    let _ = APP.set(app);
+    std::hint::black_box(&MOD_API_LEVEL);
+    crate::entry::main();
 }
