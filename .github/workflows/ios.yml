@@ -29,7 +29,7 @@ env:
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_INCREMENTAL: "0"
   # The app's own minimum (project.yml); rustc and cc read it, and the Xcode step's Cargo phase sees the same.
-  IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+  IPHONEOS_DEPLOYMENT_TARGET: "15.0"
 
 jobs:
   ipa:

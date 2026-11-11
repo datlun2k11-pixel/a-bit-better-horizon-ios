@@ -434,7 +434,7 @@ struct GameFilesRecovery: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
+        CompatNavigationStack {
             Form {
                 Section {
                     if case let .failed(message) = download.state {
