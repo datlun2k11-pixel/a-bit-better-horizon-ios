@@ -1,7 +1,6 @@
 #![allow(clippy::unnecessary_cast)]
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ffi::{c_char, CString};
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
@@ -421,12 +420,18 @@ fn log_to_console(message: &str) {
         hook(message);
     }
     extern "C" {
-        fn NSLog(format: *const c_char, ...);
+        // `NSLog(NSString *format, ...)`: the format is an object, not a C string. Handing it a
+        // `c"%s"` messages a C buffer as an `NSString` and segfaults in `objc_msgSend`.
+        fn NSLog(format: *mut objc2::runtime::AnyObject, ...);
     }
-    let line = CString::new(message).unwrap_or_default();
-    // SAFETY: the format is `%s` and nothing else, and the string is NUL-terminated and outlives the call.
+    let format = NSString::from_str("%@");
+    let line = NSString::from_str(message);
+    // SAFETY: both arguments are live `NSString`s and `%@` forwards the second one unchanged.
     unsafe {
-        NSLog(c"%s".as_ptr(), line.as_ptr());
+        NSLog(
+            &*format as *const NSString as *mut objc2::runtime::AnyObject,
+            &*line as *const NSString as *mut objc2::runtime::AnyObject,
+        );
     }
 }
 
