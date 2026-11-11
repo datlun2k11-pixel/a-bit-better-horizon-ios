@@ -600,7 +600,7 @@ impl ShaderUi {
             let rect = [x + 2.0, y + 6.0, w - 4.0, 8.0];
             crate::widgets::record(&caption, rect, false);
             let caption = Text::literal(style::fit(atlas, &caption, w - 4.0));
-            batch.text_styled(atlas, &caption, rect[0], rect[1], style::MUTED, true);
+            batch.text_styled(atlas, &caption, rect[0], rect[1], style::muted(), true);
         }
         let focused = self.focus == Some(Target::Search);
         shell::search_field(&mut self.search, batch, atlas, &cols, cursor, focused);
@@ -640,6 +640,7 @@ impl ShaderUi {
                     value: value.as_deref(),
                     switch: Self::switch(item, s),
                     slider: Self::slider(item, s),
+                    key: None,
                     live: true,
                     hover,
                     focused,

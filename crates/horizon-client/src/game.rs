@@ -6034,7 +6034,9 @@ impl Game<'_> {
         // the sleep overlay, debug screen and open screens still draw.
         let spectator = self.spectator();
         let (wi, hi) = (w as i32, h as i32);
-        let show_hud = !self.ui.hide_gui && !self.replay.playing();
+        // The hide-HUD button hides the HUD, the touch controls with it; the controls still take
+        // touches where they were, so a remembered tap brings the HUD back.
+        let show_hud = !self.ui.hide_gui && !self.replay.playing() && !self.touch.hud_hidden;
         // Hud.extractRenderState asks `Screen.isInGameUi` twice: such a screen
         // defers the subtitles over itself, and keeps them while F1 hides the
         // rest of the HUD.

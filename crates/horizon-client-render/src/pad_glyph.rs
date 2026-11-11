@@ -139,6 +139,11 @@ impl Glyphs {
     pub fn family(self) -> GlyphStyle {
         self.family
     }
+    /// Whether each glyph shows the letter of the button playing it (a Nintendo pad that goes by
+    /// its letters).
+    pub fn letters(self) -> bool {
+        self.letters
+    }
     /// The family whose print shows `part`, and the button on the pad that plays it: the one
     /// place letter mode turns a part into a physical button (`Button::by_letter`, as input is
     /// read).

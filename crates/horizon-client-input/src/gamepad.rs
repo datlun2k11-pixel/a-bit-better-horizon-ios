@@ -55,6 +55,49 @@ impl Button {
         Button::DPadLeft,
         Button::DPadRight,
     ];
+    pub fn label(self, style: GlyphStyle) -> &'static str {
+        let i = self as usize;
+        match style {
+            GlyphStyle::PlayStation => [
+                "×", "○", "□", "△", "L1", "R1", "L2", "R2", "Create",
+                "Options", "L3", "R3", "↑", "↓", "←", "→",
+            ][i],
+            GlyphStyle::Nintendo => [
+                "B", "A", "Y", "X", "L", "R", "ZL", "ZR", "−", "+", "LS", "RS", "↑",
+                "↓", "←", "→",
+            ][i],
+            GlyphStyle::Xbox | GlyphStyle::Auto => [
+                "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "View", "Menu", "LS", "RS", "↑",
+                "↓", "←", "→",
+            ][i],
+        }
+    }
+    /// The glyph's colour (RGB): face buttons in their family's colours,
+    /// the rest white.
+    pub fn color(self, style: GlyphStyle) -> [u8; 3] {
+        let face = match self {
+            Button::South => 0,
+            Button::East => 1,
+            Button::West => 2,
+            Button::North => 3,
+            _ => return [255, 255, 255],
+        };
+        match style {
+            GlyphStyle::PlayStation => [
+                [124, 178, 232],
+                [235, 110, 110],
+                [222, 145, 205],
+                [92, 205, 170],
+            ][face],
+            GlyphStyle::Nintendo => [255, 255, 255],
+            GlyphStyle::Xbox | GlyphStyle::Auto => [
+                [110, 200, 90],
+                [235, 90, 80],
+                [80, 150, 240],
+                [240, 200, 60],
+            ][face],
+        }
+    }
     /// The name in `horizon-controller.txt` and `horizon-ctl pad`.
     pub fn name(self) -> &'static str {
         match self {

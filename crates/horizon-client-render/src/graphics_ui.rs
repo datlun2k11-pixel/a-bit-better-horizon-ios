@@ -798,7 +798,7 @@ impl H {
                 n => (n as f32 - 150.0) / 1850.0,
             }),
             H::HdrBlackLevel => Some(g.hdr_black_level as f32 / 100.0),
-            H::HdrUiBrightness => Some((g.hdr_ui_brightness as f32 - 25.0) / 75.0),
+            H::HdrUiBrightness => Some((g.hdr_ui_brightness() as f32 - 25.0) / 75.0),
             _ => None,
         }
     }
@@ -835,7 +835,7 @@ impl H {
             // the saved value waits.
             H::GpuCulling => labelled(
                 "GPU Culling",
-                on_off(g.gpu_culling && crate::graphics::gpu_culling_offer().reason().is_none()),
+                on_off(g.gpu_culling_on() && crate::graphics::gpu_culling_offer().reason().is_none()),
             ),
             H::EntityCulling => labelled("Entity Culling", g.entity_culling.label()),
             H::EntityCullingPrecheck => labelled(
@@ -902,7 +902,7 @@ impl H {
                 labelled("Screenshot Quality", format!("{}x", g.screenshot_quality))
             }
             H::FrameGeneration => labelled("Frame Generation", g.frame_generation.label()),
-            H::Hdr => labelled("HDR", on_off(g.hdr)),
+            H::Hdr => labelled("HDR", on_off(g.hdr_on())),
             H::HdrCalibrate => Text::literal(lang::get(match setup(s) {
                 Setup::Unknown => "Calibrate...",
                 Setup::Automatic => "Calibrate Anyway...",
@@ -911,12 +911,12 @@ impl H {
             H::HdrPaperWhite => match g.hdr_paper_white {
                 0 => labelled(
                     "Paper White",
-                    lang::tr("Auto (%s)", &[&g.paper_white_nits()]),
+                    lang::tr("Auto (%s)", &[&g.paper_white_nits(crate::graphics::reported())]),
                 ),
                 n => labelled("Paper White", n.to_string()),
             },
             H::HdrPeak => match g.hdr_peak {
-                0 => labelled("Peak Brightness", lang::tr("Auto (%s)", &[&g.peak_nits()])),
+                0 => labelled("Peak Brightness", lang::tr("Auto (%s)", &[&g.peak_nits(crate::graphics::reported())])),
                 n => labelled("Peak Brightness", n.to_string()),
             },
             H::HdrBlackLevel => match g.hdr_black_level {
@@ -926,7 +926,7 @@ impl H {
                 ),
                 n => labelled("Black Level", format!("{:.2}", n as f32 / 100.0)),
             },
-            H::HdrUiBrightness => labelled_percent("UI Brightness", g.hdr_ui_brightness),
+            H::HdrUiBrightness => labelled_percent("UI Brightness", g.hdr_ui_brightness()),
             H::HdrLighting => labelled("HDR Lighting", on_off(g.hdr_lighting)),
             H::HdrKey => {
                 Text::translate("Shortcut: %s", &[crate::keybinds::display_name(&g.hdr_key)])
@@ -979,7 +979,9 @@ impl H {
                 }
             }
             H::HdrBlackLevel => g.hdr_black_level = (v * 100.0).round() as u32,
-            H::HdrUiBrightness => g.hdr_ui_brightness = (25.0 + (v * 15.0).round() * 5.0) as u32,
+            H::HdrUiBrightness => {
+                g.set_hdr_ui_brightness((25.0 + (v * 15.0).round() * 5.0) as u32)
+            }
             _ => {}
         }
     }
@@ -1005,7 +1007,7 @@ impl H {
                 g.blue_map.radius = step(&BLUE_MAP_RADII, g.blue_map.radius_chunks(), back)
             }
             H::CaveCulling => g.cave_culling = !g.cave_culling,
-            H::GpuCulling => g.gpu_culling = !g.gpu_culling,
+            H::GpuCulling => g.toggle_gpu_culling(),
             H::EntityCulling => {
                 g.entity_culling = step(&EntityCullingMode::ALL, g.entity_culling, back)
             }
@@ -1056,7 +1058,7 @@ impl H {
             H::FrameGeneration => {
                 g.frame_generation = step(&FrameGeneration::ALL, g.frame_generation, back)
             }
-            H::Hdr => g.hdr = !g.hdr,
+            H::Hdr => g.set_hdr_on(!g.hdr_on()),
             H::HdrLighting => g.hdr_lighting = !g.hdr_lighting,
             H::BatteryMode => g.battery = !g.battery,
             H::ShadowCache => g.shadow_cache = !g.shadow_cache,
@@ -1127,7 +1129,7 @@ impl Item {
                 | H::HdrUiBrightness
                 | H::HdrLighting
                 | H::HdrSmoothGradients,
-            ) if !s.horizon.hdr => Some("Turn HDR on to use it."),
+            ) if !s.horizon.hdr_on() => Some("Turn HDR on to use it."),
             Item::Horizon(H::TranslucentBatching)
                 if !crate::graphics::translucent_batching_offered() =>
             {
@@ -1162,7 +1164,7 @@ impl Item {
             Item::Horizon(H::BlueMapAutoDetect) => g.blue_map.auto_detect,
             Item::Horizon(H::CaveCulling) => g.cave_culling,
             Item::Horizon(H::GpuCulling) => {
-                g.gpu_culling && crate::graphics::gpu_culling_offer().reason().is_none()
+                g.gpu_culling_on() && crate::graphics::gpu_culling_offer().reason().is_none()
             }
             Item::Horizon(H::CacheShulkerBoxes) => g.cache_shulker_boxes,
             Item::Horizon(H::CacheSigns) => g.cache_signs,
@@ -1176,7 +1178,7 @@ impl Item {
             Item::Horizon(H::Weather) => g.weather,
             Item::Horizon(H::AnimatedTextures) => g.animated_textures,
             Item::Horizon(H::DitherCutoutMips) => g.dither_cutout_mips,
-            Item::Horizon(H::Hdr) => g.hdr,
+            Item::Horizon(H::Hdr) => g.hdr_on(),
             Item::Horizon(H::HdrLighting) => g.hdr_lighting,
             Item::Horizon(H::BatteryMode) => g.battery,
             Item::Horizon(H::ShadowCache) => g.shadow_cache,
@@ -1665,6 +1667,7 @@ impl GraphicsUi {
             value: value.as_deref(),
             switch: item.switch(s),
             slider: item.slider(s),
+            key: matches!(item, Item::Horizon(H::HdrKey)).then_some(self.binding.is_some()),
             live: item.blocked(s).is_none(),
             hover,
             focused,
@@ -1691,13 +1694,14 @@ impl GraphicsUi {
             Some(setting) => {
                 let (name, _) = parts(setting.item, s, false);
                 let cost = lang::get(setting.cost.label());
-                let line = style::fit(atlas, &format!("{name} · {cost}"), w - 32.0);
+                let caption = format!("{name} · {cost}");
+                let line = style::fit(atlas, &caption, w - 32.0);
                 let line = Text::literal(line).with_color(setting.cost.rgb());
                 let square = [left, y + 10.0, 4.0, 4.0];
                 style::fill(batch, atlas, square, style::cost_color(setting.cost));
                 batch.text_styled(atlas, &line, left + 8.0, y + 8.0, style::WHITE, true);
                 match setting.item.blocked(s) {
-                    Some(why) => (lang::get(why), style::MUTED),
+                    Some(why) => (lang::get(why), style::muted()),
                     None => (
                         lang::get(description(setting.item, s, setting.text)),
                         style::GREY,
@@ -2366,7 +2370,7 @@ mod tests {
         let _offer = HDR_OFFER.lock().unwrap_or_else(|e| e.into_inner());
         crate::graphics::offer_hdr(true);
         let mut s = Settings::default();
-        s.horizon.hdr = true;
+        s.horizon.set_hdr_on(true);
         let item = Item::Horizon(H::HdrSmoothGradients);
         // Where the device can't, the saved On reads Off.
         crate::graphics::offer_smooth_gradients(false);
@@ -2382,7 +2386,7 @@ mod tests {
         assert_eq!(item.blocked(&s), None);
         assert_eq!(item.label(&s).plain(), "Smooth Gradients: On");
         assert_eq!(item.switch(&s), Some(true));
-        s.horizon.hdr = false;
+        s.horizon.set_hdr_on(false);
         assert_eq!(item.blocked(&s), Some("Turn HDR on to use it."));
     }
 
@@ -2402,11 +2406,11 @@ mod tests {
         let hdr = row(&mut ui, &s, Item::Horizon(H::Hdr));
         assert!(press(&mut ui, &mut s, at(hdr)).is_empty());
         // Not even with HDR saved on, from another computer: nor its sliders and calibration.
-        s.horizon.hdr = true;
+        s.horizon.set_hdr_on(true);
         for h in [H::Hdr, H::HdrCalibrate, H::HdrPeak, H::HdrPaperWhite] {
             assert!(Item::Horizon(h).blocked(&s).is_some(), "{h:?}");
         }
-        s.horizon.hdr = false;
+        s.horizon.set_hdr_on(false);
         crate::graphics::offer_hdr(true);
         let (tx, _) = Columns::of(SIZE.0, SIZE.1).track();
         let peak = row(&mut ui, &s, Item::Horizon(H::HdrPeak));
@@ -2417,7 +2421,7 @@ mod tests {
             press(&mut ui, &mut s, at(hdr)),
             [Action::ButtonClick, Action::Changed]
         );
-        assert!(s.horizon.hdr);
+        assert!(s.horizon.hdr_on());
         let peak = row(&mut ui, &s, Item::Horizon(H::HdrPeak));
         assert_eq!(
             press(&mut ui, &mut s, (tx + 2.0, peak[1] + 4.0)),
@@ -3085,7 +3089,7 @@ mod tests {
         let mut s = Settings::default();
         assert_eq!(item.switch(&s), Some(false));
         s.horizon.preset = Preset::Balanced;
-        s.horizon.gpu_culling = true;
+        s.horizon.gpu_culling = crate::graphics::GpuCullingMode::On;
         // Where it isn't offered, the saved On reads Off, and neither a click nor Enter after
         // it does anything.
         for offer in [
@@ -3107,7 +3111,7 @@ mod tests {
             ui.focus = Some(Target::Item(item));
             let enter = ui.key_modifiers(&mut s, K::Enter, None, false, SIZE, FB);
             assert!(enter.0.is_empty());
-            assert!(s.horizon.gpu_culling, "{offer:?}");
+            assert!(s.horizon.gpu_culling_on(), "{offer:?}");
         }
         // Where it is, a click switches it and keeps the preset.
         crate::graphics::offer_gpu_culling(GpuCullingOffer::Offered);
@@ -3120,14 +3124,18 @@ mod tests {
             press(&mut ui, &mut s, (r[0] + 4.0, r[1] + 4.0)),
             [Action::ButtonClick, Action::Changed]
         );
-        assert!(!s.horizon.gpu_culling);
+        assert!(!s.horizon.gpu_culling_on());
         assert_eq!(s.horizon.preset, Preset::Balanced);
         // No preset sets it.
         for on in [false, true] {
-            s.horizon.gpu_culling = on;
+            s.horizon.gpu_culling = if on {
+                crate::graphics::GpuCullingMode::On
+            } else {
+                crate::graphics::GpuCullingMode::Off
+            };
             for preset in Preset::ALL {
                 crate::graphics::apply_preset(preset, &mut s);
-                assert_eq!(s.horizon.gpu_culling, on, "{preset:?}");
+                assert_eq!(s.horizon.gpu_culling_on(), on, "{preset:?}");
             }
         }
     }
@@ -3239,8 +3247,8 @@ mod tests {
                 let pos = i as f32 / steps as f32;
                 let mut s1 = Settings::default();
                 let mut s2 = Settings::default();
-                s1.horizon.hdr = true;
-                s2.horizon.hdr = true;
+                s1.horizon.set_hdr_on(true);
+                s2.horizon.set_hdr_on(true);
                 h.set_slider(&mut s1, pos);
 
                 item.step_slider(&mut s1, true, 200.0);
@@ -3256,8 +3264,8 @@ mod tests {
                 let pos = i as f32 / steps as f32;
                 let mut s1 = Settings::default();
                 let mut s2 = Settings::default();
-                s1.horizon.hdr = true;
-                s2.horizon.hdr = true;
+                s1.horizon.set_hdr_on(true);
+                s2.horizon.set_hdr_on(true);
                 h.set_slider(&mut s1, pos);
 
                 item.step_slider(&mut s1, false, 200.0);
@@ -3280,7 +3288,7 @@ mod tests {
         let (_, missed) = lang::scoped(lang::Language::load(&[], "de_de"), || {
             for hdr in [false, true] {
                 let mut s = Settings::default();
-                s.horizon.hdr = hdr;
+                s.horizon.set_hdr_on(hdr);
                 s.horizon.taa = true;
                 for _ in 0..8 {
                     for (page, groups) in rows() {

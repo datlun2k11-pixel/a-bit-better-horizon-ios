@@ -29,6 +29,8 @@ pub const FILE: &str = "horizon-graphics.txt";
 /// the next start, it means HDR output took the game down there: HDR output is held back on
 /// that driver ([`Graphics::hdr_failed_start`]), and the mode stays as the player chose it.
 pub const HDR_MARKER: &str = "horizon-hdr-pending";
+/// The name the options screen waits on to bind `Graphics::hdr_key`.
+pub const HDR_KEY: &str = "horizon.hdrSettings";
 /// The marker's text for a window whose HDR output starts on `driver`
 /// (`gfx::output::window_driver`).
 pub fn hdr_marker_text(driver: &str) -> String {
@@ -54,6 +56,45 @@ pub struct Reported {
     /// uses it, and the HDR page offers calibration.
     pub peak_guessed: bool,
 }
+
+static REPORTED: std::sync::Mutex<Option<Reported>> = std::sync::Mutex::new(None);
+/// Sets what the system reports (the options screens read it for HDR's setup).
+pub fn report(reported: Option<Reported>) {
+    *REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = reported;
+}
+/// What the system reports, if it does.
+pub fn reported() -> Option<Reported> {
+    *REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+static HDR_OFFERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the display path offers HDR output (HDR10 or scRGB): set from the renderer's
+/// output; the settings open HDR's rows only then.
+pub fn offer_hdr(on: bool) {
+    HDR_OFFERED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn hdr_offered() -> bool {
+    HDR_OFFERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+static SMOOTH_GRADIENTS_OFFERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Whether the device can draw, blend and filter the 16-bit frame: set from the renderer's
+/// output; the settings grey its switch out where it can't.
+pub fn offer_smooth_gradients(on: bool) {
+    SMOOTH_GRADIENTS_OFFERED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn smooth_gradients_offered() -> bool {
+    SMOOTH_GRADIENTS_OFFERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// The farthest LOD Distance the options offer, in chunks: every iOS GPU is a phone's or
+/// tablet's, without a Mac's headroom for far terrain.
+#[cfg(target_os = "ios")]
+pub const LOD_DISTANCE_CAP: u32 = 128;
+#[cfg(not(target_os = "ios"))]
+pub const LOD_DISTANCE_CAP: u32 = 1024;
 
 /// Whether HDR is set up for the display, and whether the player kept the system's setup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -872,6 +913,8 @@ pub struct Graphics {
     /// HDR Lighting: Horizon's own HDR look, light sources, the sun and sunlight above paper
     /// white. Off, HDR output shows the same picture as SDR, for shader packs or the vanilla look.
     pub hdr_lighting: bool,
+    /// A vanilla key name (`HDR_KEY`): opens HDR's settings from the game. Unbound by default.
+    pub hdr_key: String,
     /// The graphics driver whose last start ended before HDR output showed a frame (the
     /// marker found, [`HDR_MARKER`]): a window on it stays SDR whatever the mode, until the
     /// mode is changed or the window starts on another driver ([`Graphics::hdr_held`]).
@@ -953,6 +996,7 @@ impl Default for Graphics {
             hdr_black_level: 0,
             hdr_ui_nits: 0,
             hdr_lighting: true,
+            hdr_key: "key.keyboard.unknown".into(),
             hdr_failed_start: None,
             battery: false,
             shadow_cache: false,
@@ -1125,6 +1169,7 @@ impl Graphics {
                 "frameGeneration" => g.frame_generation = FrameGeneration::parse(value),
                 "hdr" => g.hdr = HdrMode::parse(value, g.hdr),
                 "hdrLighting" => g.hdr_lighting = flag(g.hdr_lighting),
+                "hdrKey" if value.starts_with("key.") => g.hdr_key = value.to_owned(),
                 "hdrPaperWhite" => g.hdr_paper_white = nits_setting(number(g.hdr_paper_white)),
                 "hdrUiNits" => ui_nits = value.parse().ok().map(nits_setting),
                 "hdrUiBrightness" => ui_share = value.parse::<u32>().ok(),
@@ -1165,7 +1210,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nopaqueIce:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscalingSharpness:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiNits:{}\nhdrLighting:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nopaqueIce:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscalingSharpness:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiNits:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -1214,6 +1259,7 @@ impl Graphics {
             self.hdr_black_level,
             self.hdr_ui_nits,
             bool_text(self.hdr_lighting),
+            self.hdr_key,
             bool_text(self.battery),
             bool_text(self.shadow_cache),
             self.api.name(),
@@ -1230,6 +1276,48 @@ impl Graphics {
     }
     pub fn save(&self, dir: &Path) {
         let _ = fs::write(dir.join(FILE), self.serialize());
+    }
+    /// HDR output's switch in the settings UI: on for any mode but Off.
+    pub fn hdr_on(&self) -> bool {
+        self.hdr != HdrMode::Off
+    }
+    pub fn set_hdr_on(&mut self, on: bool) {
+        self.hdr = if on { HdrMode::On } else { HdrMode::Off };
+    }
+    /// GPU Culling's switch in the settings UI: on for any mode but Off.
+    pub fn gpu_culling_on(&self) -> bool {
+        self.gpu_culling != GpuCullingMode::Off
+    }
+    pub fn toggle_gpu_culling(&mut self) {
+        self.gpu_culling = if self.gpu_culling == GpuCullingMode::Off {
+            GpuCullingMode::On
+        } else {
+            GpuCullingMode::Off
+        };
+    }
+    /// UI Brightness, as the share of Paper White the settings UI shows: 100 when Auto.
+    pub fn hdr_ui_brightness(&self) -> u32 {
+        let paper = self.paper_white_nits(None).max(1);
+        if self.hdr_ui_nits == 0 {
+            100
+        } else {
+            (self.hdr_ui_nits.saturating_mul(100) / paper).clamp(25, 100)
+        }
+    }
+    pub fn set_hdr_ui_brightness(&mut self, percent: u32) {
+        let paper = self.paper_white_nits(None);
+        self.hdr_ui_nits = match percent {
+            p if p >= 100 => 0,
+            p => paper.saturating_mul(p) / 100,
+        };
+    }
+    /// Binds Horizon's graphics key `name` (`HDR_KEY`); false for another name.
+    pub fn set_key(&mut self, name: &str, value: String) -> bool {
+        match name {
+            HDR_KEY => self.hdr_key = value,
+            _ => return false,
+        }
+        true
     }
     /// Paper white, in nits: the player's, or on Auto the desktop's SDR white as the
     /// system `reported` it for the renderer's display, else 203 (BT.2408's reference white).
@@ -1554,6 +1642,7 @@ mod tests {
     fn round_trips() {
         let g = Graphics {
             preset: Preset::Balanced,
+            hdr_key: "key.keyboard.unknown".into(),
             lod_distance: 256,
             far_detail: FarDetail::Reduced,
             blue_map: crate::bluemap::Settings {

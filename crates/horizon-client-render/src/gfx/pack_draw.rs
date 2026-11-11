@@ -16,6 +16,8 @@ pub struct EntitySpan {
     pub stage: u32,
     /// `entityId` for entities, `blockEntityId` for block entities (5.3), else 0.
     pub id: i32,
+    /// `currentRenderedItemId` for the actual item or armor in this run; 0 otherwise.
+    pub item_id: i32,
     /// An entity part that blends (a name tag, a shadow): `gbuffers_entities_translucent`.
     pub translucent: bool,
     /// Hidden from the camera (Horizon's entity culling, the player in first person): only the
@@ -28,6 +30,31 @@ pub struct EntitySpan {
 }
 
 impl EntitySpan {
+    /// Adds an item subrange after its vertices were emitted. Preserve all parent
+    /// entity/shadow flags, and restore the parent at the end so IDs cannot leak.
+    pub fn item_range(spans: &mut Vec<Self>, start: usize, end: usize, item_id: i32) {
+        if end <= start {
+            return;
+        }
+        let parent = spans
+            .iter()
+            .rfind(|span| span.start as usize <= start)
+            .copied()
+            .unwrap_or_default();
+        let item = Self {
+            start: start as u32,
+            item_id,
+            ..parent
+        };
+        // Keep even a zero-length parent marker: culling can then remove the
+        // item's vertices without losing the enclosing entity's identity.
+        spans.push(item);
+        spans.push(Self {
+            start: end as u32,
+            ..parent
+        });
+    }
+
     /// Marks vertices `start..end` of `spans`' list (one entity) as hidden: the span covering
     /// `start` is split there, the spans inside are hidden, and the geometry after `end` goes
     /// on in the last span's kind. False when no span covers `start`.

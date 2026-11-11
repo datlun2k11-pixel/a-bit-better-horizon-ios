@@ -16,6 +16,14 @@ use crate::{
     ui,
 };
 
+/// Whether Horizon's own pages and the Mods page show (`docs/forking.md`). An executable built
+/// without the `horizon-extras` feature clears it before the game starts.
+pub static HORIZON_EXTRAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn horizon_extras() -> bool {
+    HORIZON_EXTRAS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn tr(key: &str) -> Text {
     Text::translate(key, &[])
 }
@@ -366,6 +374,15 @@ impl Opt {
             Opt::SharePresence => "options.sharePresence",
             Opt::DirectionalAudio => "options.directionalAudio",
             Opt::MusicToast => "options.musicToast",
+            Opt::PadPlayInBackground => "horizon.options.play_in_background",
+            Opt::PadCraftOnServers => "horizon.options.craft_on_servers",
+            Opt::PadNintendoButtons => "horizon.options.nintendo_buttons",
+            Opt::PadGameplayGuide => "horizon.options.gameplay_guide",
+            Opt::PadRadialMode => "horizon.options.radial_mode",
+            Opt::PadRadialStick => "horizon.options.radial_stick",
+            // A registered page's row: this screen draws none (its own pages module is not
+            // built here).
+            Opt::Page(..) => "",
         }
     }
     pub(crate) fn kind(self, s: &Settings) -> Kind {
@@ -1389,12 +1406,16 @@ pub enum Page {
     ModBrowser,
     /// One registry project's page: `OptionsUi::mod_project`.
     ModProject,
+    /// A page a crate registered (`horizon_hooks::pages`): its index in `OptionsUi::pages`.
+    Added(usize),
     /// A native mod's settings page: its index in `mods.installed`.
     NativeMod(usize),
     /// Horizon's shader packs, either kind (`shader_pack_list`).
     ShaderPacks,
     /// The picked pack's options: the shader screen (`shader_ui`) at the pack's main screen.
     ShaderOptions,
+    /// The selected resource packs' Polytone options (`pack_options_ui`), from the pack screen.
+    PackOptions,
     /// Horizon's graphics settings (`graphics_ui`).
     Graphics,
     GraphicsAdvanced,
@@ -1404,6 +1425,10 @@ pub enum Page {
     /// Horizon's controller settings and button binds.
     Controller,
     PadBinds,
+    /// The radial menu's pages (`radial_editor`), a page's name, and a slot's action list.
+    ControllerRadial,
+    ControllerRadialName,
+    ControllerRadialPick,
     /// Horizon's touch overlay: its buttons, size, opacity, and where they sit.
     Touch,
     /// The touch overlay's drag-and-drop editor.
@@ -1618,6 +1643,12 @@ fn matches_focus(id: &FocusId, i: usize, wd: &Widget) -> bool {
 /// What the game must do after an interaction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    /// The Pack Options page closed with changes: the player's choices of its entries, the
+    /// ones that differ from their defaults (the others went back to theirs).
+    PackOptions {
+        entries: Vec<String>,
+        chosen: std::collections::BTreeMap<String, horizon_polytone::pack::ConfigValue>,
+    },
     /// An accepted button press or the release of a slider.
     ButtonClick,
     /// Horizon's own: download the Modrinth hit at this index of the pack
@@ -1689,6 +1720,8 @@ pub enum Event {
     PlayMusicTrack(String, String),
     /// Open the recordings folder in the system file browser.
     OpenStudioFolder,
+    /// A recording was picked in Studio: open it.
+    OpenStudioReplay(std::path::PathBuf),
 }
 /// A row of the Music page: the track, and the pool it is played from.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1766,6 +1799,9 @@ pub struct OptionsUi {
     pub selected_pad_action: Option<&'static str>,
     /// The glyphs the binds list shows (the setting, else the pad's family).
     pub pad_style: GlyphStyle,
+    /// The output of the renderer the options are drawn for, as of the last draw (`draw`'s
+    /// `output`): the HDR calibration and graphics rows read it.
+    pub output: crate::gfx::EffectiveOutput,
     /// The pad goes by its letters (`PadSettings::nintendo_letters`) and the glyphs are
     /// Nintendo's: each part shows the letter of the button playing it.
     pub pad_by_letter: bool,
@@ -1814,11 +1850,17 @@ pub struct OptionsUi {
     pub graphics: crate::graphics_ui::GraphicsUi,
     pub controller: crate::controller_ui::ControllerUi,
     pub shader: crate::shader_ui::ShaderUi,
+    /// The glyphs menus show (`Glyphs::of`: the setting, else the pad's family). The game sets
+    /// it each frame.
+    pub pad_glyphs: crate::pad_glyph::Glyphs,
+    /// The selected packs' Polytone config entries by pack id (the game fills them beside
+    /// `pack_infos`).
+    pub pack_configs: std::collections::BTreeMap<String, horizon_polytone::pack::Configs>,
     pub split_profiles: crate::split_profiles::SplitProfiles,
     /// HDR calibration while its page is open.
     pub calibration: Option<crate::hdr_calibration::Calibration>,
-    /// Whether the window was fullscreen before calibration made it so (the game keeps it).
-    pub calibration_fullscreen: Option<bool>,
+    /// The window as calibration found it before making it fullscreen (the game keeps it).
+    pub calibration_window: Option<crate::hdr_calibration::WindowState>,
     pub split_setup: crate::split_ui::SplitUi,
     pub studio: crate::studio_ui::StudioUi,
     /// The AI Agent page's status lines (set by the game while it shows).
@@ -1881,6 +1923,7 @@ impl Default for OptionsUi {
             selected_native_key: None,
             selected_pad_action: None,
             pad_style: GlyphStyle::Xbox,
+            output: crate::gfx::EffectiveOutput::NONE,
             pad_by_letter: false,
             pad_driving: false,
             languages: Vec::new(),
@@ -1907,9 +1950,11 @@ impl Default for OptionsUi {
             graphics: Default::default(),
             controller: Default::default(),
             shader: Default::default(),
+            pad_glyphs: Default::default(),
+            pack_configs: Default::default(),
             split_profiles: Default::default(),
             calibration: None,
-            calibration_fullscreen: None,
+            calibration_window: None,
             split_setup: Default::default(),
             studio: Default::default(),
             agent_status: Vec::new(),
@@ -2480,7 +2525,8 @@ impl OptionsUi {
                 Action::SliderDrag => events.push(Event::SliderDrag),
                 Action::BindKey(name) => self.selected_key = Some(name),
                 Action::Calibrate => {
-                    self.calibration = Some(crate::hdr_calibration::Calibration::new(s));
+                    self.calibration =
+                        Some(crate::hdr_calibration::Calibration::new(s, &self.output));
                     self.push(Page::HdrCalibration);
                 }
                 // The Shaders page's Shader Packs...: the list of either kind, as the page
@@ -2556,6 +2602,35 @@ impl OptionsUi {
         }
     }
     /// Where the controller screen opens for `page`, if it is one of its pages.
+    /// Who and what Controller Settings is about: the game sets it before each draw.
+    pub fn set_controller_context(&mut self, context: crate::controller_ui::Context) {
+        self.controller.context = context;
+    }
+
+    /// The clicks until it is set back are a controller's Left or Right on a row: a choice of a
+    /// settings page steps, rather than opens. This screen's rows step on a click already.
+    pub fn pad_clicks_step(&mut self, _on: bool) {}
+
+    /// Where the open settings page asked the focus to open (a radial slot's list, on the slot's
+    /// action), for a controller's focus to land there.
+    pub fn shell_opened_focus(&self) -> Option<[f32; 4]> {
+        None
+    }
+
+    /// The controller's focus landed there.
+    pub fn clear_shell_opened_focus(&mut self) {}
+
+    /// Where a row the focus lands on would have to move to be all in view: this screen's rows
+    /// are all drawn, so nothing moves.
+    pub fn reveal(
+        &mut self,
+        _s: &Settings,
+        _size: (f32, f32),
+        _rect: [f32; 4],
+    ) -> Option<f32> {
+        None
+    }
+
     fn controller_page(page: Page) -> Option<crate::controller_ui::Page> {
         match page {
             Page::Controller => Some(crate::controller_ui::Page::General),
@@ -2600,13 +2675,19 @@ impl OptionsUi {
             Page::ModBrowser => "horizon.mods.browse.title",
             Page::ModProject => "horizon.mods.browse.project",
             Page::NativeMod(_) => "Mod Settings",
+            // A registered page's title comes with its rows; this screen draws none.
+            Page::Added(_) => "horizon.pages.settings",
             Page::ShaderPacks => "horizon.pages.shader_packs",
             Page::ShaderOptions => "horizon.pages.shader_options",
+            Page::PackOptions => "horizon.pack.options.title",
             Page::Graphics | Page::GraphicsAdvanced | Page::GraphicsHdr | Page::HdrCalibration => {
                 "options.videoTitle"
             }
             Page::Controller => "horizon.pages.controller",
             Page::PadBinds => "horizon.pages.controller_binds",
+            Page::ControllerRadial => "horizon.pages.controller_radial",
+            Page::ControllerRadialName => "horizon.radial.name_title",
+            Page::ControllerRadialPick => "horizon.radial.pick_title",
             Page::Touch | Page::TouchLayout => "Touch Controls",
             Page::TouchLayouts => "Touch Layouts",
             Page::TouchOptions(_) | Page::TouchStyle(_) => "Button Options",
@@ -3048,12 +3129,12 @@ impl OptionsUi {
                     ),
                     // No AI hides the AI Agent page and everything AI.
                     Row::Buttons(
-                        self.extra_button(s, crate::extras::Item::DiscordPresence),
-                        Some(if s.extras.no_ai {
+                        if s.extras.no_ai {
                             self.extra_button(s, crate::extras::Item::NoAi)
                         } else {
                             open("horizon.pages.open.agent", Page::Agent)
-                        }),
+                        },
+                        None,
                     ),
                 ]
                 .into_iter()
@@ -4376,10 +4457,17 @@ impl OptionsUi {
     pub fn draw(
         &mut self,
         s: &Settings,
+        output: crate::gfx::EffectiveOutput,
         batch: &mut HudBatch,
         atlas: &HudAtlas,
         cursor: (f32, f32),
     ) {
+        self.output = output;
+        // The graphics rows' availability hints read the crate's offer flags: keep them in
+        // step with the output this screen draws for.
+        crate::graphics::report(output.reported());
+        crate::graphics::offer_hdr(output.hdr_offered());
+        crate::graphics::offer_smooth_gradients(output.smooth_gradients_offered());
         let (w, h) = (batch.width, batch.height);
         if let Some(error) = &self.resource_error {
             ui::menu_background(batch, atlas, 0.0, 0.0, w, h, self.in_world);
@@ -4462,7 +4550,13 @@ impl OptionsUi {
         }
         if self.page() == Page::SplitProfiles {
             self.split_profiles
-                .draw(batch, atlas, cursor, self.in_world, self.pad_style);
+                .draw(
+                    batch,
+                    atlas,
+                    cursor,
+                    self.in_world,
+                    crate::pad_glyph::Glyphs::of(&s.controller, self.pad_style),
+                );
             return;
         }
         if self.page() == Page::Studio {
@@ -4937,6 +5031,9 @@ impl OptionsUi {
                 StudioAction::None => Vec::new(),
                 StudioAction::Refresh => vec![Event::ButtonClick],
                 StudioAction::OpenFolder => vec![Event::ButtonClick, Event::OpenStudioFolder],
+                StudioAction::OpenReplay(path) => {
+                    vec![Event::ButtonClick, Event::OpenStudioReplay(path)]
+                }
                 StudioAction::Back => {
                     let mut events = vec![Event::ButtonClick];
                     events.extend(self.back(s));
@@ -4950,7 +5047,7 @@ impl OptionsUi {
             if right {
                 return Vec::new();
             }
-            let outcome = c.click((x, y), size, drag);
+            let outcome = c.click(&atlas.font, (x, y), size, drag);
             return self.calibration_outcome(s, outcome);
         }
         if Self::graphics_page(self.page()).is_some() {
@@ -5010,6 +5107,8 @@ impl OptionsUi {
                 crate::pack_screen::Action::BrowsePick(i) => {
                     events.push(Event::DownloadPack(i));
                 }
+                // Polytone pack options are not part of this options screen.
+                crate::pack_screen::Action::Options(_) => {}
                 crate::pack_screen::Action::None => {}
             }
             return events;
@@ -5728,11 +5827,15 @@ impl OptionsUi {
     }
     /// HDR calibration's test picture, while its page is open: the step, its nits and
     /// where the controls start (a share of the height `h`).
-    pub fn calibration_picture(&self, h: f32) -> Option<(crate::hdr_calibration::Step, f32, f32)> {
+    pub fn calibration_picture(
+        &self,
+        font: &crate::font::Font,
+        size: (f32, f32),
+    ) -> Option<(crate::hdr_calibration::Step, f32, f32)> {
         self.calibration
             .as_ref()
             .filter(|_| self.page() == Page::HdrCalibration)
-            .map(|c| c.picture(h))
+            .map(|c| c.picture(font, size))
     }
     pub fn back(&mut self, s: &mut Settings) -> Vec<Event> {
         // The editor's popup closes first, before the page under it.
@@ -6886,7 +6989,7 @@ mod tests {
             Instant::now() - std::time::Duration::from_secs(1),
         ));
         let mut batch = HudBatch::new([480, 480]);
-        ui.draw(&s, &mut batch, &atlas, (px, py));
+        ui.draw(&s, crate::gfx::EffectiveOutput::NONE, &mut batch, &atlas, (px, py));
         assert_eq!(ui.touch_popup, Some(Control::Custom(id)));
         assert!(ui.dragging_touch.is_none());
         // Options opens the button's page.
@@ -6973,7 +7076,7 @@ mod tests {
             Instant::now() - std::time::Duration::from_secs(1),
         ));
         let mut batch = HudBatch::new([480, 480]);
-        ui.draw(&s, &mut batch, &atlas, (px, py));
+        ui.draw(&s, crate::gfx::EffectiveOutput::NONE, &mut batch, &atlas, (px, py));
         assert_eq!(ui.touch_popup, Some(Control::Chat));
         let (widgets, _, _, _) = ui.layout(&s, size.0, size.1);
         let (_, entries) = ui.touch_popup_layout(&s, &widgets, size).unwrap();
@@ -8240,6 +8343,7 @@ mod tests {
         let mut on = HudBatch::new([480, 480]);
         ui.draw(
             &s,
+            crate::gfx::EffectiveOutput::NONE,
             &mut on,
             &atlas,
             (extra.x + extra.w / 2.0, extra.y + extra.h / 2.0),
@@ -8252,6 +8356,7 @@ mod tests {
         let mut off = HudBatch::new([480, 480]);
         ui.draw(
             &s,
+            crate::gfx::EffectiveOutput::NONE,
             &mut off,
             &atlas,
             (extra.x + extra.w + 40.0, extra.y + extra.h + 40.0),
@@ -8502,7 +8607,7 @@ mod tests {
                 .unwrap();
             let cursor = (option.x + 1.0, option.y + 1.0);
             let mut actual = HudBatch::new([480, 480]);
-            ui.draw(&s, &mut actual, &atlas, cursor);
+            ui.draw(&s, crate::gfx::EffectiveOutput::NONE, &mut actual, &atlas, cursor);
             let key = format!("options.inactivityFpsLimit.{mode}.tooltip");
             assert!(lang::has(&key));
             let mut expected = HudBatch::new([480, 480]);
@@ -9091,7 +9196,13 @@ mod tests {
         ui.show(Page::Language);
         let draw_hint = |ui: &mut OptionsUi| {
             let mut batch = HudBatch::new([960, 640]);
-            ui.draw(&settings, &mut batch, &atlas, (-1.0, -1.0));
+            ui.draw(
+                &settings,
+                crate::gfx::EffectiveOutput::NONE,
+                &mut batch,
+                &atlas,
+                (-1.0, -1.0),
+            );
             let search = &ui.language_search;
             batch.vertices.iter().any(|v| {
                 v.color == rgba(170, 170, 170, 255)
@@ -9197,7 +9308,13 @@ mod tests {
             let row_y = if above { top - 5.0 } else { bottom - 16.0 };
             ui.scroll = row.y - row_y;
             let (x, width, height) = (row.x, row.w, row.h);
-            ui.draw(&s, &mut batch, &atlas, (-1.0, -1.0));
+            ui.draw(
+                &s,
+                crate::gfx::EffectiveOutput::NONE,
+                &mut batch,
+                &atlas,
+                (-1.0, -1.0),
+            );
             let vertices: Vec<_> = batch
                 .vertices
                 .iter()

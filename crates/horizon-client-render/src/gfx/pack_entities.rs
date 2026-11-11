@@ -125,6 +125,7 @@ pub fn inputs() -> horizon_shaders::GbuffersInputs {
             op: ">",
             reference: 0.1,
         }),
+        terrain_lighting: None,
         item_id_declared: false,
         far_depth: false,
         // Entities, items and block entities read the shared atlas: its own maps (paged_maps.rs).
@@ -192,6 +193,7 @@ pub fn cloud_inputs() -> horizon_shaders::GbuffersInputs {
             .collect(),
         after: String::new(),
         alpha_test: None,
+        terrain_lighting: None,
         item_id_declared: false,
         far_depth: false,
         paged_maps: false,
@@ -676,7 +678,7 @@ impl PackEntities {
         bytes[0..4].copy_from_slice(&(span.stage as i32).to_le_bytes());
         bytes[4..8].copy_from_slice(&entity_id.to_le_bytes());
         bytes[8..12].copy_from_slice(&block_id.to_le_bytes());
-        bytes[12..16].copy_from_slice(&span.item_id.to_le_bytes());
+        bytes[12..16].copy_from_slice(&0i32.to_le_bytes());
         // The overlay: the layer's low 16 bits (HDR output's tier rides in the high ones).
         for (i, c) in entity_color(overlay & 0xffff).iter().enumerate() {
             bytes[16 + 4 * i..20 + 4 * i].copy_from_slice(&c.to_le_bytes());

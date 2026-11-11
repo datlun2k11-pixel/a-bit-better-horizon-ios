@@ -55,6 +55,29 @@ impl Entry {
         true
     }
 
+    /// The option `i` one step on (`back`: one before), stopping at its ends: whether it
+    /// changed.
+    pub fn nudge_option(&mut self, i: usize, back: bool) -> bool {
+        let (Some(o), Some(v)) = (self.options.get(i), self.values.get_mut(i)) else {
+            return false;
+        };
+        let dir = if back { -1.0 } else { 1.0 };
+        let new = match &o.kind {
+            OptionKind::Float { min, max, step, .. } => {
+                let (min, max, step) = (f64::from(*min), f64::from(*max), f64::from(*step));
+                let n = ((*v - min) / step).round() + dir;
+                on_f32((min + n * step).clamp(min, max))
+            }
+            OptionKind::Int { min, max, .. } => {
+                (v.round() + dir).clamp(f64::from(*min), f64::from(*max))
+            }
+            _ => return false,
+        };
+        let changed = new != *v;
+        *v = new;
+        changed
+    }
+
     /// Where option `i` sits on its slider, 0 to 1: float and int options are sliders.
     pub fn slider_position(&self, i: usize) -> Option<f32> {
         slider_position(&self.options.get(i)?.kind, *self.values.get(i)?)

@@ -249,11 +249,8 @@ pub struct Context {
     pub device: Option<Device>,
     /// The glyph family of `device`, before the player's choice.
     pub detected: GlyphStyle,
-    /// The family menus show.
-    pub style: GlyphStyle,
-    /// The pad goes by its letters (`PadSettings::nintendo_letters`) and the glyphs are
-    /// Nintendo's: each part shows the letter of the button playing it.
-    pub by_letter: bool,
+    /// The glyphs menus show, letter mode included.
+    pub glyphs: crate::pad_glyph::Glyphs,
 }
 
 fn glyphs_name(style: GlyphStyle) -> String {
@@ -395,7 +392,7 @@ impl ControllerUi {
     }
     /// The button a binding reads as on this pad.
     fn shown(&self, b: Button) -> Button {
-        if self.context.by_letter {
+        if self.context.glyphs.letters() {
             b.by_letter()
         } else {
             b
@@ -408,7 +405,10 @@ impl ControllerUi {
             Item::Bind(action) => {
                 let name = lang::get(gamepad::action_caption(action));
                 let value = match s.controller.binding(action) {
-                    Some(b) => self.shown(b).label(self.context.style).to_owned(),
+                    Some(b) => self
+                        .shown(b)
+                        .label(self.context.glyphs.family())
+                        .to_owned(),
                     None => lang::get("key.keyboard.unknown"),
                 };
                 let value = if self.binding == Some(action) {
@@ -441,7 +441,7 @@ impl ControllerUi {
                         },
                     ),
                     Info::Detected => ("Detected glyphs", glyphs_name(c.detected)),
-                    Info::Using => ("Glyphs in use", glyphs_name(c.style)),
+                    Info::Using => ("Glyphs in use", glyphs_name(c.glyphs.family())),
                 };
                 (lang::get(name), Some(value))
             }
@@ -604,6 +604,7 @@ impl ControllerUi {
                             hover,
                             focused,
                             held: self.dragging == Some(item),
+                            key: None,
                         };
                         shell::row(batch, atlas, &cols, y, &view);
                     }
@@ -657,7 +658,7 @@ impl ControllerUi {
             let rect = [x + 2.0, y + 2.0 + i as f32 * 10.0, w - 4.0, 8.0];
             crate::widgets::record(line, rect, false);
             let line = Text::literal(style::fit(atlas, line, w - 4.0));
-            batch.text_styled(atlas, &line, rect[0], rect[1], style::MUTED, true);
+            batch.text_styled(atlas, &line, rect[0], rect[1], style::muted(), true);
         }
     }
     /// A binding's row: its name, its button, and a reset once it isn't the default.
@@ -683,7 +684,7 @@ impl ControllerUi {
         let value = value.unwrap_or_default();
         if hover || focused {
             let lit = [rect[0] + 2.0, y + 1.0, rect[2] - 4.0, style::ROW - 2.0];
-            style::fill(batch, atlas, lit, style::HOVER);
+            style::fill(batch, atlas, lit, style::hover());
         }
         let label = format!("{name}: {value}");
         crate::widgets::widget_cursor(hover, true);
@@ -709,7 +710,7 @@ impl ControllerUi {
                 Text::literal(value).with_color(crate::text::YELLOW)
             }
             Some(b) => {
-                let [r, g, bl] = self.shown(b).color(self.context.style);
+                let [r, g, bl] = self.shown(b).color(self.context.glyphs.family());
                 Text::literal(value)
                     .with_color(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(bl))
             }
@@ -772,7 +773,7 @@ impl ControllerUi {
         crate::widgets::target(rect);
         if hover || focused {
             let lit = [rect[0] + 2.0, y + 1.0, rect[2] - 4.0, style::ROW - 2.0];
-            style::fill(batch, atlas, lit, style::HOVER);
+            style::fill(batch, atlas, lit, style::hover());
         }
         let ty = y + ((style::ROW - 8.0) / 2.0).floor();
         let left = rect[0] + style::INSET;
@@ -781,7 +782,7 @@ impl ControllerUi {
         let room = rect[2] - 2.0 * style::INSET - name_w - 8.0;
         let value = style::fit(atlas, &value, room);
         let vx = rect[0] + rect[2] - style::INSET - atlas.font.width(&value);
-        batch.text_styled(atlas, &Text::literal(value), vx, ty, style::SOFT, true);
+        batch.text_styled(atlas, &Text::literal(value), vx, ty, style::soft(), true);
         if focused {
             style::ring(
                 batch,
@@ -822,7 +823,7 @@ impl ControllerUi {
             return lang::get(setting.text);
         };
         let pad = &s.controller;
-        let style = self.context.style;
+        let style = self.context.glyphs.family();
         if self.binding == Some(action) {
             return lang::tr(
                 "Press the button for this. %s cancels.",

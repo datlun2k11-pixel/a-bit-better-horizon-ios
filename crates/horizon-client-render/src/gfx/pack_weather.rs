@@ -44,6 +44,7 @@ pub fn inputs() -> horizon_shaders::GbuffersInputs {
             op: ">",
             reference: 0.1,
         }),
+        terrain_lighting: None,
         item_id_declared: false,
         far_depth: false,
         paged_maps: false,

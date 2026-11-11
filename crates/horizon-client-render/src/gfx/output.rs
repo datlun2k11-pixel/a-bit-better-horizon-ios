@@ -193,6 +193,14 @@ impl EffectiveOutput {
     pub fn hdr_on(&self) -> bool {
         self.encoding.is_some()
     }
+    /// What the system reports for this renderer's display, if it does.
+    pub fn reported(&self) -> Option<Reported> {
+        self.reported
+    }
+    /// Whether the device draws, blends and filters the 16-bit frame (Smooth Gradients).
+    pub fn smooth_gradients_offered(&self) -> bool {
+        self.wide_frame_supported
+    }
     /// Whether `mode` asks for HDR here: On always, Auto where the destination offers it and
     /// the display reports HDR, neither while HDR output is held back. The output still needs
     /// an offer and a frame that can take it.
