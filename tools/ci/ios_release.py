@@ -20,26 +20,23 @@ OTHER_MACHO = {b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
                b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
 
 
-# Run 88 was the first release in this sequence. Retries change only the build.
-BASE_RUN = 88
-BASE_PATCH = 44
-
-
-def release_version(run, attempt):
-    if not re.fullmatch(r"[1-9][0-9]*", str(run)) or not re.fullmatch(r"[1-9][0-9]*", str(attempt)):
-        raise ValueError("Invalid workflow run or attempt")
-    # Fresh forks have independent counters; keep their preview builds at the base.
-    patch = BASE_PATCH + max(0, int(run) - BASE_RUN)
-    return f"0.1.{patch}", f"{run}.{attempt}"
-
+# Run numbers make the build number, so a retry of the same run is distinguishable.
 
 def stamp_app(app, run, attempt, commit, client_id):
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Invalid source commit")
-    version, build = release_version(run, attempt)
+    if not all(isinstance(part, str) and re.fullmatch(r"[1-9][0-9]*", part)
+               for part in (run, attempt)):
+        raise ValueError("Invalid workflow run")
+    build = f"{run}.{attempt}"
     paths = [app / "Info.plist", *sorted((app / "Frameworks").glob("*.framework/Info.plist"))]
     # Read all metadata before changing any file.
     records = [(path, plistlib.loads(path.read_bytes())) for path in paths]
+    # The app names its own version (project.yml's MARKETING_VERSION); the stamp only adds which
+    # workflow run built this copy.
+    version = records[0][1].get("CFBundleShortVersionString")
+    if not isinstance(version, str) or not VERSION.fullmatch(version):
+        raise ValueError("The built app has no usable CFBundleShortVersionString")
     for path, info in records:
         info["CFBundleShortVersionString"] = version
         info["CFBundleVersion"] = build
@@ -172,9 +169,9 @@ def main():
     if not args.ipa:
         parser.error("an IPA or --stamp-app is required")
     if args.run_number or args.run_attempt:
-        expected = release_version(args.run_number, args.run_attempt)
-        if audit(args.ipa, args.expect_commit) != expected:
-            raise ValueError("IPA version does not match this workflow run")
+        _, build = audit(args.ipa, args.expect_commit)
+        if build != f"{args.run_number}.{args.run_attempt}":
+            raise ValueError("IPA build number does not match this workflow run")
     result = (prepare(args.ipa, args.output_dir, args.expect_commit) if args.output_dir
               else dict(zip(("version", "build"), audit(args.ipa, args.expect_commit))))
     for key, value in result.items():

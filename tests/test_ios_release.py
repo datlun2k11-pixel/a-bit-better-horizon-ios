@@ -33,14 +33,21 @@ class IOSReleaseTests(unittest.TestCase):
             for name, data in (extra or {}).items():
                 z.writestr(name, data)
 
-    def test_workflow_versions_advance_but_retry_marketing_version_stays(self):
-        for run, version in [(1, "0.1.44"), (88, "0.1.44"), (89, "0.1.45"),
-                             (90, "0.1.46"), (91, "0.1.47")]:
-            self.assertEqual(release.release_version(run, 1), (version, f"{run}.1"))
-            self.assertEqual(release.release_version(run, 2), (version, f"{run}.2"))
-        for run, attempt in [(0, 1), (88, 0), ("88\nkey=value", 1), ("x", 1)]:
-            with self.assertRaises(ValueError):
-                release.release_version(run, attempt)
+    def test_stamp_keeps_the_apps_version_and_takes_the_run_as_its_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Game.app"
+            app.mkdir()
+            plist = app / "Info.plist"
+            plist.write_bytes(plistlib.dumps({"CFBundleShortVersionString": "0.2.9"}))
+            for run, attempt in [("1", "1"), ("91", "2")]:
+                self.assertEqual(release.stamp_app(app, run, attempt, SHA, ""),
+                                 ("0.2.9", f"{run}.{attempt}"))
+            for run, attempt in [(0, 1), (88, 0), ("88\nkey=value", 1), ("x", 1)]:
+                with self.assertRaises(ValueError):
+                    release.stamp_app(app, run, attempt, SHA, "")
+            plist.write_bytes(plistlib.dumps({"CFBundleShortVersionString": "0.2.9\nkey=value"}))
+            with self.assertRaisesRegex(ValueError, "CFBundleShortVersionString"):
+                release.stamp_app(app, "91", "2", SHA, "")
 
     def test_stamp_updates_app_and_framework_preserving_other_fields(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -49,10 +56,12 @@ class IOSReleaseTests(unittest.TestCase):
             framework.mkdir(parents=True)
             for parent in (app, framework):
                 (parent / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "keep"}))
+            (app / "Info.plist").write_bytes(plistlib.dumps(
+                {"CFBundleIdentifier": "keep", "CFBundleShortVersionString": "0.2.9"}))
             release.stamp_app(app, "91", "2", SHA, "public-client")
             for parent in (app, framework):
                 info = plistlib.loads((parent / "Info.plist").read_bytes())
-                self.assertEqual(info["CFBundleShortVersionString"], "0.1.47")
+                self.assertEqual(info["CFBundleShortVersionString"], "0.2.9")
                 self.assertEqual(info["CFBundleVersion"], "91.2")
                 self.assertEqual(info["CFBundleIdentifier"], "keep")
             info = plistlib.loads((app / "Info.plist").read_bytes())

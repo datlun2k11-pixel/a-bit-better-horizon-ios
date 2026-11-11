@@ -256,8 +256,7 @@ class MobileForkWorkflowTests(unittest.TestCase):
             ipa = Path(directory) / "Horizon-game-unsigned.ipa"
             for contains_assets in (False, True):
                 extra = {"Payload/Horizon.app/horizon-resources.json": b"{}"} if contains_assets else {}
-                version, build = fixtures.release.release_version("88", "1")
                 fixtures.IOSReleaseTests().archive(ipa, extra,
-                    {"CFBundleShortVersionString": version, "CFBundleVersion": build})
+                    {"CFBundleShortVersionString": "0.2.9", "CFBundleVersion": "88.1"})
                 result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, not contains_assets, result.stderr)
