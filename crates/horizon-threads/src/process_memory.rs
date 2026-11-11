@@ -121,7 +121,7 @@ fn mach_resident_bytes() -> Option<u64> {
     windows,
     target_os = "linux",
     target_os = "android",
-    target_os = "macos"
+    target_vendor = "apple"
 )))]
 pub fn resident_bytes() -> Option<u64> {
     None
