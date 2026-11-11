@@ -60,7 +60,7 @@ struct HomeView: View {
             )
         }
         .task(id: shownName) { await head.load(shownName) }
-        .task(id: account.profile) { await account.handOver() }
+        .task(id: account.profile) { try? await account.handOver() }
         .onChange(of: account.profile) { profile in
             if profile != nil { editingName = false; nameDraft = "" }
         }
