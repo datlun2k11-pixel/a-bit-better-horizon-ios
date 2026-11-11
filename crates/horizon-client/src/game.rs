@@ -18949,8 +18949,24 @@ impl Game<'_> {
             && let Some(text) = key_event.text.as_deref()
         {
             let text: String = text.chars().filter(|c| !c.is_control()).collect();
-            if !text.is_empty() && self.text_field_focused() && self.types_text() {
-                let _ = self.type_chars_into_screen(&text);
+            if !text.is_empty() {
+                let focused = self.text_field_focused();
+                let types = self.types_text();
+                if focused && types {
+                    if let Err(error) = self.type_chars_into_screen(&text) {
+                        log::warn!("Horizon: text input {text:?}: {error}");
+                    }
+                } else {
+                    log::info!(
+                        "Horizon: typed {text:?} dropped: options {}, page {:?}, keyboard focus {}, types {}, dialog {}, title {}",
+                        self.screen == Screen::Options,
+                        self.ui.options.page(),
+                        self.field_focused(),
+                        types,
+                        self.dialog_open(),
+                        self.title.is_some()
+                    );
+                }
             }
             return;
         }

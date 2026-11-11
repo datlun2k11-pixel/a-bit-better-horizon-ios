@@ -14,15 +14,13 @@ impl Game<'_> {
         if self.dialog_open() {
             return self.dialog_has_text_field();
         }
-        if let Some(title) = self.title.as_mut() {
-            // A caret field, an append-only one (`focused_field`), or a game
-            // rule's box (`has_caret_field` asks the rules screen itself, and
-            // `title_edit` types into it).
-            return title.has_caret_field() || title.focused_field().is_some();
-        }
         if self.sign_edit.is_some() || matches!(self.book, Some(BookScreen::Edit { .. })) {
             return true;
         }
+        // The screen's own field comes before the title's: Options and World
+        // Options open over a title that keeps its own fields, and a phone's
+        // keyboard reports their typing as key events with no physical key,
+        // which only this function's focus lets through.
         match self.screen {
             Screen::Chat | Screen::CommandBlock | Screen::Social => true,
             Screen::DebugOptions => self
@@ -38,6 +36,13 @@ impl Game<'_> {
             Screen::Inventory => {
                 self.mod_browser_typing() || self.recipe_search_focused() || self.station_typing()
             }
+            // The title's own screens: a caret field, an append-only one
+            // (`focused_field`), or a game rule's box (`has_caret_field` asks
+            // the rules screen itself, and `title_edit` types into it).
+            Screen::Playing => self
+                .title
+                .as_mut()
+                .is_some_and(|title| title.has_caret_field() || title.focused_field().is_some()),
             _ => false,
         }
     }
