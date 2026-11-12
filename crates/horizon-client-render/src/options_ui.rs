@@ -766,7 +766,8 @@ impl Opt {
             } else {
                 "horizon.options.touch_pointer.direct"
             }),
-            Opt::TouchInteract => on_off(s.touch.interact),
+            // The caption names the setting: a bare "OFF" on this page says nothing about what is off.
+            Opt::TouchInteract => generic(c, on_off(s.touch.interact)),
             _ => generic(c, self.value_text(s)),
         }
     }
