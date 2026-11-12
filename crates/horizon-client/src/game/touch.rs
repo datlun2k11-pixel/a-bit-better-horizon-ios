@@ -756,10 +756,13 @@ impl Game<'_> {
                     // would, while the first keeps the pointer where it is.
                     if cursor_mode
                         && finger.tap
-                        && !finger.hold
                         && !finger.closed
                         && finger.second.is_none()
+                        && !(finger.hold && finger.pressed)
                     {
+                        // A hold that has not pressed yet gives way: a second finger joining soon after a
+                        // click means a scroll, not an item held.
+                        finger.hold = false;
                         finger.second = Some((id, at.1));
                         // Two fingers scrolling is not a tap: the first must not click when it lifts.
                         finger.wheeled = true;
@@ -853,14 +856,21 @@ impl Game<'_> {
                     }
                     return;
                 }
+                // Two fingers down and scrolling move neither the arrow, as on a trackpad, and the first
+                // finger keeps its place for when the other lifts.
+                let (from, scrolling) = (finger.from, finger.second.is_some());
                 let last = finger.scrolled;
+                if scrolling {
+                    if let Some(f) = self.touch.menu.as_mut() {
+                        f.from = at;
+                        f.scrolled = at;
+                    }
+                    return;
+                }
                 let pointer = if cursor_mode {
                     let was = clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch());
                     clamp_point(
-                        (
-                            was.0 + at.0 - finger.from.0,
-                            was.1 + at.1 - finger.from.1,
-                        ),
+                        (was.0 + at.0 - from.0, was.1 + at.1 - from.1),
                         self.touch_batch(),
                     )
                 } else {
