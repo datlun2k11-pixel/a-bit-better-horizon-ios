@@ -358,6 +358,7 @@ impl Opt {
             Opt::TouchStickScale => "horizon.options.touch_stick_size",
             Opt::TouchStickOpacity => "horizon.options.touch_stick_opacity",
             Opt::TouchPointer => "horizon.options.touch_pointer",
+            Opt::TouchInteract => "horizon.options.touch_interact",
             Opt::ModelPart(i) => [
                 "options.modelPart.cape",
                 "options.modelPart.jacket",
@@ -765,6 +766,7 @@ impl Opt {
             } else {
                 "horizon.options.touch_pointer.direct"
             }),
+            Opt::TouchInteract => on_off(s.touch.interact),
             _ => generic(c, self.value_text(s)),
         }
     }
@@ -1266,6 +1268,7 @@ impl Opt {
                     crate::touch::PointerMode::Cursor => crate::touch::PointerMode::Direct,
                 };
             }
+            Opt::TouchInteract => s.touch.interact = !s.touch.interact,
             _ => {}
         }
         if self.affects_preset() {
@@ -3390,6 +3393,7 @@ impl OptionsUi {
                     ),
                     Row::Big(Opt::TouchStick),
                     Row::Big(Opt::TouchPointer),
+                    Row::Big(Opt::TouchInteract),
                 ];
                 // The stick is the one button still sized here; every other button has its own options
                 // (in Edit Layout, hold it for a moment).

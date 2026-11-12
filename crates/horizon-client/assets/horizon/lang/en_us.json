@@ -94,6 +94,7 @@
   "horizon.options.touch_pointer": "Menu Input",
   "horizon.options.touch_pointer.direct": "Direct Touch",
   "horizon.options.touch_pointer.cursor": "Mouse Cursor",
+  "horizon.options.touch_interact": "Touch Interaction",
   "horizon.options.touch.forward": "Forward",
   "horizon.options.touch.back": "Back",
   "horizon.options.touch.left": "Left",

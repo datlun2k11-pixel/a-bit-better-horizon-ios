@@ -990,6 +990,8 @@ pub enum Opt {
     TouchStickOpacity,
     /// Direct touch, or a pointer the finger moves over a menu.
     TouchPointer,
+    /// Whether a tap on the world uses and a held finger mines, or the layout's buttons do it all.
+    TouchInteract,
     PadGameplayGuide,
     /// The radial menu's opener held or pressed once (`PadSettings::radial_mode`).
     PadRadialMode,

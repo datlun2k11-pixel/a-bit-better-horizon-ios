@@ -448,6 +448,9 @@ pub struct TouchSettings {
     pub stick_opacity: f32,
     /// How a finger acts over a menu.
     pub pointer: PointerMode,
+    /// Whether a finger on the world itself taps to use and holds to mine. Turned off, touching the screen
+    /// only turns the view: a player whose layout maps the mouse buttons interacts through those.
+    pub interact: bool,
 }
 
 impl Default for TouchSettings {
@@ -464,6 +467,7 @@ impl Default for TouchSettings {
             stick_scale: 1.0,
             stick_opacity: 1.0,
             pointer: PointerMode::Direct,
+            interact: true,
         }
     }
 }
@@ -606,6 +610,12 @@ impl TouchSettings {
                         s.pointer = PointerMode::Cursor;
                     }
                 }
+                // `interact:off`; the screen interacts by default and has no line.
+                "interact" => {
+                    if value == "off" {
+                        s.interact = false;
+                    }
+                }
                 // `stick:<scale>:<opacity>`, as `serialize` writes it.
                 "stick" => {
                     if let Some((scale, opacity)) = value.split_once(':') {
@@ -708,6 +718,9 @@ impl TouchSettings {
         }
         if self.pointer == PointerMode::Cursor {
             text.push_str("pointer:cursor\n");
+        }
+        if !self.interact {
+            text.push_str("interact:off\n");
         }
         if self.stick_scale != 1.0 || self.stick_opacity != 1.0 {
             text.push_str(&format!(
@@ -1615,6 +1628,17 @@ mod tests {
         let old = TouchSettings::parse("hidden:hide_hud\n");
         assert!(old.visible(Control::HideHud));
         assert_eq!(control_from_name("hide_hud"), Some(Control::HideHud));
+    }
+
+    #[test]
+    fn interacting_is_on_until_the_file_says_otherwise() {
+        assert!(TouchSettings::default().interact);
+        let off = TouchSettings::parse("interact:off\n");
+        assert!(!off.interact);
+        assert!(off.serialize().contains("interact:off\n"));
+        assert_eq!(TouchSettings::parse(&off.serialize()), off);
+        // A file that never turned it off says nothing about it.
+        assert!(!TouchSettings::default().serialize().contains("interact"));
     }
 
     #[test]

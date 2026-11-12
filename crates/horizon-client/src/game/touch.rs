@@ -537,7 +537,11 @@ impl Game<'_> {
                     self.mouse.add_motion(dx, dy);
                 }
                 // Pocket Edition: a tap hits the entity it is on, and uses the item or block otherwise.
+                // Turned off, the screen only turns the view: the layout's buttons click.
                 Out::Tap => {
+                    if !self.settings.touch.interact {
+                        continue;
+                    }
                     self.touch_grab();
                     let button = if self.entity_targeted() {
                         MouseButton::Left
@@ -551,6 +555,9 @@ impl Game<'_> {
                 // used for as long as they are held (a bow, a shield...) are used until the finger lifts;
                 // anything else mines.
                 Out::MineStart => {
+                    if !self.settings.touch.interact {
+                        continue;
+                    }
                     self.touch_grab();
                     let button = if self.touch_holds_use() {
                         MouseButton::Right
@@ -561,8 +568,11 @@ impl Game<'_> {
                     self.play_mouse(button, true)?;
                 }
                 Out::MineEnd => {
-                    let button = self.touch.holding.take().unwrap_or(MouseButton::Left);
-                    self.play_mouse(button, false)?;
+                    // Only what a finger started: an ended hold that never pressed must not let go of a
+                    // button the layout holds down.
+                    if let Some(button) = self.touch.holding.take() {
+                        self.play_mouse(button, false)?;
+                    }
                 }
             }
         }
