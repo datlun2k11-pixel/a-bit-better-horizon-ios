@@ -28,7 +28,10 @@ impl Game<'_> {
         let grabbed = pointer
             && self.screen == Screen::Playing
             && (self.player.is_some() || self.studio.flying());
-        let active = self.focused || self.agent_pointer;
+        // Only relative motion reaches `add_motion` (a touch drag or an agent's
+        // `mouse-move`), and it is pointer input whichever way the window's focus
+        // is reported: a stale "unfocused" on iOS used to eat every touch drag.
+        let active = self.focused || self.agent_pointer || self.mouse.has_accumulated();
         if let Some((xo, yo)) = self
             .mouse
             .handle_accumulated_movement(time, active, grabbed, look)
