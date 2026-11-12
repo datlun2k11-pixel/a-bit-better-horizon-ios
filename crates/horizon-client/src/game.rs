@@ -5938,6 +5938,9 @@ impl Game<'_> {
         // Finalize touch input after every screen, including title/options early
         // returns and prompts. Queued clicks require this drawn-pointer acknowledgement.
         self.draw_touch_close(&mut batch);
+        // Last of all, over every screen: the pointer is drawn by the game, so it must not be
+        // missed on the screens that return early (options, win, debug options).
+        self.draw_touch_cursor(&mut batch);
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
@@ -6391,7 +6394,6 @@ impl Game<'_> {
         if show_hud {
             self.draw_pad_guide(&mut batch, guide_from);
         }
-        self.draw_touch_cursor(&mut batch);
         batch
     }
     fn draw_inventory(&mut self, batch: &mut HudBatch) {

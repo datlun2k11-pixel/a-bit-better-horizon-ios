@@ -24,6 +24,9 @@ use winit::{
 /// GUI pixels a finger drags over a menu for one line of scrolling.
 const SCROLL_LINE: f32 = 12.0;
 
+/// GUI pixels a menu gesture must travel before it counts as aiming rather than tapping the finger's spot.
+const AIM_SLOP: f32 = 8.0;
+
 /// Whether the input diagnostics may write another line for `key`: at most one per `interval`, per key. A drag
 /// sends a hundred moves a second, and the log wants the shape of the gesture, not every one.
 pub(super) fn log_due(key: &'static str, interval: std::time::Duration) -> bool {
@@ -146,6 +149,8 @@ impl Game<'_> {
 /// pressed in one go would press whatever was under the old position (or nothing).
 struct MenuFinger {
     id: u64,
+    /// Where it went down (GUI pixels).
+    start: (f32, f32),
     /// Where the scrolling last caught up with the finger (GUI pixels).
     scrolled: (f32, f32),
     /// Where the finger was last seen: in cursor mode it moves the pointer by its own movement.
@@ -155,9 +160,13 @@ struct MenuFinger {
     pressed: bool,
     /// A cursor-mode gesture: it aims the pointer while it moves and clicks under it when it lifts.
     tap: bool,
+    /// It moved far enough to aim the pointer: lifting clicks under the pointer, a still tap under the finger.
+    moved: bool,
     /// The gesture scrolled a list: it aimed, so it must not also click.
     wheeled: bool,
     lifted: bool,
+    /// A whole frame has been drawn with the click pressed: letting go now cannot be missed.
+    settled: bool,
     /// It went down on the close button, which already acted: the rest of it is ignored.
     closed: bool,
 }
@@ -357,6 +366,15 @@ impl Game<'_> {
             return;
         }
         let playing = self.touch_playing();
+        // A menu opened before the pointer was ever moved: show it in the middle, where a tap clicks,
+        // rather than nowhere (`draw_touch_cursor` draws nothing without a position).
+        if !playing
+            && self.settings.touch.pointer == touch::PointerMode::Cursor
+            && self.touch.cursor.is_none()
+            && let Some(b) = self.touch_batch()
+        {
+            self.touch.cursor = Some((b.width / 2.0, b.height / 2.0));
+        }
         if playing {
             self.touch_release_menu(event_loop);
         } else {
@@ -715,12 +733,12 @@ impl Game<'_> {
                 let on_close = self.touch_close_shown()
                     && self
                         .touch_batch()
-                        .is_some_and(|b| touch::hit_rect(touch::close_rect(b.width, b.height), pointer));
+                        .is_some_and(|b| touch::hit_rect(touch::close_rect(b.width, b.height), at));
                 let on_keyboard = !on_close
                     && self.touch_shown()
                     && self.field_focused()
                     && self.touch_batch().is_some_and(|b| {
-                        touch::hit_rect(touch::keyboard_rect(b.width, b.height), pointer)
+                        touch::hit_rect(touch::keyboard_rect(b.width, b.height), at)
                     });
                 if on_close {
                     // What Escape does where the finger is (the pad's B).
@@ -751,13 +769,16 @@ impl Game<'_> {
                 }
                 self.touch.menu = Some(MenuFinger {
                     id,
+                    start: at,
                     scrolled: at,
                     from: at,
                     frames: 0,
                     pressed: false,
                     tap: cursor_mode && !(on_close || on_keyboard),
+                    moved: false,
                     wheeled: false,
                     lifted: false,
+                    settled: false,
                     closed: on_close || on_keyboard,
                 });
             }
@@ -786,6 +807,7 @@ impl Game<'_> {
                 if let Some(f) = self.touch.menu.as_mut() {
                     f.scrolled = (at.0, last.1 + lines * SCROLL_LINE);
                     f.from = at;
+                    f.moved |= (at.0 - f.start.0).hypot(at.1 - f.start.1) > AIM_SLOP;
                     f.wheeled |= lines != 0.0;
                 }
                 if cursor_mode {
@@ -801,25 +823,33 @@ impl Game<'_> {
                 let Some(finger) = self.touch.menu.as_ref().filter(|f| f.id == id) else {
                     return;
                 };
-                let (closed, tap, pointer) = (
+                let (closed, tap, aimed) = (
                     finger.closed,
                     finger.tap && !finger.wheeled,
-                    if cursor_mode {
-                        self.touch.cursor.unwrap_or(at)
-                    } else {
-                        at
-                    },
+                    cursor_mode && finger.moved,
                 );
+                // A gesture that aimed clicks under the pointer. A still tap clicks where the finger is,
+                // so a plain tap on a widget works without moving the arrow onto it first.
+                let pointer = if aimed {
+                    clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch())
+                } else {
+                    at
+                };
                 if let Some(f) = self.touch.menu.as_mut() {
                     f.lifted = true;
                 }
                 if !closed {
+                    if cursor_mode {
+                        self.touch.cursor = Some(clamp_point(pointer, self.touch_batch()));
+                    }
                     self.touch_pointer(event_loop, pointer);
                     if tap && click {
-                        // The click under the pointer: pressed now, let go once the game has drawn a frame
-                        // with it there, so a screen finds the widget it is on.
+                        // Pressed now and let go on a later frame (`touch_menu_frame`): a press and
+                        // release within one tick would leave the screen nothing to click on.
                         self.touch_button(event_loop, true);
-                        self.touch.late.push((MouseButton::Left, self.ticks));
+                        if let Some(f) = self.touch.menu.as_mut() {
+                            f.pressed = true;
+                        }
                     }
                 }
             }
@@ -848,9 +878,18 @@ impl Game<'_> {
                 self.touch.menu = None;
             }
         } else if finger.tap {
-            // A cursor-mode gesture clicked on lifting (`touch_menu`); nothing waits on a frame here.
+            // A cursor-mode click pressed when the finger lifted (`touch_menu`): let go only once a
+            // whole frame has drawn the pointer on what it pressed.
             if finger.lifted {
-                self.touch.menu = None;
+                if !finger.settled {
+                    finger.settled = true;
+                } else {
+                    let pressed = finger.pressed;
+                    self.touch.menu = None;
+                    if pressed {
+                        self.touch_button(event_loop, false);
+                    }
+                }
             }
         } else if !finger.pressed {
             if finger.frames >= 2 {
