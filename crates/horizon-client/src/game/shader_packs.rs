@@ -864,10 +864,18 @@ impl Game<'_> {
             self.settings.horizon.shader_pack.clear();
             self.settings.save(&Self::options_path());
         }
-        self.system_message(Text::colored(
-            format!("Shader pack {name} could not be loaded and was turned off"),
-            0xFF5555,
-        ));
+        // The chat carries the reason too, cut to its first line: a player reporting "it was turned
+        // off" otherwise has to find latest.log before anyone can tell what the pack did.
+        let mut reason = error.lines().next().unwrap_or_default().trim();
+        if let Some(cut) = reason.char_indices().nth(200) {
+            reason = &reason[..cut.0];
+        }
+        let message = if reason.is_empty() {
+            format!("Shader pack {name} could not be loaded and was turned off")
+        } else {
+            format!("Shader pack {name} could not be loaded and was turned off: {reason}")
+        };
+        self.system_message(Text::colored(message, 0xFF5555));
     }
 
     /// Whether the game's vignette draws: the option, unless the loaded pack turns it off.

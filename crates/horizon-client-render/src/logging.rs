@@ -237,16 +237,22 @@ fn roll(file: &mut File, dir: &Path, date: NaiveDate) -> io::Result<()> {
     Ok(())
 }
 
-/// The open `latest.log` and the lock that keeps it this game's.
+/// The open `latest.log` and the lock that keeps it this game's, when it got one.
 pub struct Latest {
     pub file: File,
-    _lock: File,
+    _lock: Option<File>,
 }
 
 /// Opens `dir/latest.log` for this run, archiving the last run's. None when another Horizon
 /// using the same folder is writing it: that game keeps it, this one logs to stderr only. The
 /// lock is a separate file (`.lock`): Windows locks are mandatory, and a locked latest.log could
 /// not be read while the game runs.
+///
+/// On iOS the lock cannot be trusted. The system suspends an app instead of killing it, so the
+/// process that wrote this log can still hold the lock while the next one runs (the app was
+/// updated, or LiveContainer keeps two instances); refusing to write then hides the bug report the
+/// log exists for. There the file is opened anyway, in append mode and without rolling it, so both
+/// writers only ever add whole lines.
 pub fn open_latest(dir: &Path) -> io::Result<Option<Latest>> {
     fs::create_dir_all(dir)?;
     let lock = OpenOptions::new()
@@ -254,21 +260,36 @@ pub fn open_latest(dir: &Path) -> io::Result<Option<Latest>> {
         .create(true)
         .truncate(false)
         .open(dir.join(".lock"))?;
-    match lock.try_lock() {
-        Ok(()) => {}
+    let ours = match lock.try_lock() {
+        Ok(()) => true,
+        Err(fs::TryLockError::WouldBlock) if cfg!(target_os = "ios") => {
+            eprintln!(
+                "Horizon: another instance is writing {}; appending to it",
+                dir.join("latest.log").display()
+            );
+            false
+        }
         Err(fs::TryLockError::WouldBlock) => return Ok(None),
         Err(fs::TryLockError::Error(e)) => return Err(e),
-    }
+    };
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
+        // A whole line lands in one write, so a writer without the lock cannot interleave with
+        // this one's lines.
+        .append(true)
         .create(true)
         .truncate(false)
         .open(dir.join("latest.log"))?;
-    let modified = file.metadata()?.modified()?;
-    let date = DateTime::<Local>::from(modified).date_naive();
-    roll(&mut file, dir, date)?;
-    Ok(Some(Latest { file, _lock: lock }))
+    if ours {
+        let modified = file.metadata()?.modified()?;
+        let date = DateTime::<Local>::from(modified).date_naive();
+        roll(&mut file, dir, date)?;
+    }
+    Ok(Some(Latest {
+        file,
+        _lock: ours.then_some(lock),
+    }))
 }
 
 /// What the writer thread is told.
