@@ -173,8 +173,9 @@ private struct ShareLogs: View {
         // "Where the game looks, on the phone"), not beside the launcher's in `Documents/logs`: share the
         // newest `latest.log` of the two, so a build that logs to either place is captured.
         let engine = documents.deletingLastPathComponent()
-            .appendingPathComponent("Library/Application Support/horizon/logs/latest.log")
-        let latest = [engine, documents.appendingPathComponent("logs/latest.log")]
+            .appendingPathComponent("Library/Application Support/horizon")
+        let latest = [engine.appendingPathComponent("logs/latest.log"),
+                      documents.appendingPathComponent("logs/latest.log")]
             .filter { FileManager.default.fileExists(atPath: $0.path) }
             .max { modified($0) < modified($1) }
         var files = ["logs/launcher.log", "logs/launcher-1.log", "horizon-boot.log"]
@@ -183,14 +184,15 @@ private struct ShareLogs: View {
         if let latest { files.insert(latest, at: 0) }
         // The engine writes crash reports beside its log (`Library/Application Support/horizon`),
         // the launcher in `Documents`: share the newest of the two, as the log above.
-        let newest = [documents.appendingPathComponent("crash-reports"),
-                      documents.deletingLastPathComponent()
-                          .appendingPathComponent("Library/Application Support/horizon/crash-reports")]
-            .filter { FileManager.default.fileExists(atPath: $0.path) }
-            .flatMap { (try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)) ?? [] }
-            .filter { $0.lastPathComponent.hasPrefix("crash-") && $0.pathExtension == "txt" }
-            .max { $0.lastPathComponent < $1.lastPathComponent }
-        if let newest { files.append(newest) }
+        let folders: [URL] = [documents.appendingPathComponent("crash-reports"),
+                              engine.appendingPathComponent("crash-reports")]
+        let reports: [URL] = folders.flatMap { folder in
+            (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        }
+        let crashes = reports.filter { $0.lastPathComponent.hasPrefix("crash-") && $0.pathExtension == "txt" }
+        if let newest = crashes.max(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            files.append(newest)
+        }
         guard let host = gameViewController() else { return }
         let items: [Any]
         if let archive = LogsArchive.write(files) {
