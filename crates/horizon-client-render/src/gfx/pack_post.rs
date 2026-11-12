@@ -1352,7 +1352,6 @@ pub(super) type TerrainPage = (u32, wgpu::Buffer, wgpu::Buffer);
 
 /// Header (sprite-rect words, state count), sprite rectangles, then model/fluid ids.
 /// Keeping immutable tables together leaves the existing three storage bindings intact.
-#[cfg(test)]
 pub(super) fn terrain_tables(table: &[i32], rects: &[u32]) -> Vec<i32> {
     let rects = if rects.is_empty() { &[0, 0][..] } else { rects };
     [rects.len() as i32, (table.len() / 2) as i32]
