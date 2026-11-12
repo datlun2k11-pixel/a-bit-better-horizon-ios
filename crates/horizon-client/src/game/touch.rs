@@ -35,6 +35,10 @@ const DOUBLE_TAP: Duration = Duration::from_millis(300);
 /// pointer, which must not also click where it left it.
 const TAP_SLOP: f32 = 6.0;
 
+/// How long the second tap of a double tap has to stay still before it holds the left button: a touch that
+/// moves sooner is moving the arrow, and pressing where it started would click what the arrow is over.
+const HOLD_STILL: Duration = Duration::from_millis(120);
+
 /// Whether the input diagnostics may write another line for `key`: at most one per `interval`, per key. A drag
 /// sends a hundred moves a second, and the log wants the shape of the gesture, not every one.
 pub(super) fn log_due(key: &'static str, interval: std::time::Duration) -> bool {
@@ -166,11 +170,16 @@ struct MenuFinger {
     from: (f32, f32),
     /// Loop iterations since it went down.
     frames: u8,
+    /// When it went down.
+    started: Instant,
     pressed: bool,
     /// A cursor-mode gesture: it drags the pointer while it moves and clicks under it when it lifts.
     tap: bool,
-    /// The second tap of a double tap: it holds the left button down until the finger lifts.
+    /// The second tap of a double tap: once it stays still, it holds the left button until the finger lifts.
     hold: bool,
+    /// In cursor mode the finger dragged the arrow past `TAP_SLOP`: it is aiming, not tapping, and must
+    /// never press.
+    moved: bool,
     /// The second finger of a two-finger drag in cursor mode, which scrolls, and the y it last scrolled to
     /// (GUI pixels).
     second: Option<(u64, f32)>,
@@ -800,9 +809,11 @@ impl Game<'_> {
                     scrolled: at,
                     from: at,
                     frames: 0,
+                    started: Instant::now(),
                     pressed: false,
                     tap,
                     hold,
+                    moved: false,
                     second: None,
                     wheeled: false,
                     lifted: false,
@@ -851,6 +862,8 @@ impl Game<'_> {
                     self.touch.cursor = Some(pointer);
                     self.touch_pointer(event_loop, pointer);
                     if let Some(f) = self.touch.menu.as_mut() {
+                        let (dx, dy) = (at.0 - f.scrolled.0, at.1 - f.scrolled.1);
+                        f.moved |= dx * dx + dy * dy > TAP_SLOP * TAP_SLOP;
                         f.from = at;
                     }
                     return;
@@ -899,6 +912,8 @@ impl Game<'_> {
                     at
                 };
                 if let Some(f) = self.touch.menu.as_mut() {
+                    // A drag whose moves all stayed under the slop still aimed rather than tapped.
+                    f.moved |= dragged;
                     f.lifted = true;
                 }
                 if !closed {
@@ -942,10 +957,19 @@ impl Game<'_> {
                 self.touch.menu = None;
             }
         } else if finger.hold {
-            // A double tap held down: press and keep holding until the finger lifts, so the drag that
-            // follows carries what it grabbed.
+            // A double tap held down: once it has stayed still a moment, press and keep holding until the
+            // finger lifts, so the drag that follows carries what it grabbed. A second touch that moves
+            // the arrow instead never presses: moving the pointer after a click is not another click.
             if !finger.pressed {
-                if finger.frames >= 2 {
+                if finger.moved {
+                    if finger.lifted {
+                        self.touch.menu = None;
+                    }
+                } else if finger.started.elapsed() >= HOLD_STILL {
+                    finger.pressed = true;
+                    self.touch_button(event_loop, true);
+                } else if finger.lifted {
+                    // Lifted before it stayed still: a second tap that was just a tap, clicked as one.
                     finger.pressed = true;
                     self.touch_button(event_loop, true);
                 }
