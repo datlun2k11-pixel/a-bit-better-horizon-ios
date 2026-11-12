@@ -1383,9 +1383,11 @@ pub(super) fn block_ids(
         queue.write_buffer(&buffer, 0, contents);
         Some(buffer)
     };
-    let rects = if rects.is_empty() { &[0, 0][..] } else { rects };
+    // `hz_sprite_rects` reads the rects after the pair of table lengths that
+    // `terrain_tables` writes first, as the atlas's own probe packs bind it.
+    let rects = terrain_tables(&[], rects);
     let ids = buffer("Shader pack block ids", bytemuck::cast_slice(table))?;
-    let rects = buffer("Shader pack sprite rects", bytemuck::cast_slice(rects))?;
+    let rects = buffer("Shader pack sprite rects", bytemuck::cast_slice(&rects))?;
     let storage = |binding| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::VERTEX,

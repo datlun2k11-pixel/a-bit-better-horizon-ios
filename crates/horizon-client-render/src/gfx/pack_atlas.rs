@@ -724,6 +724,7 @@ impl PackAtlas {
             "hz_v_origin"
         };
         declarations.push_str("layout(set = 3, binding = 0) readonly buffer HzBlockIds { int hz_block_ids[]; };\nlayout(set = 3, binding = 1) readonly buffer HzVertices { uint hz_vertices[]; };\nlayout(set = 3, binding = 2) readonly buffer HzQuadStates { uint hz_quad_states[]; };\nlayout(set = 3, binding = 3) readonly buffer HzSpriteRects { uvec2 hz_sprite_rects[]; };\nvec4 hz_mc_entity; vec3 hz_mid_block; vec2 hz_mid_uv; float hz_emission;\n");
+        declarations.push_str(CORNER_FN);
         declarations.push_str(&format!(
             "const uint hz_state_words = {}u;\n",
             super::TERRAIN_STATE_WORDS
@@ -739,7 +740,7 @@ impl PackAtlas {
         let (cell, side, scale) = if flat {
             (
                 "uvec2 hz_rect = uvec2(0u, 1u);\n    \
-                 if (hz_layer < uint(hz_sprite_rects.length())) hz_rect = hz_sprite_rects[hz_layer];\n    \
+                 if (2u * hz_layer + 1u < hz_sprite_rects[0].x) hz_rect = hz_sprite_rects[1u + hz_layer];\n    \
                  hz_cell = vec2(float(hz_rect.x & 65535u), float(hz_rect.x >> 16u)) / float(hz_rect.y);\n    "
                     .to_owned(),
                 "float(hz_rect.y)",
@@ -785,9 +786,15 @@ impl PackAtlas {
             scale[0], scale[1],
         );
         let mut body = body;
-        body.push_str(FACE);
-        body.push_str(r#"    hz_mc_entity=vec4(-1.0,0.0,0.0,0.0); hz_mid_block=vec3(0.0); hz_emission=0.0;
-    uint hz_meta=(uint(gl_VertexIndex)>>2u)*hz_quad_words;
+        // A flat page's quad is the arena quad of its vertex index, or the record slot past
+        // `PACKED_BASE`; both address the metadata sidecar the way the page addresses them.
+        let meta_quad = if flat {
+            "(hz_rec ? hz_slot : (uint(gl_VertexIndex) >> 2u))"
+        } else {
+            "(uint(gl_VertexIndex) >> 2u)"
+        };
+        let state = r#"    hz_mc_entity=vec4(-1.0,0.0,0.0,0.0); hz_mid_block=vec3(0.0); hz_emission=0.0;
+    uint hz_meta=uint(hz_meta_quad)*hz_quad_words;
     uvec2 hz_source=uvec2(hz_quad_states[hz_meta],hz_quad_states[hz_meta+1u]);
     if(hz_source.x!=0xffffffffu){
         vec3 hz_cell_origin=vec3(uvec3(hz_source.y&15u,(hz_source.y>>4u)&15u,(hz_source.y>>8u)&15u));
@@ -806,13 +813,39 @@ impl PackAtlas {
             else{hz_Color=vec4(hz_old_lighting?mix(hz_shaded_tint.rgb,hz_v_color.rgb,hz_ao_strength):mix(hz_tint.rgb,hz_no_dir.rgb,hz_ao_strength),1.0);}
         }
     }
-    vec2 hz_avg_uv=vec2(0.0);
-    for(uint hz_c=0u;hz_c<4u;++hz_c){
-        uint hz_uv_word=hz_vertices[hz_q+hz_c*6u+3u];
-        hz_avg_uv+=clamp(vec2(float(hz_uv_word&65535u),float(hz_uv_word>>16u))*(hz_origin.w > 0.0 ? uintBitsToFloat(floatBitsToUint(hz_origin.w) & 0xff800000u) : fract(abs(hz_origin.w))),0.0,1.0)*0.25;
-    }
-    hz_mid_uv=(hz_cell+hz_avg_uv)*hz_scale;
-"#);
+"#
+        .replace("hz_meta_quad", meta_quad);
+        // Both paths read their quad's four corners from the page: flat through `PULL_FLAT`
+        // (either layout), the others at their vertex index. `FACE` turns them into the
+        // normal, tangent and midpoint every pack sees.
+        if flat {
+            body.insert_str(0, PULL_FLAT);
+        } else {
+            body.insert_str(
+                0,
+                "    uint hz_av = uint(gl_VertexIndex) & ~3u;\n    \
+                 uvec3 hz_cp0; uvec3 hz_cp1; uvec3 hz_cp2; uvec3 hz_cp3;\n    \
+                 uint hz_uv0; uint hz_uv1; uint hz_uv2; uint hz_uv3;\n    \
+                 hz_arena_corner(hz_av, hz_cp0, hz_uv0);\n    \
+                 hz_arena_corner(hz_av + 1u, hz_cp1, hz_uv1);\n    \
+                 hz_arena_corner(hz_av + 2u, hz_cp2, hz_uv2);\n    \
+                 hz_arena_corner(hz_av + 3u, hz_cp3, hz_uv3);\n",
+            );
+        }
+        body.push_str(FACE);
+        if flat {
+            // The pulled vertex's alpha is its ambient occlusion (`separateAo`) or its own
+            // alpha; the sidecar below replaces it exactly when it holds lighting.
+            body.push_str("    hz_Color.a = hz_v_color.a;\n");
+        }
+        body.push_str(&state);
+        body.push_str(
+            "    vec2 hz_avg_uv=clamp(vec2(float(hz_uv0&65535u),float(hz_uv0>>16u))*hz_uv_scale,0.0,1.0)\n        \
+             +clamp(vec2(float(hz_uv1&65535u),float(hz_uv1>>16u))*hz_uv_scale,0.0,1.0)\n        \
+             +clamp(vec2(float(hz_uv2&65535u),float(hz_uv2>>16u))*hz_uv_scale,0.0,1.0)\n        \
+             +clamp(vec2(float(hz_uv3&65535u),float(hz_uv3>>16u))*hz_uv_scale,0.0,1.0);\n    \
+             hz_mid_uv=(hz_cell+hz_avg_uv*0.25)*hz_scale;\n",
+        );
         declarations.push_str(
             "vec2 hz_cell; vec2 hz_scale; vec2 hz_mid; float hz_uv_scale; vec4 hz_tangent;\n",
         );
