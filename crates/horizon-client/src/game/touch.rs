@@ -31,6 +31,10 @@ const SCROLL_LINE: f32 = 12.0;
 /// left button until it lifts, as PojavLauncher's touchpad does.
 const DOUBLE_TAP: Duration = Duration::from_millis(300);
 
+/// GUI pixels a cursor-mode finger may move and still be a tap: past it, the finger was dragging the
+/// pointer, which must not also click where it left it.
+const TAP_SLOP: f32 = 6.0;
+
 /// Whether the input diagnostics may write another line for `key`: at most one per `interval`, per key. A drag
 /// sends a hundred moves a second, and the log wants the shape of the gesture, not every one.
 pub(super) fn log_due(key: &'static str, interval: std::time::Duration) -> bool {
@@ -155,7 +159,8 @@ impl Game<'_> {
 /// pressed in one go would press whatever was under the old position (or nothing).
 struct MenuFinger {
     id: u64,
-    /// Where the scrolling last caught up with the finger (GUI pixels).
+    /// Where the scrolling last caught up with the finger (GUI pixels); in cursor mode, where the
+    /// gesture went down, which tells a drag from a tap.
     scrolled: (f32, f32),
     /// Where the finger was last seen: in cursor mode it moves the pointer by its own movement.
     from: (f32, f32),
@@ -166,6 +171,9 @@ struct MenuFinger {
     tap: bool,
     /// The second tap of a double tap: it holds the left button down until the finger lifts.
     hold: bool,
+    /// The second finger of a two-finger drag in cursor mode, which scrolls, and the y it last scrolled to
+    /// (GUI pixels).
+    second: Option<(u64, f32)>,
     /// The gesture scrolled a list: it aimed, so it must not also click.
     wheeled: bool,
     lifted: bool,
@@ -724,7 +732,19 @@ impl Game<'_> {
         let cursor_mode = self.settings.touch.pointer == touch::PointerMode::Cursor;
         match phase {
             TouchPhase::Started => {
-                if self.touch.menu.is_some() {
+                if let Some(finger) = self.touch.menu.as_mut() {
+                    // A second finger over a cursor-mode gesture scrolls, as a touchpad's two fingers
+                    // would, while the first keeps the pointer where it is.
+                    if cursor_mode
+                        && finger.tap
+                        && !finger.hold
+                        && !finger.closed
+                        && finger.second.is_none()
+                    {
+                        finger.second = Some((id, at.1));
+                        // Two fingers scrolling is not a tap: the first must not click when it lifts.
+                        finger.wheeled = true;
+                    }
                     return;
                 }
                 // In cursor mode the finger drags the pointer a touchpad's mouse would, and a tap acts
@@ -783,6 +803,7 @@ impl Game<'_> {
                     pressed: false,
                     tap,
                     hold,
+                    second: None,
                     wheeled: false,
                     lifted: false,
                     settled: false,
@@ -794,8 +815,24 @@ impl Game<'_> {
                 else {
                     return;
                 };
+                if let Some((second, last)) = finger.second
+                    && second == id
+                {
+                    // The second finger scrolls as the wheel would, the content following the fingers.
+                    let lines = ((at.1 - last) / SCROLL_LINE).trunc();
+                    let scrolls = self.screen != Screen::Inventory;
+                    if let Some(f) = self.touch.menu.as_mut() {
+                        if let Some(second) = f.second.as_mut() {
+                            second.1 += lines * SCROLL_LINE;
+                        }
+                        f.wheeled = true;
+                    }
+                    if scrolls && lines != 0.0 {
+                        self.touch_wheel(event_loop, lines);
+                    }
+                    return;
+                }
                 let last = finger.scrolled;
-                let hold = finger.hold;
                 let pointer = if cursor_mode {
                     let was = clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch());
                     clamp_point(
@@ -808,18 +845,24 @@ impl Game<'_> {
                 } else {
                     at
                 };
+                if cursor_mode {
+                    // A finger only moves the pointer, a touchpad's: dragging it never scrolls the
+                    // list it crosses, which a second finger does.
+                    self.touch.cursor = Some(pointer);
+                    self.touch_pointer(event_loop, pointer);
+                    if let Some(f) = self.touch.menu.as_mut() {
+                        f.from = at;
+                    }
+                    return;
+                }
                 // A drag scrolls lists as a wheel would, the content following the finger. Not in an
-                // inventory, where a drag carries the item it pressed on, nor while a double tap holds
-                // the button down: that drag carries what it grabbed.
+                // inventory, where a drag carries the item it pressed on.
                 let lines = ((at.1 - last.1) / SCROLL_LINE).trunc();
-                let scrolls = self.screen != Screen::Inventory && !hold;
+                let scrolls = self.screen != Screen::Inventory;
                 if let Some(f) = self.touch.menu.as_mut() {
                     f.scrolled = (at.0, last.1 + lines * SCROLL_LINE);
                     f.from = at;
                     f.wheeled |= lines != 0.0;
-                }
-                if cursor_mode {
-                    self.touch.cursor = Some(pointer);
                 }
                 self.touch_pointer(event_loop, pointer);
                 if scrolls && lines != 0.0 {
@@ -831,9 +874,21 @@ impl Game<'_> {
                 let Some(finger) = self.touch.menu.as_ref().filter(|f| f.id == id) else {
                     return;
                 };
+                if finger.second.is_some_and(|(second, _)| second == id) {
+                    if let Some(f) = self.touch.menu.as_mut() {
+                        f.second = None;
+                    }
+                    return;
+                }
+                // A finger that dragged the pointer was not a tap: it must not click where it left the
+                // arrow either.
+                let dragged = {
+                    let (dx, dy) = (at.0 - finger.scrolled.0, at.1 - finger.scrolled.1);
+                    cursor_mode && dx * dx + dy * dy > TAP_SLOP * TAP_SLOP
+                };
                 let (closed, tap, hold) = (
                     finger.closed,
-                    finger.tap && !finger.wheeled,
+                    finger.tap && !finger.wheeled && !dragged,
                     finger.hold,
                 );
                 // The tap acts under the pointer, wherever the finger is: it never brings the arrow to
