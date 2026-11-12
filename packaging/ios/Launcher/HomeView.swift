@@ -67,6 +67,10 @@ struct HomeView: View {
         .onChange(of: link.phase) { phase in
             LauncherLog.write("game phase: \(String(describing: phase))")
         }
+        // First run: the launcher starts the game-files download itself, and its card shows the unpacking.
+        .task(id: link.phase) {
+            if link.phase == .waiting { await download.startAutomaticallyIfNeeded() }
+        }
         .task {
             await updates.check()
             link.uncover = onPlay
