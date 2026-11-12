@@ -796,6 +796,16 @@ impl ApplicationHandler for Split<'_> {
         self.turn(0);
     }
 
+    /// iOS's `applicationDidReceiveMemoryWarning`: every game gives back what it can, and P1's
+    /// lowers its render distance when warnings come close together.
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        self.host.on_memory_warning(now);
+        for guest in &mut self.guests {
+            guest.game.on_memory_warning(now);
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_retired_guests();
         let on = self.desktop_split_available()

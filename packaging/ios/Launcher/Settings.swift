@@ -181,8 +181,13 @@ private struct ShareLogs: View {
             .map { documents.appendingPathComponent($0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
         if let latest { files.insert(latest, at: 0) }
-        let crashes = documents.appendingPathComponent("crash-reports")
-        let newest = (try? FileManager.default.contentsOfDirectory(at: crashes, includingPropertiesForKeys: nil))?
+        // The engine writes crash reports beside its log (`Library/Application Support/horizon`),
+        // the launcher in `Documents`: share the newest of the two, as the log above.
+        let newest = [documents.appendingPathComponent("crash-reports"),
+                      documents.deletingLastPathComponent()
+                          .appendingPathComponent("Library/Application Support/horizon/crash-reports")]
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+            .flatMap { (try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)) ?? [] }
             .filter { $0.lastPathComponent.hasPrefix("crash-") && $0.pathExtension == "txt" }
             .max { $0.lastPathComponent < $1.lastPathComponent }
         if let newest { files.append(newest) }

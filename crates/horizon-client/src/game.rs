@@ -252,6 +252,7 @@ mod machines;
 mod maps;
 mod melee;
 mod memory;
+mod memory_warning;
 mod menu_clicks;
 mod minecarts;
 #[cfg(test)]
@@ -2980,6 +2981,9 @@ struct Game<'a> {
     debug_options: Option<debug_options::DebugOptionsUi>,
     /// `DebugEntryMemory`'s readings (game/debug_lines.rs).
     memory_meter: std::cell::RefCell<horizon_client::debug_overlay::MemoryMeter>,
+    /// iOS memory warnings: how many came close together, and whether the
+    /// render distance is lowered (game/memory_warning.rs).
+    memory: memory_warning::Memory,
     /// The F3 overlay's vertices between rebuilds (`draw_debug_overlay_under`).
     debug_paint: RefCell<horizon_client::debug_overlay::PaintCache>,
     /// The F3 overlay's last reading of the refresh rate, and when it was taken.
@@ -5596,6 +5600,57 @@ impl Game<'_> {
         } else {
             PresenceStatus::Online
         }
+    }
+    /// A memory warning (iOS `applicationDidReceiveMemoryWarning`): give back
+    /// what can be given back, and lower the render distance when the warnings
+    /// come close together in a singleplayer world at a long distance.
+    pub(super) fn on_memory_warning(&mut self, now: Instant) {
+        self.streaming.release_memory();
+        horizon_threads::release_free_memory();
+        // A remote server's chunks are not ours to unload, and without a world
+        // (or a player) there is no render distance in use. The warning still
+        // counts: while lowered, it postpones the restore.
+        let second = self.memory.note_warning(now);
+        if self.player.is_none() || self.integrated.is_none() || self.memory.is_lowered() {
+            return;
+        }
+        if self.settings.render_distance <= memory_warning::LOWER_ABOVE || !second {
+            return;
+        }
+        self.memory.lower();
+        self.apply_memory_radius();
+        self.system_message(horizon_client::text::Text::literal(format!(
+            "Running low on memory: render distance lowered to {} until the pressure passes",
+            memory_warning::LOWER_RADIUS
+        )));
+    }
+    /// The restore side of [`Game::on_memory_warning`], once a quiet while has
+    /// passed; leaving the world forgets the lowering.
+    fn memory_tick(&mut self, now: Instant) {
+        if self.player.is_none() {
+            let lowered = self.memory.is_lowered();
+            self.memory.close_world();
+            if lowered {
+                self.apply_memory_radius();
+            }
+            return;
+        }
+        if self.memory.is_lowered() {
+            // A dimension change or a view distance packet sets the radius
+            // again: the lowering holds until it is restored.
+            self.apply_memory_radius();
+        }
+        if self.memory.restore_due(now) {
+            self.memory.restore();
+            self.apply_memory_radius();
+            self.system_message(horizon_client::text::Text::literal(format!(
+                "Memory pressure gone: render distance restored to {}",
+                self.settings.render_distance
+            )));
+        }
+    }
+    fn apply_memory_radius(&mut self) {
+        self.streaming.radius = self.memory.effective(self.settings.render_distance);
     }
     fn tick(&mut self) -> Result<()> {
         if self.agent.hold_server {
@@ -12228,6 +12283,7 @@ impl<'a> Game<'a> {
             ),
             debug_options: None,
             memory_meter: Default::default(),
+            memory: Default::default(),
             debug_paint: Default::default(),
             debug_refresh: Default::default(),
             gpu_utilization: 0.0,

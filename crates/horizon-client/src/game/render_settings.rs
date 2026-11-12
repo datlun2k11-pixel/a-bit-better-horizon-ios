@@ -134,8 +134,9 @@ impl Game<'_> {
         // LocalPlayer.refreshChatAbilities: the chat shows what the Chat option allows.
         let abilities = self.chat_abilities();
         self.ui.chat.set_abilities(&self.gui.atlas.font, abilities);
-        let render_distance_changed = self.streaming.radius != self.settings.render_distance;
-        self.streaming.radius = self.settings.render_distance;
+        let wanted = self.memory.effective(self.settings.render_distance);
+        let render_distance_changed = self.streaming.radius != wanted;
+        self.streaming.radius = wanted;
         // Options.renderDistance, biomeBlendRadius, ambientOcclusion,
         // cutoutLeaves, Opaque Ice and the leaf-culling mode:
         // LevelExtractor.allChanged when they change.

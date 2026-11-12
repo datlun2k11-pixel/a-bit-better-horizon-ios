@@ -546,6 +546,14 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, event_loop: &ActiveEventLoop, id: DeviceId, event: DeviceEvent) {
         deep(|| self.device_event_here(event_loop, id, event))
     }
+    /// iOS's memory warning while the resources load: no world is open yet, so the
+    /// allocator's free pages are all there is to give back.
+    fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
+        deep(|| match self {
+            App::Loading(_) => horizon_threads::release_free_memory(),
+            App::Ready(split) => ApplicationHandler::memory_warning(&mut **split, event_loop),
+        })
+    }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         deep(|| self.about_to_wait_here(event_loop))
     }

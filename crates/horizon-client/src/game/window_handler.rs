@@ -248,6 +248,7 @@ impl Game<'_> {
         }
         horizon_client::spans::time("server_packs", || self.tick_server_packs());
         horizon_client::spans::time("control", || self.poll_control(event_loop));
+        self.memory_tick(Instant::now());
         if !self.splitscreen.guest && !self.options.split_guest {
             self.poll_launcher(event_loop);
             self.sync_airplay();
