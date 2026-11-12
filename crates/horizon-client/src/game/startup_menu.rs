@@ -388,6 +388,23 @@ pub(super) fn spawn_loader(
     let handle = std::thread::Builder::new()
         .name("resource-loader".into())
         .spawn(move || {
+            // A phone's files are unpacked here, before the loader reads the folder: a prepared
+            // archive is hundreds of megabytes, and on the launch thread the work outlived iOS's
+            // twenty-second launch watchdog, which killed the app with the archive half done —
+            // then the next launch did it again. The loading screen is already painting.
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            {
+                match horizon_client::import::recover(&import_home) {
+                    Ok(Some(path)) => {
+                        log::info!("Horizon: finished the import at {}", path.display())
+                    }
+                    Ok(None) => {}
+                    Err(error) => log::error!("Horizon: could not finish the last import: {error}"),
+                }
+                // The cable's door: an archive dropped into `Documents` is installed for the launch
+                // it was dropped for; `scan` says what it took and what it left alone.
+                horizon_client::import::scan(&import_home);
+            }
             let load = || {
                 // A detached tail and the Loaded handoff retain clones of this
                 // same transaction; neither reacquires a lock on the UI thread.

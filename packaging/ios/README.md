@@ -188,7 +188,7 @@ rather than a dead end.
 *Files* tab, or iTunes' *File Sharing*, or any manager that gets there -- and launch. The game unpacks what it
 finds there on a worker while the launcher draws its progress (the launcher's *Preparing game files* screen,
 fed by `launcher-state`'s `import`), then deletes the archive. Unpacking on the launch thread is what iOS's
-watchdog kills before a window appears; `import::boot` is that worker, and the resource loader waits for it.
+watchdog kills before a window appears; the resource loader unpacks on its own thread, before it reads the folder.
 
 Both doors route by the archive's root, so one file format carries three things: `horizon-resources.json` is
 the game files, `level.dat` is a world (into `Documents/saves`, never over one that exists), `pack.mcmeta` is a

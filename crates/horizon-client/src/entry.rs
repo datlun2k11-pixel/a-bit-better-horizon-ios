@@ -42,16 +42,10 @@ pub fn main_with(mods: crate::mod_api::Mods) {
     horizon_airplay::register();
     horizon_airplay::audio::start();
     #[cfg(target_os = "ios")]
-    let documents = match into_app_sandbox() {
-        Ok(documents) => documents,
-        Err(error) => {
-            eprintln!("Horizon: {error}");
-            std::process::exit(1);
-        }
-    };
-    // `android_main` already moved into the app's files folder.
-    #[cfg(target_os = "android")]
-    let documents = std::env::current_dir().unwrap_or_default();
+    if let Err(error) = into_app_sandbox() {
+        eprintln!("Horizon: {error}");
+        std::process::exit(1);
+    }
 
     crate::horizon_look::give();
     // OptiFine's and Polytone's pack formats (platform, docs/layers.md), before any pack loads.
@@ -117,20 +111,6 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         if side == "client" {
             horizon_client::msa::restore(&home);
         }
-    }
-    // What a phone does with its files before the game looks for them, once the log can say so.
-    #[cfg(any(target_os = "ios", target_os = "android"))]
-    if !help {
-        // A swap that a flat battery or a crash left half done is finished, or the old tree put back,
-        // before anything reads the folder it was working on.
-        match horizon_client::import::recover(&documents) {
-            Ok(Some(path)) => log::info!("Horizon: finished the import at {}", path.display()),
-            Ok(None) => {}
-            Err(error) => log::error!("Horizon: could not finish the last import: {error}"),
-        }
-        // The cable's door: an archive dragged into `Documents` is installed here, so the launch it was
-        // dragged for is the one that finds it. `scan` says what it took and what it left alone.
-        horizon_client::import::scan(&documents);
     }
     let renderers = crate::mod_api::mods()
         .iter()
