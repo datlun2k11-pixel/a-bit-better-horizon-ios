@@ -169,9 +169,18 @@ private struct ShareLogs: View {
 
     private func share() {
         let documents = GameFolder.documents
-        var files = ["logs/latest.log", "logs/launcher.log", "logs/launcher-1.log", "horizon-boot.log"]
+        // The engine writes its log under `Library/Application Support/horizon/logs` (packaging/ios/README.md,
+        // "Where the game looks, on the phone"), not beside the launcher's in `Documents/logs`: share the
+        // newest `latest.log` of the two, so a build that logs to either place is captured.
+        let engine = documents.deletingLastPathComponent()
+            .appendingPathComponent("Library/Application Support/horizon/logs/latest.log")
+        let latest = [engine, documents.appendingPathComponent("logs/latest.log")]
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+            .max { modified($0) < modified($1) }
+        var files = ["logs/launcher.log", "logs/launcher-1.log", "horizon-boot.log"]
             .map { documents.appendingPathComponent($0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
+        if let latest { files.insert(latest, at: 0) }
         let crashes = documents.appendingPathComponent("crash-reports")
         let newest = (try? FileManager.default.contentsOfDirectory(at: crashes, includingPropertiesForKeys: nil))?
             .filter { $0.lastPathComponent.hasPrefix("crash-") && $0.pathExtension == "txt" }
@@ -190,6 +199,10 @@ private struct ShareLogs: View {
             popover.sourceRect = CGRect(x: host.view.bounds.midX, y: host.view.bounds.midY, width: 1, height: 1)
         }
         host.present(sheet, animated: true)
+    }
+
+    private func modified(_ url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
     }
 }
 

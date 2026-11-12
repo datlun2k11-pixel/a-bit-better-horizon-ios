@@ -367,6 +367,36 @@ fn parse_source<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String
         .unwrap_or_else(|panic| Err(format!("{SOURCE_PANIC}{panic}")))
 }
 
+/// What the chat says a refused pack did: the reason, then the first line of a few notes that
+/// explain it, inside one screen of chat text.
+fn failure_detail(error: &str, notes: &[String]) -> String {
+    let clip = |text: &str, max: usize| {
+        let line = text.lines().next().unwrap_or_default().trim();
+        match line.char_indices().nth(max) {
+            Some((cut, _)) => line[..cut].trim_end().to_owned(),
+            None => line.to_owned(),
+        }
+    };
+    let mut detail = clip(error, 200);
+    if detail.is_empty() {
+        detail = "the pack could not run on this device".into();
+    }
+    let mut added = 0;
+    for note in notes {
+        let line = clip(note, 120);
+        if line.is_empty() || detail.contains(&line) {
+            continue;
+        }
+        if detail.chars().count() + line.chars().count() + 3 > 480 || added == 3 {
+            break;
+        }
+        detail.push_str(" | ");
+        detail.push_str(&line);
+        added += 1;
+    }
+    detail
+}
+
 fn start_parser(
     key: LoadKey,
     inputs: horizon_shaders::GameInputs,
@@ -552,7 +582,7 @@ impl Game<'_> {
             // This report is a completed GPU job, never the pending notice.
             // Apply the same quarantine as the synchronous loader so a pack
             // that the device refuses is not retried on every app launch.
-            self.shader_pack_failed(&name, dimension, &notes.join("; "));
+            self.shader_pack_failed(&name, dimension, &notes.join("; "), &notes);
         }
     }
 
@@ -674,7 +704,7 @@ impl Game<'_> {
                             Err(refused) => {
                                 let mut notes = refused.notes;
                                 notes.push(refused.reason.clone());
-                                self.shader_pack_failed(&name, dimension, &refused.reason);
+                                self.shader_pack_failed(&name, dimension, &refused.reason, &notes);
                                 record_report(&name, dimension, &[], &notes);
                             }
                         }
@@ -682,7 +712,7 @@ impl Game<'_> {
                     Err(error) => {
                         remember(&path, fingerprint(&path), None);
                         if error.starts_with(SOURCE_PANIC) {
-                            self.shader_pack_failed(&name, dimension, &error);
+                            self.shader_pack_failed(&name, dimension, &error, &[]);
                         } else {
                             self.pack_ids = None;
                             let _ = renderer.set_shader_pack(dimension, None, &[]);
@@ -850,10 +880,16 @@ impl Game<'_> {
     /// Turns off the pack `name` after loading it panicked or failed: nothing runs in its place,
     /// it is no longer the picked pack (so the next start does not load it again), and the chat
     /// says so.
-    fn shader_pack_failed(&mut self, name: &str, dimension: i32, error: &str) {
+    fn shader_pack_failed(&mut self, name: &str, dimension: i32, error: &str, notes: &[String]) {
         let path = Self::shader_packs_dir().join(name);
         remember(&path, fingerprint(&path), None);
         log::error!("shader pack {name}: turned off: {error}");
+        // The reader's explanation is the notes (a program's diagnostics, which input is missing):
+        // write them here, because a refused pack never reaches the code that warns about a loaded
+        // one's notes.
+        for note in notes {
+            log::error!("shader pack {name}: {note}");
+        }
         self.pack_ids = None;
         if let Some(renderer) = &mut self.renderer {
             // Marks this dimension as loaded, without a pack, so it is not tried again (without
@@ -864,17 +900,13 @@ impl Game<'_> {
             self.settings.horizon.shader_pack.clear();
             self.settings.save(&Self::options_path());
         }
-        // The chat carries the reason too, cut to its first line: a player reporting "it was turned
-        // off" otherwise has to find latest.log before anyone can tell what the pack did.
-        let mut reason = error.lines().next().unwrap_or_default().trim();
-        if let Some(cut) = reason.char_indices().nth(200) {
-            reason = &reason[..cut.0];
-        }
-        let message = if reason.is_empty() {
-            format!("Shader pack {name} could not be loaded and was turned off")
-        } else {
-            format!("Shader pack {name} could not be loaded and was turned off: {reason}")
-        };
+        // The chat carries the reason too, with the first few notes after it: a player reporting
+        // "it was turned off" otherwise has to find latest.log before anyone can tell what the
+        // pack did, and on a phone that file is now readable (`Settings > Share logs`).
+        let message = format!(
+            "Shader pack {name} could not be loaded and was turned off: {}",
+            failure_detail(error, notes)
+        );
         self.system_message(Text::colored(message, 0xFF5555));
     }
 
