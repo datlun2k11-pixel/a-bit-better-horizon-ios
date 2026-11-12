@@ -64,7 +64,7 @@ pub(super) struct TouchInput {
     /// The finger that is the pointer over a menu.
     menu: Option<MenuFinger>,
     /// Where the menu pointer was left in cursor mode (`touch::PointerMode::Cursor`), in GUI pixels: a
-    /// finger drags it like a touchpad's pointer, and it is drawn only while a finger is down.
+    /// finger drags it like a touchpad's pointer, and it is drawn on every menu screen.
     cursor: Option<(f32, f32)>,
     /// When the last menu tap lifted: a touch soon after it is its second tap, and halts the pointer.
     last_tap: Option<Instant>,
@@ -370,8 +370,8 @@ impl Game<'_> {
             return;
         }
         let playing = self.touch_playing();
-        // A menu opened before the pointer was ever moved: show it in the middle when a touch brings it
-        // out, rather than nowhere.
+        // A menu opened before the pointer was ever moved: show it in the middle, where a tap clicks,
+        // rather than nowhere.
         if !playing
             && self.settings.touch.pointer == touch::PointerMode::Cursor
             && self.touch.cursor.is_none()
@@ -1039,13 +1039,11 @@ impl Game<'_> {
     }
 
     /// The menu pointer in cursor mode: a mouse arrow whose tip is where a tap clicks. iOS has no
-    /// visible cursor, so the game draws the one a mouse would bring, and only while a finger is down:
-    /// an arrow left sitting over a menu is noise.
+    /// visible cursor, so the game draws the one a mouse would bring.
     pub(super) fn draw_touch_cursor(&self, batch: &mut HudBatch) {
         if self.settings.touch.pointer != touch::PointerMode::Cursor
             || self.touch_playing()
             || self.touch_on_phone()
-            || !self.touch.menu.as_ref().is_some_and(|f| !f.closed)
         {
             return;
         }
