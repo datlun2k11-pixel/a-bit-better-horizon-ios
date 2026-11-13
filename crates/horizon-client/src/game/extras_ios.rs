@@ -18,6 +18,11 @@ use horizon_client::{
 use std::time::Duration;
 use winit::{event::MouseButton, keyboard::KeyCode};
 
+// The PvP and HUD glue is shared with the desktop extras: iOS had it as a top-level game module
+// before the extras layer moved it under `extras/`.
+#[path = "extras/pvp.rs"]
+pub(in crate::game) mod pvp;
+
 #[derive(Default)]
 pub(super) struct ExtrasState {
     zoom: Zoom,
