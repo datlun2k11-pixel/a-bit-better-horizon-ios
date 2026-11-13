@@ -6,6 +6,8 @@ use std::time::Instant;
 
 pub use crate::settings::Opt;
 
+mod pack_drop;
+
 use crate::{
     gamepad::{self, GlyphStyle},
     hud::{HudAtlas, HudBatch, rgba},
@@ -1685,6 +1687,7 @@ pub enum Event {
     Packs(Vec<String>),
     /// Create World's Data Packs screen closed with a new selection.
     DataPacks(Vec<String>),
+    ImportPacks(Vec<std::path::PathBuf>),
     OpenPackFolder,
     /// Data Packs' Open Pack Folder: create the folder if needed and open it.
     OpenDataPackFolder(std::path::PathBuf),
@@ -2352,23 +2355,6 @@ impl OptionsUi {
             return None;
         };
         Some([search.x, search.y, search.width, search.height])
-    }
-    /// Whether the resource pack screen is open (not Create World's data packs on the same
-    /// page).
-    pub fn resource_packs_open(&self) -> bool {
-        self.page() == Page::Packs && self.data_pack_dir.is_none()
-    }
-    /// The packs in `resourcepacks/` changed while the pack screen is open
-    /// (`PackSelectionScreen`'s directory watcher): the screen is made again over
-    /// `infos`, keeping the selection made on it so far.
-    pub fn update_pack_infos(&mut self, infos: Vec<crate::pack_screen::PackInfo>) {
-        if let Some(p) = self.pack_screen.take()
-            && p.changed
-        {
-            self.pack_selection = p.commit();
-            self.pack_reselected = true;
-        }
-        self.pack_infos = infos;
     }
     pub fn page(&self) -> Page {
         *self.stack.last().unwrap_or(&Page::Main)
@@ -5117,6 +5103,7 @@ impl OptionsUi {
                 self.pack_focus = Instant::now();
             }
             match action {
+                crate::pack_screen::Action::Import(paths) => events.push(Event::ImportPacks(paths)),
                 crate::pack_screen::Action::OpenFolder => events.push(match &self.data_pack_dir {
                     Some(dir) => Event::OpenDataPackFolder(dir.clone()),
                     None => Event::OpenPackFolder,

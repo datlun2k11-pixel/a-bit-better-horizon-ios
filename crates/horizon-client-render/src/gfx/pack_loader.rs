@@ -19,8 +19,7 @@ pub(super) struct Request {
 pub(super) struct Finished {
     pub generation: u64,
     pub dimension: i32,
-    // The result crosses onto the fixed-size main-thread render stack.
-    pub post: Option<Box<PackPost>>,
+    pub post: Option<PackPost>,
     pub programs: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -124,7 +123,7 @@ impl Compiler {
                 };
                 let post = if post.complete && !programs.is_empty() && !stop.load(Ordering::Relaxed)
                 {
-                    Some(Box::new(post))
+                    Some(post)
                 } else {
                     notes.push(
                         "Shader pipeline could not load completely. Using normal rendering.".into(),

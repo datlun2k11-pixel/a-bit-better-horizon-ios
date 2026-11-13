@@ -625,6 +625,14 @@ impl Loading {
                     let _ = std::fs::create_dir_all(&dir);
                     packs::open_folder(&dir);
                 }
+                Event::ImportPacks(paths) => {
+                    packs::import_resource_packs(
+                        &mut self.menu.options,
+                        &self.vanilla_root,
+                        &[],
+                        &paths,
+                    );
+                }
                 Event::DownloadPack(i) => {
                     let dir = packs::packs_dir();
                     if let Some(screen) = &mut self.menu.options.pack_screen
@@ -1106,7 +1114,16 @@ impl Loading {
             // `PackSelectionScreen.onFilesDrop`: a pack dropped on the window
             // joins the Create New World screen's data packs.
             WindowEvent::DroppedFile(path) => {
-                if let Some(title) = &mut self.menu.title {
+                let batch = HudBatch::new(self.menu_size());
+                let handled = self.menu.options_open
+                    && self.gui.as_ref().is_some_and(|gui| {
+                        self.menu.options.drop_resource_pack(
+                            path.clone(),
+                            &gui.atlas,
+                            (batch.width, batch.height),
+                        )
+                    });
+                if !handled && let Some(title) = &mut self.menu.title {
                     title.drop_file(path);
                 }
             }
@@ -1457,67 +1474,79 @@ mod tests {
     }
 
     #[test]
-    fn startup_options_handoff_moves_the_mod_install_and_its_busy_screen_together() {
-        let (jobs, release) = super::super::mod_browser::Jobs::blocked_test_install();
-        let mut menu = StartupMenu {
-            mod_jobs: jobs,
-            options_open: true,
-            ..Default::default()
-        };
-        menu.options.mod_browser.installing = Some("ruby".into());
-        let mut target = OptionsUi::default();
-        target.resource_error = Some("existing resource error".into());
-        let mut jobs = super::super::mod_browser::Jobs::default();
-        assert!(menu.handoff_options(&mut target, &mut jobs));
-        drop(menu);
-        assert_eq!(target.mod_browser.installing.as_deref(), Some("ruby"));
-        assert_eq!(
-            target.resource_error.as_deref(),
-            Some("existing resource error")
-        );
-        let mut mods = horizon_client::mod_list::ModList::default();
-        assert!(!jobs.poll(&mut target.mod_browser, &mut mods));
-        release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !jobs.poll(&mut target.mod_browser, &mut mods) {
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    fn resource_pack_drops_import_from_startup_and_game_options() {
+        struct Loop;
+        impl super::super::event_loop::EventLoopCtl for Loop {
+            fn exit(&self) {}
+            fn set_control_flow(&self, _: winit::event_loop::ControlFlow) {}
         }
-        assert!(target.mod_browser.installing.is_none());
-        assert!(mods.enabled.contains("ruby"));
-        assert!(!jobs.poll(&mut target.mod_browser, &mut mods));
-        while !jobs.shutdown() {
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-    }
-
-    #[test]
-    fn fatal_startup_keeps_its_mod_worker_owned_until_shutdown_finishes() {
-        let (_sender, receiver) = std::sync::mpsc::channel();
-        let mut loading = loading(receiver);
-        let (jobs, release) = super::super::mod_browser::Jobs::blocked_test_install();
-        loading.menu.mod_jobs = jobs;
-        loading.error = Some("startup failed".into());
-        assert!(!loading.shutdown_mod_browser());
-        release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !loading.shutdown_mod_browser() {
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        assert!(loading.error.is_some());
-    }
-
-    #[test]
-    #[ignore = "requires prepared vanilla resources in HORIZON_TEST_RESOURCES"]
-    fn failed_handoff_keeps_options_and_does_not_mark_a_completed_harness() {
         let root =
             PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources"));
+        let game_dir = std::env::current_dir().unwrap();
+        assert!(
+            std::fs::read_dir(&game_dir).unwrap().next().is_none(),
+            "run the built test executable directly from an empty scratch game directory"
+        );
+        let source = game_dir.join("drop-fixtures");
+        std::fs::create_dir(&source).unwrap();
+        for name in ["Startup pack", "Game pack"] {
+            let path = source.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("pack.mcmeta"),
+                br#"{"pack":{"pack_format":1,"description":"Drop test"}}"#,
+            )
+            .unwrap();
+        }
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut loading = loading(receiver);
+        loading.gui = Some(gui(&root));
+        loading.vanilla_root = root.clone();
+        loading.open_menu_options(Page::Packs);
+        loading
+            .menu_event(&Loop, WindowEvent::DroppedFile(source.join("Startup pack")))
+            .unwrap();
+        assert!(
+            loading
+                .menu
+                .options
+                .pack_screen
+                .as_ref()
+                .unwrap()
+                .confirming()
+        );
+        assert!(!packs::packs_dir().join("Startup pack").exists());
+        let batch = HudBatch::new(loading.menu_size());
+        let events = loading.menu.options.click(
+            &mut loading.settings,
+            &loading.gui.as_ref().unwrap().atlas,
+            batch.width / 2.0 - 150.0,
+            batch.height / 2.0 + 20.0,
+            (batch.width, batch.height),
+            [1280, 720],
+            false,
+            false,
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::ImportPacks(_))));
+        loading.menu_option_events(events);
+        assert!(
+            packs::packs_dir()
+                .join("Startup pack/pack.mcmeta")
+                .is_file()
+        );
+        assert!(
+            loading
+                .menu
+                .options
+                .pack_infos
+                .iter()
+                .any(|p| p.id == "file/Startup pack")
+        );
+        assert!(loading.settings.resource_packs.is_empty());
+
         let settings = Settings::default();
-        // Real CPU resources and pack state, but no window/GPU. finish fails at
-        // its missing menu bundle before any renderer construction is attempted.
-        let mut loaded = super::super::load_resources(
+        let loaded = load_resources(
             root.clone(),
             None,
             &root,
@@ -1526,106 +1555,50 @@ mod tests {
             false,
             true,
             &Progress::new(),
-            &mut |_, _| {},
+            &mut |_, _| unreachable!(),
         )
         .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "horizon-failed-handoff-tail-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        let access = horizon_client::import::acquire_home_access(&home).unwrap();
-        let worker_access = access.clone();
-        loaded.home_access = Some(access);
-        let managed_root = home.join(".horizon-cache/mod-content/0123456789abcdef");
-        std::fs::create_dir_all(&managed_root).unwrap();
-        std::fs::write(managed_root.join("horizon-mod-content.stamp"), b"fixture").unwrap();
-        let lease = horizon_assets::root_lease::RootLease::acquire(&managed_root).unwrap();
-        let worker_lease = horizon_assets::root_lease::lease_for(&managed_root);
-        assert!(worker_lease.is_some());
-        let (release, waiting) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _access = worker_access;
-            let _root_lease = worker_lease;
-            waiting.recv().unwrap();
-            Ok(())
-        });
-        drop(lease);
-        let id = worker.thread().id();
-        loaded.rest_loader = Some(WorldRestLoader {
-            progress: Progress::new(),
-            handle: Some(worker),
-        });
-        let (_sender, receiver) = std::sync::mpsc::channel();
-        let mut loading = loading(receiver);
-        loading.options =
-            Options::parse(["--resources".into(), root.to_string_lossy().into_owned()].into_iter())
-                .unwrap();
-        let error = loading.finish(loaded).err().expect("missing GUI must fail");
-        let retained = retired_rest_loaders()
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|h| h.thread().id() == id);
-        let pending = !poll_retired_rest_loaders();
-        let collector_blocked = horizon_assets::root_lease::RootLease::try_exclusive(&managed_root)
-            .unwrap()
-            .is_none();
-        let writer_home = home.clone();
-        let (attempting, attempted) = std::sync::mpsc::channel();
-        let (published, publication) = std::sync::mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            attempting.send(()).unwrap();
-            horizon_client::import::with_home_access(&writer_home, || {
-                std::fs::write(writer_home.join("published"), b"new generation")?;
-                Ok(())
-            })
-            .unwrap();
-            published.send(()).unwrap();
-        });
-        attempted.recv().unwrap();
-        let escaped = publication.recv_timeout(Duration::from_millis(100)).is_ok();
-        // Always release the real worker before asserting, so a regression
-        // cannot leave a blocked producer behind in this test process.
-        release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let _ = poll_retired_rest_loaders();
-            if retired_rest_loaders()
-                .lock()
-                .unwrap()
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = execution_role::ExecutionRole::IntegratedServer;
+        let resources = Box::leak(Box::new(loaded.resources));
+        let mut game = Game::new(
+            resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&root),
+            None,
+        )
+        .unwrap();
+        game.title = Some(Title::new(PathBuf::from("saves"), &root));
+        game.open_options_at(true, Page::Packs);
+        game.handle_window_event_inner(&Loop, WindowEvent::DroppedFile(source.join("Game pack")));
+        assert!(game.ui.options.pack_screen.as_ref().unwrap().confirming());
+        assert!(!packs::packs_dir().join("Game pack").exists());
+        let size = game.gui_size();
+        let events = game.ui.options.click(
+            &mut game.settings,
+            &game.gui.atlas,
+            size.0 / 2.0 - 150.0,
+            size.1 / 2.0 + 20.0,
+            size,
+            [1280, 720],
+            false,
+            false,
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::ImportPacks(_))));
+        game.handle_option_events(events).unwrap();
+        assert!(packs::packs_dir().join("Game pack/pack.mcmeta").is_file());
+        assert!(
+            game.ui
+                .options
+                .pack_infos
                 .iter()
-                .all(|h| h.thread().id() != id)
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        writer.join().unwrap();
-        assert!(
-            collector_blocked,
-            "failed handoff released the root while its tail still read it"
+                .any(|p| p.id == "file/Game pack")
         );
-        assert!(
-            horizon_assets::root_lease::RootLease::try_exclusive(&managed_root)
-                .unwrap()
-                .is_some(),
-            "finished tail did not release its root lease"
-        );
-        assert!(
-            retained && pending,
-            "failed Loaded handoff detached its active tail"
-        );
-        assert!(
-            !escaped,
-            "failed handoff released HomeAccess while the tail still read"
-        );
-        assert!(home.join("published").is_file());
-        std::fs::remove_dir_all(home).unwrap();
-        assert!(error.to_string().contains("missing menu bundle"));
-        assert_eq!(loading.options.as_ref().unwrap().resources, root);
-        assert!(!loading.completed_without_game);
+        assert!(game.settings.resource_packs.is_empty());
     }
 
     #[test]

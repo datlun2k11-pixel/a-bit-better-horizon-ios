@@ -205,7 +205,12 @@ impl Game<'_> {
                 let Some(f) = self.item_frames.iter_mut().find(|f| f.id == id) else {
                     continue;
                 };
-                apply_frame_metadata(f, *index, value);
+                match (index, value) {
+                    (0, Value::Byte(flags)) => f.invisible = (*flags as u8 & 0x20) != 0,
+                    (8, Value::Id(d)) => f.facing = (*d).clamp(0, 5) as u8,
+                    (10, Value::Int(r)) => f.rotation = r.rem_euclid(8) as i8,
+                    _ => {}
+                }
                 if let Some(item) = item {
                     f.item = item;
                 }
@@ -515,7 +520,7 @@ fn apply_frame_metadata(frame: &mut ItemFrame, index: u8, value: &Value) {
     match (index, value) {
         (0, Value::Byte(flags)) => frame.invisible = flags & 0x20 != 0,
         (8, Value::Id(direction)) => frame.facing = (*direction).clamp(0, 5) as u8,
-        (10, Value::Int(rotation)) => frame.rotation = rotation.rem_euclid(8) as u8,
+        (10, Value::Int(rotation)) => frame.rotation = rotation.rem_euclid(8) as i8,
         _ => {}
     }
 }

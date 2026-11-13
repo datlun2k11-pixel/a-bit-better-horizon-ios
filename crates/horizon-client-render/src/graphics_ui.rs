@@ -76,6 +76,7 @@ pub enum H {
     EntityCullingPrecheck,
     ParticleCulling,
     LeafCulling,
+    OpaqueIce,
     CacheShulkerBoxes,
     CacheSigns,
     CacheDecoratedPots,
@@ -95,8 +96,11 @@ pub enum H {
     Workers,
     Overlay,
     ResolutionScale,
+    DynamicResolution,
+    TargetFps,
     Antialiasing,
     Upscaling,
+    UpscalingSharpness,
     ScreenshotQuality,
     FrameGeneration,
     Hdr,
@@ -368,6 +372,16 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "World pixels per screen pixel. Below 100% is faster on the GPU.",
                         ),
                         h(
+                            H::DynamicResolution,
+                            Medium,
+                            "Raises Resolution Scale toward 100% while the frame rate allows it.",
+                        ),
+                        h(
+                            H::TargetFps,
+                            Low,
+                            "The frame rate Dynamic Resolution keeps.",
+                        ),
+                        h(
                             H::Antialiasing,
                             Medium,
                             "Smooths jagged edges. FXAA: softer. TAA: smoothest, moving things may trail.",
@@ -376,6 +390,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             H::Upscaling,
                             High,
                             "Renders the world smaller and rebuilds it with TAA. Faster, softer.",
+                        ),
+                        h(
+                            H::UpscalingSharpness,
+                            Low,
+                            "Sharpens the upscaled picture. Higher: crisper edges, more shimmer.",
                         ),
                         h(
                             H::ScreenshotQuality,
@@ -451,6 +470,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             H::LeafCulling,
                             Saves,
                             "Draws or drops leaf faces inside canopies. Off keeps vanilla's fancy leaves.",
+                        ),
+                        h(
+                            H::OpaqueIce,
+                            Saves,
+                            "Draws ice in the solid pass, without its see-through texture.",
                         ),
                     ],
                 ),
@@ -790,6 +814,8 @@ impl H {
             }
             H::Workers => Some(g.workers as f32 / max_workers() as f32),
             H::ResolutionScale => Some((g.resolution_scale as f32 - 50.0) / 150.0),
+            H::TargetFps => Some((g.target_fps as f32 - 30.0) / 210.0),
+            H::UpscalingSharpness => Some(g.upscaling_sharpness as f32 / 100.0),
             // Auto, then 10..480 by 10.
             H::HdrPaperWhite => Some(g.hdr_paper_white as f32 / 480.0),
             // Auto, then 200..2000 by 50.
@@ -809,6 +835,8 @@ impl H {
             H::UploadBudget => Some((UPLOAD_STEPS.len() - 1) as u32),
             H::Workers => Some(max_workers()),
             H::ResolutionScale => Some(30),
+            H::TargetFps => Some(42),
+            H::UpscalingSharpness => Some(20),
             H::HdrPaperWhite => Some(41),
             H::HdrPeak => Some(37),
             H::HdrBlackLevel => Some(100),
@@ -848,6 +876,7 @@ impl H {
             ),
             H::ParticleCulling => labelled("Particle Culling", g.particle_culling.label()),
             H::LeafCulling => labelled("Leaf Culling", g.leaf_culling.label()),
+            H::OpaqueIce => labelled("Opaque Ice", on_off(g.opaque_ice)),
             H::CacheShulkerBoxes => labelled("Shulker Boxes", on_off(g.cache_shulker_boxes)),
             H::CacheSigns => labelled("Signs", on_off(g.cache_signs)),
             H::CacheDecoratedPots => labelled("Decorated Pots", on_off(g.cache_decorated_pots)),
@@ -889,6 +918,8 @@ impl H {
                 n => labelled("Worker Threads", n),
             },
             H::ResolutionScale => labelled_percent("Resolution Scale", g.resolution_scale),
+            H::DynamicResolution => labelled("Dynamic Resolution", on_off(g.dynamic_resolution)),
+            H::TargetFps => labelled("Target FPS", g.target_fps),
             H::Antialiasing => labelled(
                 "Anti-aliasing",
                 match (g.fxaa, g.taa) {
@@ -898,6 +929,9 @@ impl H {
                 },
             ),
             H::Upscaling => labelled("Upscaling", g.upscaling.label()),
+            H::UpscalingSharpness => {
+                labelled("Upscaling Sharpness", format!("{}%", g.upscaling_sharpness))
+            }
             H::ScreenshotQuality => {
                 labelled("Screenshot Quality", format!("{}x", g.screenshot_quality))
             }
@@ -971,6 +1005,8 @@ impl H {
             }
             H::Workers => g.workers = (v * max_workers() as f32).round() as u32,
             H::ResolutionScale => g.resolution_scale = (50.0 + (v * 30.0).round() * 5.0) as u32,
+            H::TargetFps => g.target_fps = (30.0 + (v * 42.0).round() * 5.0) as u32,
+            H::UpscalingSharpness => g.upscaling_sharpness = (v * 20.0).round() as u32 * 5,
             H::HdrPaperWhite => g.hdr_paper_white = (v * 48.0).round() as u32 * 10,
             H::HdrPeak => {
                 g.hdr_peak = match (v * 37.0).round() as u32 {
@@ -1017,6 +1053,7 @@ impl H {
             H::LeafCulling => {
                 g.leaf_culling = step(&LeafCullingMode::ALL, g.leaf_culling, back);
             }
+            H::OpaqueIce => g.opaque_ice = !g.opaque_ice,
             H::CacheShulkerBoxes => g.cache_shulker_boxes = !g.cache_shulker_boxes,
             H::CacheSigns => g.cache_signs = !g.cache_signs,
             H::CacheDecoratedPots => g.cache_decorated_pots = !g.cache_decorated_pots,
@@ -1030,6 +1067,7 @@ impl H {
             H::Fog => g.fog = !g.fog,
             H::Weather => g.weather = !g.weather,
             H::AnimatedTextures => g.animated_textures = !g.animated_textures,
+            H::DynamicResolution => g.dynamic_resolution = !g.dynamic_resolution,
             H::DitherCutoutMips => g.dither_cutout_mips = !g.dither_cutout_mips,
             H::PresentMode => g.present_mode = step(&PresentMode::ALL, g.present_mode, back),
             // Off, FXAA, TAA.
@@ -1173,10 +1211,12 @@ impl Item {
             Item::Horizon(H::CacheChests) => g.cache_chests,
             Item::Horizon(H::CacheBanners) => g.cache_banners,
             Item::Horizon(H::CacheCopperGolemStatues) => g.cache_copper_golem_statues,
+            Item::Horizon(H::OpaqueIce) => g.opaque_ice,
             Item::Horizon(H::Sky) => g.sky,
             Item::Horizon(H::Fog) => g.fog,
             Item::Horizon(H::Weather) => g.weather,
             Item::Horizon(H::AnimatedTextures) => g.animated_textures,
+            Item::Horizon(H::DynamicResolution) => g.dynamic_resolution,
             Item::Horizon(H::DitherCutoutMips) => g.dither_cutout_mips,
             Item::Horizon(H::Hdr) => g.hdr_on(),
             Item::Horizon(H::HdrLighting) => g.hdr_lighting,
@@ -3235,6 +3275,8 @@ mod tests {
             H::UploadBudget,
             H::Workers,
             H::ResolutionScale,
+            H::TargetFps,
+            H::UpscalingSharpness,
             H::HdrPaperWhite,
             H::HdrPeak,
             H::HdrBlackLevel,

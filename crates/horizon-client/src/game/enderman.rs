@@ -127,6 +127,7 @@ impl Game<'_> {
                 || &*support.name == "minecraft:bedrock"
                 || !support.full_collision
                 || !b.can_survive(level, ticks, at, state)
+
             {
                 return None;
             }
@@ -282,3 +283,6 @@ impl Game<'_> {
         })
     }
 }
+#[cfg(test)]
+#[path = "enderman_occupancy_tests.rs"]
+mod occupancy_tests;
