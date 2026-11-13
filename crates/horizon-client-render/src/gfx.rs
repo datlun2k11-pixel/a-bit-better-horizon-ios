@@ -11706,11 +11706,28 @@ impl Renderer {
             let mut pages = std::mem::take(&mut self.pack_pages);
             pages.clear();
             if pack_draws_terrain || pack_draws_shadow {
-                pages.extend(
-                    self.arena
-                        .page_buffers()
-                        .map(|(p, b)| (p, b.clone(), self.terrain_metadata.page(p).clone())),
-                );
+                // Terrain meshed in the compact layout has no sidecar, and a page
+                // it made can outlive the layout switch until it empties: a pack's
+                // terrain program reads one for every page it binds, so give any
+                // page without one a zeroed sidecar instead of panicking on it.
+                let stride = std::mem::size_of::<TerrainVertex>() as u64;
+                let missing: Vec<(u32, u64)> = self
+                    .arena
+                    .page_buffers()
+                    .filter(|(page, _)| !self.terrain_metadata.has(*page))
+                    .map(|(page, buffer)| (page, buffer.size() / stride))
+                    .collect();
+                for (page, vertices) in missing {
+                    if !self.terrain_metadata.ensure(&self.device, page, vertices) {
+                        log::warn!(
+                            "Horizon renderer: terrain metadata for page {page} is missing; \
+                             the page draws no shader-pack terrain"
+                        );
+                    }
+                }
+                pages.extend(self.arena.page_buffers().filter_map(|(p, b)| {
+                    Some((p, b.clone(), self.terrain_metadata.get(p)?.clone()))
+                }));
             }
             let mut terrain =
                 |rp: &mut wgpu::RenderPass<'_>,

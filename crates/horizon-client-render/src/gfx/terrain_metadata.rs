@@ -117,10 +117,37 @@ impl TerrainMetadata {
         );
         true
     }
-    pub fn page(&self, page: u32) -> &wgpu::Buffer {
-        self.pages
+    pub fn has(&self, page: u32) -> bool {
+        self.pages.contains_key(&page)
+    }
+    /// A sidecar for a page the arena made without one: terrain meshed in the
+    /// compact layout uploads none, and such a page outlives the layout switch
+    /// until it empties. A pack's terrain program reads every page it binds, so
+    /// a missing sidecar becomes a zeroed one (no block identity, no lighting).
+    pub fn ensure(&mut self, device: &wgpu::Device, page: u32, capacity: u64) -> bool {
+        let bytes = capacity.div_ceil(4).max(1) * BYTES;
+        if self
+            .pages
             .get(&page)
-            .expect("quad metadata accompanies every terrain page")
+            .is_some_and(|buffer| buffer.size() >= bytes)
+        {
+            return true;
+        }
+        let Some(new) = super::arena::try_create(
+            device,
+            "Terrain metadata",
+            bytes,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        ) else {
+            return false;
+        };
+        self.pages.insert(page, new);
+        true
+    }
+    pub fn get(&self, page: u32) -> Option<&wgpu::Buffer> {
+        self.pages.get(&page)
     }
     pub fn retain(&mut self, live: impl Fn(u32) -> bool) -> Vec<wgpu::Buffer> {
         self.pages
@@ -173,7 +200,7 @@ mod tests {
             lighting: None,
         };
         assert!(metadata.upload(&device, &mut encoder, &mut uploads, (9, 4, 8), [first]));
-        let original = metadata.page(9).clone();
+        let original = metadata.get(9).unwrap().clone();
         // Water-only geometry stays raw even when compact packing is enabled.
         // Use the same representation selector as Renderer::upload_mesh and
         // read the actual GPU sidecar below, after page growth and compaction.
@@ -186,7 +213,7 @@ mod tests {
             .upload_states(true, false)
             .expect("raw water has metadata in packed mode");
         assert!(metadata.upload(&device, &mut encoder, &mut uploads, (9, 8, 16), states));
-        assert_ne!(&original, metadata.page(9));
+        assert_ne!(&original, metadata.get(9).unwrap());
         let read = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 4 * BYTES,
@@ -195,7 +222,7 @@ mod tests {
         });
         // Arena compaction moves both quads into another page before the old page is freed.
         assert!(metadata.copy_range(&device, &mut encoder, (9, 4), (10, 4), 16, 8));
-        encoder.copy_buffer_to_buffer(metadata.page(10), 0, &read, 0, 4 * BYTES);
+        encoder.copy_buffer_to_buffer(metadata.get(10).unwrap(), 0, &read, 0, 4 * BYTES);
         uploads.finish(&encoder);
         queue.submit([encoder.finish()]);
         read.slice(..)

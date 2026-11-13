@@ -3,7 +3,7 @@
 # Its separate workspace keeps host builds from compiling the game a second time.
 [package]
 name = "horizon-android"
-version = "0.2.8"
+version = "0.2.91"
 edition = "2024"
 license = "MIT"
 publish = false
