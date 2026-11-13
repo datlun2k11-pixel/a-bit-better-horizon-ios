@@ -35,6 +35,42 @@ const MAX_PACKED: u64 = 2 << 30;
 const MAX_UNPACKED: u64 = 4 << 30;
 const MAX_ENTRIES: usize = 50_000;
 
+/// What an import is doing, for a phone's launcher to draw (packaging/ios/Launcher). One archive at
+/// a time is unpacked on a phone, and the launcher asks for this while it is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportStatus {
+    /// The archive's file name, as the person who sent it named it.
+    pub label: String,
+    pub files: usize,
+    pub total_files: usize,
+    pub bytes: u64,
+    /// Why the archive could not be installed. It stays until the next import starts.
+    pub error: Option<String>,
+}
+
+static STATUS: Mutex<Option<ImportStatus>> = Mutex::new(None);
+
+/// The archive being unpacked now, or the last one that failed. `None` when nothing is happening.
+pub fn status() -> Option<ImportStatus> {
+    STATUS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+fn set_status(status: Option<ImportStatus>) {
+    *STATUS.lock().unwrap_or_else(PoisonError::into_inner) = status;
+}
+
+/// Count one more file out, for the launcher's progress bar.
+fn report_progress(files: usize, bytes: u64) {
+    let mut status = STATUS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(status) = status.as_mut() {
+        status.files = files;
+        status.bytes = bytes;
+    }
+}
+
 #[derive(Debug, Default)]
 struct HomeGate {
     busy: Mutex<bool>,
@@ -291,6 +327,8 @@ pub struct Pack {
     /// Every entry above the root the game reads, including the trailing `/`: `""`, `"Horizon/"`, or
     /// `"horizon-client/26.3/"` for somebody who compressed one folder too many.
     prefix: String,
+    /// Every file the archive holds, for the importing screen's progress bar.
+    total_files: usize,
     pub kind: Kind,
 }
 
@@ -318,6 +356,7 @@ impl Pack {
         if names.is_empty() {
             return Err("the archive holds nothing".into());
         }
+        let total_files = names.len();
         names.sort();
         // Descend through at most two shared folders looking for the marker, because compressing
         // `.local/horizon-client` rather than `26.3` is a mistake a careful person still makes.
@@ -362,13 +401,14 @@ impl Pack {
             path: path.to_owned(),
             item,
             prefix,
+            total_files,
             kind,
         })
     }
 
     /// Read every entry out into `into`, which is created here. Anything that goes wrong removes
     /// `into` again: the game must never see a half tree.
-    fn unpack(&mut self, into: &Path) -> Result<(usize, u64)> {
+    fn unpack(&mut self, into: &Path, progress: &mut dyn FnMut(usize, u64)) -> Result<(usize, u64)> {
         fs::create_dir_all(into)?;
         let mut files = 0;
         let mut written = 0u64;
@@ -404,6 +444,7 @@ impl Pack {
             }
             written += copied;
             files += 1;
+            progress(files, written);
         }
         Ok((files, written))
     }
@@ -462,7 +503,44 @@ impl Pack {
     /// Put the archive where the game reads it, under `home` (`Documents` on a phone), and consume
     /// it: a phone does not have 589 MB to spend twice, and what arrives is a copy of something that
     /// is still on the computer that sent it.
-    pub fn install(mut self, home: &Path) -> Result<Installed> {
+    pub fn install(self, home: &Path) -> Result<Installed> {
+        let label = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.item.clone());
+        let total_files = self.total_files;
+        set_status(Some(ImportStatus {
+            label,
+            files: 0,
+            total_files,
+            bytes: 0,
+            error: None,
+        }));
+        let result = self.install_now(home);
+        let mut status = STATUS.lock().unwrap_or_else(PoisonError::into_inner);
+        match &result {
+            Ok(_) => *status = None,
+            // Kept for the launcher to show: a phone's player can read the screen, not the log.
+            Err(error) => {
+                if let Some(status) = status.as_mut() {
+                    status.error = Some(error.to_string());
+                } else {
+                    *status = Some(ImportStatus {
+                        label: String::new(),
+                        files: 0,
+                        total_files: 0,
+                        bytes: 0,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+        drop(status);
+        result
+    }
+
+    fn install_now(mut self, home: &Path) -> Result<Installed> {
         fs::create_dir_all(home)?;
         with_home_access(home, || {
             let archive = self.path.clone();
@@ -483,14 +561,14 @@ impl Pack {
                 // A world is never written over: what would be overwritten is the player's own.
                 Kind::World => {
                     let dest = unique(&home.join(folder).join(&self.item));
-                    let (files, bytes) = self.unpack(&dest)?;
+                    let (files, bytes) = self.unpack(&dest, &mut report_progress)?;
                     fs::remove_file(&archive)?;
                     (dest, files, bytes)
                 }
                 Kind::Resources => {
                     let scratch = home.join("resources.unpacking");
                     let _ = fs::remove_dir_all(&scratch);
-                    let (files, bytes) = self.unpack(&scratch)?;
+                    let (files, bytes) = self.unpack(&scratch, &mut report_progress)?;
                     let dest = home.join(folder);
                     publish(&scratch, &dest)?;
                     fs::remove_file(&archive)?;
