@@ -42,10 +42,16 @@ pub fn main_with(mods: crate::mod_api::Mods) {
     horizon_airplay::register();
     horizon_airplay::audio::start();
     #[cfg(target_os = "ios")]
-    if let Err(error) = into_app_sandbox() {
-        eprintln!("Horizon: {error}");
-        std::process::exit(1);
-    }
+    let documents = match into_app_sandbox() {
+        Ok(documents) => documents,
+        Err(error) => {
+            eprintln!("Horizon: {error}");
+            std::process::exit(1);
+        }
+    };
+    // `android_main` already moved into the app's files folder.
+    #[cfg(target_os = "android")]
+    let documents = std::env::current_dir().unwrap_or_default();
 
     // The platform's features the dedicated server loads from server.toml, through the engine's hooks.
     horizon_chat_filter::install();
@@ -112,6 +118,14 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         if side == "client" {
             horizon_client::msa::restore(&home);
         }
+    }
+    // What a phone does with its files before the game looks for them, once the log can say so:
+    // on a worker, because a launch that unpacks a prepared archive before its first frame is what
+    // iOS's watchdog kills. The launcher holds Play back until these files exist, so this is the
+    // only door an archive dropped into `Documents` has.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    if !help {
+        horizon_client::import::boot(&documents);
     }
     let renderers = crate::mod_api::mods()
         .iter()

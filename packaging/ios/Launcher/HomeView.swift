@@ -67,10 +67,11 @@ struct HomeView: View {
         .onChange(of: link.phase) { phase in
             LauncherLog.write("game phase: \(String(describing: phase))")
         }
-        // First run: the launcher starts the game-files download itself, and its card shows the unpacking.
-        .task(id: link.phase) {
-            if link.phase == .waiting { await download.startAutomaticallyIfNeeded() }
-        }
+        // First run: a zip the player dropped in comes first, then the launcher's own download;
+        // the game's unpacking card shows either one. The game reports when the archive it found
+        // at launch is still being installed, so neither door touches that zip a second time.
+        .task(id: link.phase) { await beginGameFilesSetup() }
+        .task(id: link.bootImporting) { await beginGameFilesSetup() }
         .task {
             await updates.check()
             link.uncover = onPlay
@@ -297,6 +298,14 @@ struct HomeView: View {
                                         startPoint: .topTrailing, endPoint: .bottomLeading))
         }
         .clipShape(RoundedRectangle(cornerRadius: 28))
+    }
+
+    /// A dropped zip is offered before the network: it is what the player already did. The game's
+    /// launch-time install owns the folder until it says it is done, so neither door runs twice.
+    private func beginGameFilesSetup() async {
+        guard link.phase == .waiting, !link.bootImporting else { return }
+        if link.importDroppedArchives() { return }
+        await download.startAutomaticallyIfNeeded()
     }
 
     private var playLabel: String {

@@ -524,7 +524,13 @@ impl Loading {
                 "launcher-cancel-start" => cancel_start(request),
                 "launcher-state" => {
                     let state = if horizon_ios_launcher::waiting() {
-                        json!({ "phase": "waiting", "import": import_state() })
+                        json!({
+                            "phase": "waiting",
+                            "import": import_state(),
+                            // An archive the launch found is still being installed: the launcher
+                            // must not hand the same zip over again, nor race it with a download.
+                            "importing": horizon_client::import::boot_importing(),
+                        })
                     } else if self.importing() {
                         json!({ "phase": "needs_files", "reason": self.import_reason(), "import": import_state() })
                     } else {

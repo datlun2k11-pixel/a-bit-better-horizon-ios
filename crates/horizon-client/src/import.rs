@@ -21,7 +21,10 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock, PoisonError, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use zip::{CompressionMethod, ZipArchive, write::SimpleFileOptions, write::ZipWriter};
 
@@ -68,6 +71,77 @@ fn report_progress(files: usize, bytes: u64) {
     if let Some(status) = status.as_mut() {
         status.files = files;
         status.bytes = bytes;
+    }
+}
+
+/// Whether the launch-time import was started, and whether it is still running.
+static BOOT_STARTED: AtomicBool = AtomicBool::new(false);
+static BOOT_DONE: (Mutex<bool>, Condvar) = (Mutex::new(true), Condvar::new());
+
+/// Whether an archive the launch found in `Documents` is still being installed.
+pub fn boot_importing() -> bool {
+    BOOT_STARTED.load(Ordering::Relaxed)
+        && !*BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Install what a phone's `Documents` holds, on a worker: a prepared tree is hundreds of megabytes
+/// and thousands of files, and unpacking it on the thread that runs the app is what iOS's launch
+/// watchdog kills (`0x8badf00d`, a black launch screen and a relaunch) before a window appears.
+///
+/// Called once, before the event loop; [`wait_for_boot_import`] is how the loader hears it is over.
+/// The launcher holds Play back while the game files are missing, so an archive dropped into that
+/// folder has to be taken here: nothing else looks at it before a start.
+pub fn boot(home: &Path) {
+    if !cfg!(any(target_os = "ios", target_os = "android"))
+        || BOOT_STARTED.swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    *BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    let home = home.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("horizon-import-boot".into())
+        .spawn(move || {
+            // Also on a panic: the loader must never wait on a thread that is gone.
+            let _finished = FinishBoot;
+            // A swap that a flat battery or a crash left half done is finished, or the old tree put
+            // back, before anything reads the folder it was working on.
+            match recover(&home) {
+                Ok(Some(path)) => log::info!("Horizon: finished the import at {}", path.display()),
+                Ok(None) => {}
+                Err(error) => log::error!("Horizon: could not finish the last import: {error}"),
+            }
+            // The cable's door: an archive dropped into `Documents` is installed here, so the
+            // launch it was dropped for is the one that finds it.
+            scan(&home);
+        });
+    if let Err(error) = spawned {
+        log::error!("Horizon: could not start the import worker: {error}");
+        finish_boot();
+    }
+}
+
+struct FinishBoot;
+
+impl Drop for FinishBoot {
+    fn drop(&mut self) {
+        finish_boot();
+    }
+}
+
+fn finish_boot() {
+    *BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    BOOT_DONE.1.notify_all();
+}
+
+/// Wait until [`boot`]'s worker is done (at once when there is nothing to do, as on a desktop).
+pub fn wait_for_boot_import() {
+    if !BOOT_STARTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut done = BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner);
+    while !*done {
+        done = BOOT_DONE.1.wait(done).unwrap_or_else(PoisonError::into_inner);
     }
 }
 

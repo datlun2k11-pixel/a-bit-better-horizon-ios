@@ -124,6 +124,12 @@ final class GameLink: ObservableObject {
     @Published private(set) var importing: ImportProgress?
     /// The failed import the player put away: the game keeps saying it until the next one starts.
     private var dismissedImport: String?
+    /// The game is still installing what it found in `Documents` at launch.
+    @Published private(set) var bootImporting = false
+    /// The zip in `Documents` being handed to the game's importer now.
+    private var droppedImport: Task<Void, Never>?
+    /// The zips already handed over this run: a bad archive is not retried until the next launch.
+    private var offeredDrops: Set<String> = []
 
     /// Uncover the game (Present.swift dismisses the launcher).
     var uncover: () -> Void = {}
@@ -185,6 +191,12 @@ final class GameLink: ObservableObject {
             self.version = version
         }
         applyImport(state["import"] as? [String: Any])
+        bootImporting = state["importing"] as? Bool ?? false
+        // A zip copied in while the launcher was up. Play stays disabled until the game files are
+        // in, so the launcher is the one that has to hand it to the game's importer.
+        if phase == .waiting, !bootImporting, !GameFolder.hasGameFiles, importing == nil {
+            importDroppedArchives()
+        }
         if phase == .title, was != .title {
             if let action = queued {
                 queued = nil
@@ -214,6 +226,45 @@ final class GameLink: ObservableObject {
     func dismissImport() {
         dismissedImport = importing?.error
         importing = nil
+    }
+
+    /// Every `.zip` the Files app put in the game's folder.
+    private func zipsInDocuments() -> [URL] {
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: GameFolder.documents, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        )) ?? []
+        return files.filter { $0.pathExtension.lowercased() == "zip" }
+    }
+
+    /// Hand the game's importer every zip in its folder that has not been offered yet. The game
+    /// looks at that folder itself at launch, but only before the launcher takes Play away; this is
+    /// the same door for a zip copied in while the launcher is up. The game checks what each archive
+    /// holds, so its wait screen and this one install the same things. Says whether it found one.
+    @discardableResult
+    func importDroppedArchives() -> Bool {
+        guard droppedImport == nil, !bootImporting, !GameFolder.hasGameFiles else { return false }
+        let waiting = zipsInDocuments().filter {
+            !$0.lastPathComponent.hasPrefix("horizon-download-")
+                && offeredDrops.insert($0.path).inserted
+        }
+        guard !waiting.isEmpty else { return false }
+        droppedImport = Task { @MainActor [weak self] in
+            for zip in waiting {
+                guard let self else { return }
+                LauncherLog.write("offering \(zip.lastPathComponent) to the game's importer")
+                let answer = await self.send("import \(zip.path)")
+                if let error = answer.error {
+                    LauncherLog.write("\(zip.lastPathComponent) was not installed: \(error)")
+                    // A leftover archive the game would not take: say why, once.
+                    self.problem = "\(zip.lastPathComponent): \(error)"
+                } else {
+                    LauncherLog.write("installed \(zip.lastPathComponent) as \(answer["kind"] as? String ?? "unknown")")
+                }
+                await self.refresh()
+            }
+            self?.droppedImport = nil
+        }
+        return true
     }
 
     /// Read the worlds and servers again.
