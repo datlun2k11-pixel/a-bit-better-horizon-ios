@@ -405,6 +405,12 @@ pub(super) fn spawn_loader(
                 // it was dropped for; `scan` says what it took and what it left alone.
                 horizon_client::import::scan(&import_home);
             }
+            // The scan above may be what installed the game files, and the base was resolved before
+            // this thread started: point it at what is actually on disk now.
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            let vanilla_root =
+                horizon_client::import::resources_root(&vanilla_root, Some(import_home.as_path()))
+                    .unwrap_or(vanilla_root);
             let load = || {
                 // A detached tail and the Loaded handoff retain clones of this
                 // same transaction; neither reacquires a lock on the UI thread.
