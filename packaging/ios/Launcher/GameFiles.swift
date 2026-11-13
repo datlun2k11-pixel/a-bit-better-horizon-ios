@@ -110,8 +110,10 @@ final class GameFilesDownload: NSObject, ObservableObject {
         begin(url: url, token: nil)
     }
 
-    /// Import through the same resource-only validator as automatic setup.
-    func importPreparedFile(_ url: URL) async {
+    /// Install a ZIP the player picked in Files: game files, a world or a resource pack, as the game's
+    /// importer recognizes it. The automatic setup keeps its resource-only command; this one is generic
+    /// because the picker offers whatever archive the player has.
+    func importChosen(_ url: URL) async {
         guard !busy else { return }
         resourcesOnly = false
         attempt = UUID()
@@ -135,7 +137,7 @@ final class GameFilesDownload: NSObject, ObservableObject {
                 try FileManager.default.copyItem(at: url, to: local)
             }.value
             guard generation == attempt, !Task.isCancelled else { return }
-            let answer = await importArchive("import-game-files \(local.path)")
+            let answer = await importArchive("import \(local.path)")
             guard generation == attempt else { return }
             if let error = answer.error { state = .failed(error); Haptics.failed() }
             else { state = .done(Self.describe(answer)); Haptics.done() }
@@ -330,6 +332,8 @@ struct GameFilesCard: View {
     /// The game has none yet: say so first.
     var missing: Bool
     var setupHelp: (() -> Void)? = nil
+    @State private var choosingFile = false
+    @State private var fileIssue: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -359,6 +363,10 @@ struct GameFilesCard: View {
                     }
                     .accessibilityIdentifier("launcher-download-game-files")
                 }
+                SecondaryButton(title: "Import a ZIP from Files", icon: "doc.badge.plus") {
+                    choosingFile = true
+                }
+                .accessibilityIdentifier("launcher-import-zip")
             }
             DisclosureGroup(missing ? "Use a download link instead" : "Download from a link") {
                 Text("""
@@ -378,13 +386,22 @@ struct GameFilesCard: View {
                 PrimaryButton(title: "Download from link", icon: "arrow.down", action: download.start)
                     .disabled(download.busy || download.link.trimmingCharacters(in: .whitespaces).isEmpty)
             }
-            Text("You can also send the zip from the game's own screen over Wi-Fi, or drop it into Horizon's folder in the Files app.")
+            Text("Import a ZIP from Files for game files, a world or a resource pack. You can also send it from the game's own screen over Wi-Fi, or drop it into Horizon's folder in the Files app.")
                 .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
         .background(Theme.surface, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(missing ? Theme.noticeBorder : Theme.border))
+        .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.zip]) { result in
+            switch result {
+            case let .success(url): Task { await download.importChosen(url) }
+            case let .failure(error): fileIssue = error.localizedDescription
+            }
+        }
+        .alert("Couldn’t open that ZIP", isPresented: Binding(
+            get: { fileIssue != nil }, set: { if !$0 { fileIssue = nil } }
+        )) { Button("OK", role: .cancel) {} } message: { Text(fileIssue ?? "") }
     }
 
     @ViewBuilder private var progress: some View {
@@ -489,7 +506,7 @@ struct GameFilesRecovery: View {
         }
         .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.zip]) { result in
             switch result {
-            case let .success(url): Task { await download.importPreparedFile(url) }
+            case let .success(url): Task { await download.importChosen(url) }
             case let .failure(error): fileIssue = error.localizedDescription
             }
         }
