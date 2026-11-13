@@ -174,14 +174,25 @@ private struct ShareLogs: View {
         // newest `latest.log` of the two, so a build that logs to either place is captured.
         let engine = documents.deletingLastPathComponent()
             .appendingPathComponent("Library/Application Support/horizon")
-        let latest = [engine.appendingPathComponent("logs/latest.log"),
-                      documents.appendingPathComponent("logs/latest.log")]
+        let logFolders: [URL] = [engine.appendingPathComponent("logs"),
+                                 documents.appendingPathComponent("logs")]
+        let latest = logFolders.map { $0.appendingPathComponent("latest.log") }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
             .max { modified($0) < modified($1) }
         var files = ["logs/launcher.log", "logs/launcher-1.log", "horizon-boot.log"]
             .map { documents.appendingPathComponent($0) }
             .filter { FileManager.default.fileExists(atPath: $0.path) }
         if let latest { files.insert(latest, at: 0) }
+        // Each start rolls the previous `latest.log` into `logs/YYYY-MM-DD-N.log.gz` (the engine
+        // keeps seven a day), so the run that failed is usually the newest archive, not
+        // `latest.log` — which holds the run the person reopened the game in to report it.
+        let rolled = logFolders.flatMap { folder in
+            (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        }
+        .filter { $0.pathExtension == "gz" }
+        .sorted { modified($0) > modified($1) }
+        var seen = Set<String>()
+        files.append(contentsOf: rolled.filter { seen.insert($0.lastPathComponent).inserted }.prefix(3))
         // The engine writes crash reports beside its log (`Library/Application Support/horizon`),
         // the launcher in `Documents`: share the newest of the two, as the log above.
         let folders: [URL] = [documents.appendingPathComponent("crash-reports"),
