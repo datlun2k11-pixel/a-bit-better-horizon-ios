@@ -29,7 +29,8 @@ pub(super) fn run_event_loop(mut game: Game<'_>) -> Result<()> {
         return game.error.take().map_or(Ok(()), Err);
     }
     let mut split = split::Split::new(game);
-    let result = event_loop()?.run_app(&mut split);
+    let window_loop = event_loop()?;
+    let result = deep(|| window_loop.run_app(&mut split));
     game = split.host;
     narrator::stop();
     leave_fullscreen_after(&result, &mut game.settings);
@@ -543,27 +544,27 @@ pub(super) enum App {
 }
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        deep(|| self.resumed_here(event_loop))
+        self.resumed_here(event_loop)
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        deep(|| self.window_event_here(event_loop, id, event))
+        self.window_event_here(event_loop, id, event)
     }
     fn device_event(&mut self, event_loop: &ActiveEventLoop, id: DeviceId, event: DeviceEvent) {
-        deep(|| self.device_event_here(event_loop, id, event))
+        self.device_event_here(event_loop, id, event)
     }
     /// iOS's memory warning while the resources load: no world is open yet, so the
     /// allocator's free pages are all there is to give back.
     fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
-        deep(|| match self {
+        match self {
             App::Loading(_) => horizon_threads::release_free_memory(),
             App::Ready(split) => ApplicationHandler::memory_warning(&mut **split, event_loop),
-        })
+        }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        deep(|| self.about_to_wait_here(event_loop))
+        self.about_to_wait_here(event_loop)
     }
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
-        deep(|| self.exiting_here(event_loop))
+        self.exiting_here(event_loop)
     }
 }
 
@@ -1000,8 +1001,20 @@ pub(super) fn event_loop() -> Result<EventLoop<()>> {
     Ok(EventLoop::new()?)
 }
 
+/// Runs the window's event loop on a 32 MB stack.
+///
+/// iOS gives its main thread 1 MB, and `winit` runs the loop on it, while the
+/// startup handoff into `Game::new` alone needs about 860 KB of frames. Moving the
+/// whole `run_app` call onto a bigger stack gives every handler that room, with a
+/// single mapping for the session.
+///
+/// Deliberately not `stacker::maybe_grow` per handler: stacker has no stack-bounds
+/// backend for iOS (`guess_os_stack_limit` is `None` there), so `maybe_grow` takes
+/// a fresh 32 MB stack for *every* event on iOS. On a 2 GB phone those repeated
+/// mappings run out of memory on the title screen (`Cannot allocate memory
+/// (os error 12)`), which panics in stacker and takes the game down.
 pub(super) fn deep<T>(work: impl FnOnce() -> T) -> T {
-    stacker::maybe_grow(1 << 20, 32 << 20, work)
+    stacker::grow(32 << 20, work)
 }
 
 pub(super) fn launcher_loading(
@@ -1060,7 +1073,8 @@ pub(super) fn run_loading(
 ) -> Result<()> {
     let loading = launcher_loading(options, settings, vanilla_root, pack_error, started)?;
     let mut app = App::Loading(Box::new(loading));
-    let result = event_loop()?.run_app(&mut app);
+    let window_loop = event_loop()?;
+    let result = deep(|| window_loop.run_app(&mut app));
     narrator::stop();
     match &mut app {
         // Ready: splitscreen around P1's game.
