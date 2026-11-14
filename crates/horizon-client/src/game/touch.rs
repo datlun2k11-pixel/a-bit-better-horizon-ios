@@ -93,6 +93,12 @@ pub(super) struct TouchInput {
     custom_keys: std::collections::BTreeMap<u16, Vec<touch::CustomKey>>,
     /// The toggle buttons that are holding their keys down.
     toggled: BTreeSet<u16>,
+    /// The keys and mouse buttons the menus' layout's buttons are holding: a separate set, so a
+    /// button of the Interaction layout and one of the playing layout that share an id never
+    /// release each other's keys.
+    menu_custom_keys: std::collections::BTreeMap<u16, Vec<touch::CustomKey>>,
+    /// The menus' layout's toggle buttons that are holding their keys down.
+    menu_toggled: BTreeSet<u16>,
     /// Controls let go after the tick that last saw them: the game samples keys once a tick, so a
     /// tap pressed and released in the same frame would otherwise be invisible to it (a double
     /// tap of forward to sprint).
@@ -133,6 +139,7 @@ impl TouchInput {
     pub(super) fn holds_key(&self, key: KeyCode) -> bool {
         self.custom_keys
             .values()
+            .chain(self.menu_custom_keys.values())
             .flatten()
             .any(|k| matches!(k, touch::CustomKey::Key(k) if *k == key))
     }
@@ -181,6 +188,8 @@ impl Game<'_> {
         self.touch.late_keys.clear();
         self.touch.custom_keys.clear();
         self.touch.toggled.clear();
+        self.touch.menu_custom_keys.clear();
+        self.touch.menu_toggled.clear();
         self.touch.analog = None;
         self.touch.menu_pads.clear();
         self.touch.menu_shift = false;
@@ -396,7 +405,7 @@ impl Game<'_> {
             // That old finger must not route a new world touch back into the menu.
             self.touch_release_menu(event_loop);
         } else {
-            if self.touch_menu_pad_touch(event_loop, touch.id, touch.phase, at, batch) {
+            if self.touch_menu_pad_touch(event_loop, touch.id, touch.phase, at, batch)? {
                 return Ok(());
             }
             if touch.phase == TouchPhase::Cancelled {
@@ -722,6 +731,69 @@ impl Game<'_> {
         Ok(())
     }
 
+    /// A button the player added to the menus' layout: the same keys and mouse buttons, read from
+    /// that layout, and its own toggle. A toggle button holds them until its next tap.
+    fn touch_menu_custom_key(
+        &mut self,
+        event_loop: &dyn EventLoopCtl,
+        id: u16,
+        pressed: bool,
+    ) -> Result<()> {
+        let (toggle, keys) = {
+            let layout = &self.settings.touch_menu;
+            (
+                layout.button(id).is_some_and(|b| b.toggle),
+                layout.button_mappings(id),
+            )
+        };
+        if !pressed {
+            if toggle {
+                return Ok(());
+            }
+            return self.touch_release_menu_custom(event_loop, id);
+        }
+        if toggle && self.touch.menu_toggled.remove(&id) {
+            return self.touch_release_menu_custom(event_loop, id);
+        }
+        if self.touch.menu_custom_keys.contains_key(&id) {
+            return Ok(());
+        }
+        if toggle {
+            self.touch.menu_toggled.insert(id);
+        }
+        self.touch.menu_custom_keys.insert(id, keys.clone());
+        for key in keys {
+            self.touch_custom_event(event_loop, key, ElementState::Pressed)?;
+        }
+        Ok(())
+    }
+
+    /// Lets go of everything a menus' layout button pressed, in the reverse of the order it went down.
+    fn touch_release_menu_custom(&mut self, event_loop: &dyn EventLoopCtl, id: u16) -> Result<()> {
+        let Some(keys) = self.touch.menu_custom_keys.remove(&id) else {
+            return Ok(());
+        };
+        for key in keys.into_iter().rev() {
+            self.touch_custom_event(event_loop, key, ElementState::Released)?;
+        }
+        Ok(())
+    }
+
+    /// Every menus' layout button lets go: the screen closed under the fingers.
+    fn touch_release_menu_customs(&mut self, event_loop: &dyn EventLoopCtl) -> Result<()> {
+        let toggled: Vec<u16> = std::mem::take(&mut self.touch.menu_toggled)
+            .into_iter()
+            .collect();
+        for id in toggled {
+            self.touch_release_menu_custom(event_loop, id)?;
+        }
+        let held: Vec<u16> = self.touch.menu_custom_keys.keys().copied().collect();
+        for id in held {
+            self.touch_release_menu_custom(event_loop, id)?;
+        }
+        Ok(())
+    }
+
     /// Every toggle button lets go: a screen opened over the game, or the player left it.
     fn touch_release_toggles(&mut self, event_loop: &dyn EventLoopCtl) -> Result<()> {
         let ids: Vec<u16> = std::mem::take(&mut self.touch.toggled)
@@ -736,21 +808,29 @@ impl Game<'_> {
     /// Buttons that no longer exist (deleted, or cleared by Reset Layout) let go of their keys, so a
     /// deletion never leaves a key stuck down.
     fn touch_release_removed(&mut self, event_loop: &dyn EventLoopCtl) -> Result<()> {
-        let missing = |id: &u16| self.settings.touch.button(*id).is_none();
-        if !self.touch.custom_keys.keys().any(missing) && !self.touch.toggled.iter().any(missing) {
-            return Ok(());
-        }
-        let ids: Vec<u16> = self
-            .touch
-            .custom_keys
+        let game = (&self.touch.custom_keys, &self.touch.toggled);
+        let gone: Vec<u16> = game
+            .0
             .keys()
             .copied()
-            .chain(self.touch.toggled.iter().copied())
+            .chain(game.1.iter().copied())
             .filter(|id| self.settings.touch.button(*id).is_none())
             .collect();
-        for id in ids {
+        for id in gone {
             self.touch.toggled.remove(&id);
             self.touch_release_custom(event_loop, id)?;
+        }
+        let menus = (&self.touch.menu_custom_keys, &self.touch.menu_toggled);
+        let gone: Vec<u16> = menus
+            .0
+            .keys()
+            .copied()
+            .chain(menus.1.iter().copied())
+            .filter(|id| self.settings.touch_menu.button(*id).is_none())
+            .collect();
+        for id in gone {
+            self.touch.menu_toggled.remove(&id);
+            self.touch_release_menu_custom(event_loop, id)?;
         }
         Ok(())
     }
@@ -835,11 +915,12 @@ impl Game<'_> {
             .map(|(control, _)| control)
     }
 
-    /// A finger on the screen's D-pad, Sneak or Jump (`touch_menu_pad_shown`). The pad's own state is put
-    /// to work on the screen's pointer: directions step between the targets the pad's crosshair reaches,
-    /// Jump holds the left button (a direction then spreads a stack across slots, and Jump's release drops
-    /// it), and Sneak latches the Shift a shift-click needs. Whether the touch went to a button; the menu
-    /// gesture never sees it.
+    /// A finger on the screen's D-pad, Sneak, Jump or one of the layout's own buttons
+    /// (`touch_menu_pad_shown`). The pad's own state is put to work on the screen's pointer: directions
+    /// step between the targets the pad's crosshair reaches, Jump holds the left button (a direction
+    /// then spreads a stack across slots, and Jump's release drops it), Sneak latches the Shift a
+    /// shift-click needs, and a player's button sends its keys. Whether the touch went to a button;
+    /// the menu gesture never sees it.
     fn touch_menu_pad_touch(
         &mut self,
         event_loop: &dyn EventLoopCtl,
@@ -847,14 +928,14 @@ impl Game<'_> {
         phase: TouchPhase,
         at: (f32, f32),
         batch: HudBatch,
-    ) -> bool {
+    ) -> Result<bool> {
         match phase {
             TouchPhase::Started => {
                 if !self.touch_menu_pad_shown() {
-                    return false;
+                    return Ok(false);
                 }
                 let Some(control) = self.menu_pad_control(batch.width, batch.height, at) else {
-                    return false;
+                    return Ok(false);
                 };
                 let mut pad = MenuPad {
                     id,
@@ -871,14 +952,17 @@ impl Game<'_> {
                         self.touch_menu_pad_click(event_loop, true);
                         pad.pressed = true;
                     }
+                    // A button the player added to this layout sends its keys, over menus as it does
+                    // over the world.
+                    Control::Custom(id) => self.touch_menu_custom_key(event_loop, id, true)?,
                     control => self.touch_menu_pad_step(event_loop, control),
                 }
                 self.touch.menu_pads.push(pad);
-                true
+                Ok(true)
             }
             TouchPhase::Moved => {
                 let Some(index) = self.touch.menu_pads.iter().position(|p| p.id == id) else {
-                    return false;
+                    return Ok(false);
                 };
                 // Sliding from one direction onto another steps that way at once, as the D-pad does.
                 if self.touch_menu_pad_shown()
@@ -893,20 +977,24 @@ impl Game<'_> {
                     pad.repeating = false;
                     self.touch_menu_pad_step(event_loop, to);
                 }
-                true
+                Ok(true)
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
                 let Some(index) = self.touch.menu_pads.iter().position(|p| p.id == id) else {
-                    return false;
+                    return Ok(false);
                 };
                 let pad = &mut self.touch.menu_pads[index];
                 if pad.control == Control::Jump && pad.pressed {
                     // Let go once a frame has drawn the press, as a menu tap does.
                     pad.lifted = true;
                 } else {
+                    let control = pad.control;
                     self.touch.menu_pads.remove(index);
+                    if let Control::Custom(id) = control {
+                        self.touch_menu_custom_key(event_loop, id, false)?;
+                    }
                 }
-                true
+                Ok(true)
             }
         }
     }
@@ -1008,6 +1096,10 @@ impl Game<'_> {
         self.touch.menu_shift = false;
         if pressed {
             self.touch_button(event_loop, false);
+        }
+        // A finger that went away with the screen lets go of its button's keys.
+        if let Err(e) = self.touch_release_menu_customs(event_loop) {
+            log::warn!("Horizon: touch: {e}");
         }
     }
 
@@ -1387,8 +1479,9 @@ impl Game<'_> {
 
     // ---- drawing ----
 
-    /// The D-pad, Sneak and Jump over a screen in cursor mode: the pointer steps from slot to slot and
-    /// button to button, clicks, and shift-clicks, without a finger reaching across the screen.
+    /// The D-pad, Sneak and Jump over a screen in cursor mode, and any buttons the player added to the
+    /// menus' layout: the pointer steps from slot to slot and button to button, clicks, and
+    /// shift-clicks, without a finger reaching across the screen.
     pub(super) fn draw_touch_menu_pad(&self, batch: &mut HudBatch) {
         if !self.touch_menu_pad_shown() {
             return;
@@ -1401,6 +1494,22 @@ impl Game<'_> {
                 .iter()
                 .any(|pad| pad.control == control)
                 || (control == Control::Sneak && self.touch.menu_shift);
+            if let Control::Custom(id) = control {
+                let Some(button) = self.settings.touch_menu.button(id) else {
+                    continue;
+                };
+                touch_draw::draw_custom(
+                    batch,
+                    atlas,
+                    &self.settings.touch_menu.button_label(id),
+                    r,
+                    held || self.touch.menu_toggled.contains(&id),
+                    button.opacity,
+                    button.background,
+                    button.stroke,
+                );
+                continue;
+            }
             touch_draw::draw_control(
                 batch,
                 atlas,

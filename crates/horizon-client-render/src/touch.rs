@@ -820,13 +820,14 @@ impl TouchSettings {
         self.layout_at(w, h, true)
     }
     /// The buttons that drive a screen's pointer (game/touch.rs): the D-pad, Sneak and Jump, where the
-    /// player put them and at their sizes. They come from the D-pad template whatever this layout's
-    /// movement is: a screen steps from slot to slot and button to button rather than steering, so a
-    /// menu never gets a stick.
+    /// player put them and at their sizes, and any buttons the player added to this layout. They come
+    /// from the D-pad template whatever this layout's movement is: a screen steps from slot to slot and
+    /// button to button rather than steering, so a menu never gets a stick.
     pub fn menu_layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
         let mut v = layout(w, h);
         v.retain(|(control, _)| menu_control(*control) && self.visible(*control));
         self.styled_at(&mut v, w, h);
+        self.custom_at(w, h, &mut v);
         v
     }
     /// [`TouchSettings::menu_layout`] with the buttons the player turned off still in place: the menu
@@ -835,7 +836,31 @@ impl TouchSettings {
         let mut v = layout(w, h);
         v.retain(|(control, _)| menu_control(*control));
         self.styled_at(&mut v, w, h);
+        self.custom_at(w, h, &mut v);
         v
+    }
+    /// The player's own buttons at their placements, each its own size, added after the built-in ones.
+    fn custom_at(&self, w: f32, h: f32, v: &mut Vec<(Control, Rect)>) {
+        let base = button_size(h);
+        for (id, button) in &self.buttons {
+            let side = |v: f32| {
+                (base * v.clamp(MIN_SIZE, MAX_SIZE))
+                    .round()
+                    .max(1.0)
+            };
+            let (bw, bh) = (side(button.width), side(button.height));
+            let x = button.placement.x * (w - bw).max(0.0);
+            let y = button.placement.y * (h - bh).max(0.0);
+            v.push((
+                Control::Custom(*id),
+                [
+                    x.clamp(0.0, (w - bw).max(0.0)),
+                    y.clamp(0.0, (h - bh).max(0.0)),
+                    bw,
+                    bh,
+                ],
+            ));
+        }
     }
     fn layout_at(&self, w: f32, h: f32, hidden_too: bool) -> Vec<(Control, Rect)> {
         let mut v = layout(w, h);
@@ -858,27 +883,7 @@ impl TouchSettings {
             v.retain(|(control, _)| self.visible(*control));
         }
         self.styled_at(&mut v, w, h);
-        // The player's buttons, after the built-in ones: each its own size.
-        let base = button_size(h);
-        for (id, button) in &self.buttons {
-            let side = |v: f32| {
-                (base * v.clamp(MIN_SIZE, MAX_SIZE))
-                    .round()
-                    .max(1.0)
-            };
-            let (bw, bh) = (side(button.width), side(button.height));
-            let x = button.placement.x * (w - bw).max(0.0);
-            let y = button.placement.y * (h - bh).max(0.0);
-            v.push((
-                Control::Custom(*id),
-                [
-                    x.clamp(0.0, (w - bw).max(0.0)),
-                    y.clamp(0.0, (h - bh).max(0.0)),
-                    bw,
-                    bh,
-                ],
-            ));
-        }
+        self.custom_at(w, h, &mut v);
         v
     }
     /// A built-in button's own size and the player's placement, applied in place. The hotbar follows the
@@ -2053,6 +2058,16 @@ mod tests {
         s.set_hidden(Control::Sneak, true);
         expected.retain(|c| *c != Control::Sneak);
         assert_eq!(controls(&s), expected);
+        // The player's own buttons are part of the menus' layout too, where the player put them and
+        // at their sizes.
+        let id = s.add_button(600.0, 300.0);
+        s.set_placement(Control::Custom(id), 0.25, 0.75);
+        let menu = s.menu_layout(600.0, 300.0);
+        assert!(menu.iter().any(|(c, _)| *c == Control::Custom(id)));
+        assert_eq!(
+            placed(&menu, Control::Custom(id)),
+            placed(&s.layout(600.0, 300.0), Control::Custom(id))
+        );
     }
 
     #[test]
@@ -2086,6 +2101,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(loaded.movement, Movement::DPad);
         assert_eq!(loaded.profile, MENU_PROFILE);
+        // Buttons the player adds are the layout's own: the editor shows them, and they survive a save.
+        let mut s = TouchSettings::menu_default();
+        let id = s.add_button(600.0, 300.0);
+        s.set_button_key(id, 0, Some("key.keyboard.t".to_owned()));
+        s.set_button_name(id, "Chat".to_owned());
+        assert!(s
+            .menu_editor_layout(600.0, 300.0)
+            .iter()
+            .any(|(c, _)| *c == Control::Custom(id)));
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-touch-menu-buttons-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        s.save_menu(&dir);
+        let loaded = TouchSettings::load_menu(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.button(id), s.button(id));
+        assert_eq!(
+            loaded.button_key_name(id, 0),
+            Some("key.keyboard.t")
+        );
     }
 
     #[test]

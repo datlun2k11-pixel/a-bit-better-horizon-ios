@@ -4194,10 +4194,9 @@ impl OptionsUi {
                     tr("controls.reset"),
                     Act::TouchReset,
                 ));
-                // The menus' layout is the six buttons over a screen: it takes no new buttons and has
-                // no profiles to switch to, so Add and Layouts stay away.
+                out.push(button(68.0, 4.0, 60.0, Text::literal("Add"), Act::TouchAdd));
+                // The menus' layout is a system layout, not a profile: it has none to switch to.
                 if !menus {
-                    out.push(button(68.0, 4.0, 60.0, Text::literal("Add"), Act::TouchAdd));
                     out.push(button(
                         132.0,
                         4.0,
@@ -5550,41 +5549,45 @@ impl OptionsUi {
                             events.push(Event::ButtonClick);
                         }
                         Act::TouchAdd => {
-                            s.touch.add_button(size.0, size.1);
+                            s.edited_touch_mut(self.touch_editing_menus)
+                                .add_button(size.0, size.1);
                             events.push(Event::Changed);
                         }
                         Act::TouchSetKey(id, slot, name) => {
-                            s.touch.set_button_key(id, slot, Some(name.to_owned()));
+                            s.edited_touch_mut(self.touch_editing_menus)
+                                .set_button_key(id, slot, Some(name.to_owned()));
                             events.extend(self.back(s));
                         }
                         Act::TouchClearKey(id, slot) => {
-                            s.touch.set_button_key(id, slot, None);
+                            s.edited_touch_mut(self.touch_editing_menus)
+                                .set_button_key(id, slot, None);
                             events.extend(self.back(s));
                         }
                         Act::TouchToggle(id) => {
-                            if let Some(button) = s.touch.button(id) {
-                                s.touch.set_button_toggle(id, !button.toggle);
+                            let touch = s.edited_touch_mut(self.touch_editing_menus);
+                            if let Some(button) = touch.button(id) {
+                                let toggle = !button.toggle;
+                                touch.set_button_toggle(id, toggle);
                                 events.push(Event::Changed);
                             }
                         }
                         Act::TouchSwipe(id) => {
-                            if let Some(button) = s.touch.button(id) {
-                                s.touch.set_button_swipe(id, !button.swipe);
+                            let touch = s.edited_touch_mut(self.touch_editing_menus);
+                            if let Some(button) = touch.button(id) {
+                                let swipe = !button.swipe;
+                                touch.set_button_swipe(id, swipe);
                                 events.push(Event::Changed);
                             }
                         }
                         Act::TouchColor(id, stroke) => {
-                            if let Some(button) = s.touch.button(id) {
+                            let touch = s.edited_touch_mut(self.touch_editing_menus);
+                            if let Some(button) = touch.button(id) {
                                 let color = if stroke {
                                     button.stroke
                                 } else {
                                     button.background
                                 };
-                                s.touch.set_button_color(
-                                    id,
-                                    stroke,
-                                    crate::touch::cycle_color(color),
-                                );
+                                touch.set_button_color(id, stroke, crate::touch::cycle_color(color));
                                 events.push(Event::Changed);
                             }
                         }
@@ -6631,41 +6634,45 @@ impl OptionsUi {
                             events.push(Event::ButtonClick);
                         }
                         Act::TouchAdd => {
-                            s.touch.add_button(self.size.0, self.size.1);
+                            s.edited_touch_mut(self.touch_editing_menus)
+                                .add_button(self.size.0, self.size.1);
                             events.push(Event::Changed);
                         }
                         Act::TouchSetKey(id, slot, name) => {
-                            s.touch.set_button_key(id, slot, Some(name.to_owned()));
+                            s.edited_touch_mut(self.touch_editing_menus)
+                                .set_button_key(id, slot, Some(name.to_owned()));
                             events.extend(self.back(s));
                         }
                         Act::TouchClearKey(id, slot) => {
-                            s.touch.set_button_key(id, slot, None);
+                            s.edited_touch_mut(self.touch_editing_menus)
+                                .set_button_key(id, slot, None);
                             events.extend(self.back(s));
                         }
                         Act::TouchToggle(id) => {
-                            if let Some(button) = s.touch.button(id) {
-                                s.touch.set_button_toggle(id, !button.toggle);
+                            let touch = s.edited_touch_mut(self.touch_editing_menus);
+                            if let Some(button) = touch.button(id) {
+                                let toggle = !button.toggle;
+                                touch.set_button_toggle(id, toggle);
                                 events.push(Event::Changed);
                             }
                         }
                         Act::TouchSwipe(id) => {
-                            if let Some(button) = s.touch.button(id) {
-                                s.touch.set_button_swipe(id, !button.swipe);
+                            let touch = s.edited_touch_mut(self.touch_editing_menus);
+                            if let Some(button) = touch.button(id) {
+                                let swipe = !button.swipe;
+                                touch.set_button_swipe(id, swipe);
                                 events.push(Event::Changed);
                             }
                         }
                         Act::TouchColor(id, stroke) => {
-                            if let Some(button) = s.touch.button(id) {
+                            let touch = s.edited_touch_mut(self.touch_editing_menus);
+                            if let Some(button) = touch.button(id) {
                                 let color = if stroke {
                                     button.stroke
                                 } else {
                                     button.background
                                 };
-                                s.touch.set_button_color(
-                                    id,
-                                    stroke,
-                                    crate::touch::cycle_color(color),
-                                );
+                                touch.set_button_color(id, stroke, crate::touch::cycle_color(color));
                                 events.push(Event::Changed);
                             }
                         }
@@ -7125,13 +7132,43 @@ mod tests {
                 .iter()
                 .any(|w| matches!(w.kind, WKind::TouchControl(Control::Stick)))
         );
-        assert!(!widgets.iter().any(|w| matches!(
-            w.kind,
-            WKind::Button {
-                act: Act::TouchAdd,
-                ..
-            }
-        )));
+        // The player's own buttons can be added to this layout too, and land in it, not in the one in use.
+        let add = widgets
+            .iter()
+            .find(|w| {
+                matches!(
+                    w.kind,
+                    WKind::Button {
+                        act: Act::TouchAdd,
+                        ..
+                    }
+                )
+            })
+            .expect("the system layout's editor has an Add button");
+        assert_eq!(
+            ui.click(
+                &mut s,
+                &atlas,
+                add.x + 2.0,
+                add.y + 2.0,
+                size,
+                [960, 960],
+                false,
+                false
+            ),
+            vec![Event::ButtonClick, Event::Changed]
+        );
+        assert!(s.touch.buttons.is_empty());
+        let id = *s
+            .touch_menu
+            .buttons
+            .keys()
+            .next()
+            .expect("the button was added to the menus' layout");
+        let widgets = ui.layout(&s, size.0, size.1).0;
+        assert!(widgets.iter().any(
+            |w| matches!(w.kind, WKind::TouchControl(Control::Custom(c)) if c == id)
+        ));
         let jump = widgets
             .iter()
             .find(|w| matches!(w.kind, WKind::TouchControl(Control::Jump)))
