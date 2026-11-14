@@ -8,25 +8,38 @@ enum Device {
 }
 
 #[derive(Default)]
-pub(crate) struct InputMode(Device);
+pub(crate) struct InputMode {
+    device: Device,
+    /// The keyboard and mouse attachments last seen, to log the moment either changes.
+    hardware: Option<(bool, bool)>,
+}
 
 impl InputMode {
     pub(crate) fn touch(&mut self) {
-        self.0 = Device::Touch;
+        self.switch(Device::Touch);
     }
     pub(crate) fn keyboard(&mut self) {
-        self.0 = Device::Keyboard;
+        self.switch(Device::Keyboard);
     }
     pub(crate) fn mouse(&mut self) {
-        self.0 = Device::Mouse;
+        self.switch(Device::Mouse);
+    }
+
+    /// The overlay's side of a bug report: which device last moved, and whether the buttons are therefore
+    /// hidden, is what a "the controls vanished" or "a mouse appeared and the pad stayed" report turns on.
+    fn switch(&mut self, device: Device) {
+        if self.device != device {
+            log::info!("touch overlays: input {:?} -> {device:?}", self.device);
+            self.device = device;
+        }
     }
 
     pub(crate) fn used_mouse(&self) -> bool {
-        self.0 == Device::Mouse
+        self.device == Device::Mouse
     }
 
     pub(crate) fn hides_touch(&self, keyboard: bool, mouse: bool) -> bool {
-        match self.0 {
+        match self.device {
             Device::Touch => false,
             Device::Keyboard => keyboard,
             Device::Mouse => mouse,
@@ -34,6 +47,21 @@ impl InputMode {
     }
 
     pub(crate) fn refresh(&mut self, keyboard: bool, mouse: bool) {
+        // Attaching or removing a keyboard or mouse flips the overlay's visibility: a report about controls
+        // appearing or vanishing needs the moment it changed, and nothing else logs it.
+        if self.hardware != Some((keyboard, mouse)) {
+            log::info!(
+                "touch overlays: keyboard {}, mouse {}; touch controls {}",
+                if keyboard { "attached" } else { "none" },
+                if mouse { "attached" } else { "none" },
+                if self.hides_touch(keyboard, mouse) {
+                    "hidden"
+                } else {
+                    "shown"
+                }
+            );
+            self.hardware = Some((keyboard, mouse));
+        }
         if !self.hides_touch(keyboard, mouse) {
             self.touch();
         }

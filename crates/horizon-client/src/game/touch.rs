@@ -316,27 +316,39 @@ impl Game<'_> {
         self.touch.seen = true;
         self.touch.hardware.touch();
         self.last_input = Instant::now();
-        // The look bug reports have no other way to say whether the finger's events arrive at all: one line a
-        // second of the phase, and the state the look gate reads.
-        if log_due("touch", std::time::Duration::from_secs(1)) {
-            log::info!(
-                "touch {:?} at ({:.0}, {:.0}); playing={} focused={} captured={} agent_pointer={}",
-                touch.phase,
-                touch.location.x,
-                touch.location.y,
-                self.touch_playing(),
-                self.focused,
-                self.captured,
-                self.agent_pointer
-            );
-        }
         let Some(batch) = self.touch_batch() else {
+            // The finger reached the game but no screen is drawn to land on (loading, under the launcher's
+            // cover, or a dead surface): the tap is lost, and the log must say why rather than nothing.
+            if log_due("touch-no-screen", std::time::Duration::from_secs(5)) {
+                log::warn!(
+                    "touch {} {:?} at ({:.0}, {:.0}) has no screen to land on; the tap is lost",
+                    touch.id,
+                    touch.phase,
+                    touch.location.x,
+                    touch.location.y
+                );
+            }
             return Ok(());
         };
         let at = (
             touch.location.x as f32 / batch.scale,
             touch.location.y as f32 / batch.scale,
         );
+        // Every start, lift and cancel, but a drag's moves only once a second: the log wants the shape of a
+        // gesture and the state the look gate reads, not a hundred lines a second.
+        if touch.phase != TouchPhase::Moved || log_due("touch", std::time::Duration::from_secs(1)) {
+            log::info!(
+                "touch {} {:?} at ({:.0}, {:.0}) GUI; playing={} focused={} captured={} agent_pointer={}",
+                touch.id,
+                touch.phase,
+                at.0,
+                at.1,
+                self.touch_playing(),
+                self.focused,
+                self.captured,
+                self.agent_pointer
+            );
+        }
         let playing = self.touch_playing();
         if playing {
             // Loading or keyboard navigation can consume a menu finger's release.
@@ -473,6 +485,20 @@ impl Game<'_> {
 
     fn touch_act(&mut self, event_loop: &dyn EventLoopCtl, out: Vec<Out>, scale: f32) -> Result<()> {
         for o in out {
+            // What the fingers' state machine decided, for the bug reports that cannot tell a tap from a
+            // drag from a hold: the drag and the stick move too often to log here.
+            match o {
+                Out::Tap => log::info!(
+                    "touch tap; interact={} entity_targeted={}",
+                    self.settings.touch.interact,
+                    self.entity_targeted()
+                ),
+                Out::MineStart => log::info!("touch hold: mining starts"),
+                Out::MineEnd => log::info!("touch hold: mining ends"),
+                Out::Press(control) => log::info!("touch press {control:?}"),
+                Out::Release(control) => log::info!("touch release {control:?}"),
+                Out::Look(..) | Out::Move(..) => {}
+            }
             match o {
                 Out::Press(Control::Hotbar(slot)) => self.selected = usize::from(slot),
                 Out::Press(Control::Sneak) => {
@@ -766,6 +792,11 @@ impl Game<'_> {
                         finger.second = Some((id, at.1));
                         // Two fingers scrolling is not a tap: the first must not click when it lifts.
                         finger.wheeled = true;
+                        log::info!(
+                            "touch menu: second finger {id} down at ({:.0}, {:.0}); two-finger scroll",
+                            at.0,
+                            at.1
+                        );
                     }
                     return;
                 }
@@ -817,6 +848,13 @@ impl Game<'_> {
                 // A touch soon after a tap lifted is its second tap: held down, it keeps the button down.
                 let last_tap = self.touch.last_tap.take();
                 let hold = tap && last_tap.is_some_and(|since| since.elapsed() <= DOUBLE_TAP);
+                log::info!(
+                    "touch menu: finger {id} down at ({:.0}, {:.0}) -> ({:.0}, {:.0}); cursor_mode={cursor_mode} tap={tap} hold={hold} on_close={on_close} on_keyboard={on_keyboard}",
+                    at.0,
+                    at.1,
+                    pointer.0,
+                    pointer.1
+                );
                 self.touch.menu = Some(MenuFinger {
                     id,
                     scrolled: at,
@@ -911,6 +949,7 @@ impl Game<'_> {
                     if let Some(f) = self.touch.menu.as_mut() {
                         f.second = None;
                     }
+                    log::info!("touch menu: second finger {id} lifted; two-finger scroll ends");
                     return;
                 }
                 // A finger that dragged the pointer was not a tap: it must not click where it left the
@@ -923,6 +962,13 @@ impl Game<'_> {
                     finger.closed,
                     finger.tap && !finger.wheeled && !dragged,
                     finger.hold,
+                );
+                log::info!(
+                    "touch menu: finger {id} {phase:?} at ({:.0}, {:.0}); cursor_mode={cursor_mode} closed={closed} tap={tap} hold={hold} wheeled={} dragged={dragged} moved={}",
+                    at.0,
+                    at.1,
+                    finger.wheeled,
+                    finger.moved
                 );
                 // The tap acts under the pointer, wherever the finger is: it never brings the arrow to
                 // the finger, so the mouse stays where the player left it.
@@ -962,6 +1008,10 @@ impl Game<'_> {
             && finger.pressed
             && !finger.closed
         {
+            log::info!(
+                "touch menu: finger {} abandoned while pressed; its click is released",
+                finger.id
+            );
             self.touch_button(event_loop, false);
         }
     }
@@ -1049,6 +1099,10 @@ impl Game<'_> {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
+        log::info!(
+            "touch menu click {}",
+            if pressed { "down" } else { "up" }
+        );
         let state = if pressed {
             ElementState::Pressed
         } else {
@@ -1070,6 +1124,10 @@ impl Game<'_> {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
+        // A slow swipe sends a line per frame: once a moment says the list is scrolling.
+        if log_due("touch-wheel", std::time::Duration::from_millis(200)) {
+            log::info!("touch menu scroll {lines:.0} lines");
+        }
         self.handle_window_event(
             event_loop,
             id,

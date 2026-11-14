@@ -43,7 +43,20 @@ declare_class!(
         fn view_did_appear(&self, animated: bool) {
             let _: () = unsafe { msg_send![super(self), viewDidAppear: animated] };
             // A full-screen launcher stole first responder; restore gameplay keyboard focus.
-            if let Some(view) = self.view() { unsafe { view.becomeFirstResponder(); } }
+            if let Some(view) = self.view() {
+                let restored: bool = unsafe { msg_send![&*view, becomeFirstResponder] };
+                super::view::log_to_console(&format!(
+                    "game view appeared; keyboard focus taken back: {restored}"
+                ));
+            }
+        }
+
+        #[method(didReceiveMemoryWarning)]
+        fn did_receive_memory_warning(&self) {
+            // iOS says this before it kills a foreground app: in the log it dates the stall, the evicted
+            // textures or the crash that follows.
+            super::view::log_to_console("the phone is low on memory (didReceiveMemoryWarning)");
+            let _: () = unsafe { msg_send![super(self), didReceiveMemoryWarning] };
         }
 
         #[method(shouldAutorotate)]
