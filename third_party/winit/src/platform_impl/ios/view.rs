@@ -75,7 +75,9 @@ declare_class!(
             let mtm = MainThreadMarker::new().unwrap();
             let _: () = unsafe { msg_send![super(self), layoutSubviews] };
 
-            let window = self.window().unwrap();
+            // A full-screen modal (the launcher) takes the game's view out of its window while
+            // it covers it, and that view can still be laid out: there is no window to resize to.
+            let Some(window) = self.window() else { return };
             let window_bounds = window.bounds();
             // If the app is started in landscape, the view frame and window bounds can be mismatched.
             // The view frame will be in portrait and the window bounds in landscape. So apply the
