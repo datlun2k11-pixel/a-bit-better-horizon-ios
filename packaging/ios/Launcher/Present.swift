@@ -8,7 +8,7 @@ private var presentationPending = false
 /// lets a check queued by an older turn stand down when a newer one took over.
 private var rotationTarget: UIInterfaceOrientationMask = .landscape
 private var rotationCount = 0
-private var rotationObserver: NSObjectProtocol?
+private var rotationWatchInstalled = false
 
 /// The C entry point `horizon-ios-launcher` looks up: show the launcher while the engine is stopped or starting. Play dismisses it; the game's Quit Game asks for it again. `submit` is how the
 /// launcher asks the game things (Bridge.swift). Called on the main thread; the presenting waits a turn of the
@@ -115,16 +115,23 @@ func turn(_ scene: UIWindowScene?, to orientations: UIInterfaceOrientationMask) 
     verify(scene, count: count, attempt: 1, after: 0.8)
 }
 
-/// Every physical turn is a chance for UIKit to stop a turn half-way: after one, check the window
-/// still fills the screen (see `verify`).
+/// Every physical turn is a chance for UIKit to stop a turn half-way, and the same can be left
+/// behind by the launch itself: check the window after one (see `verify`).
 private func watchRotations() {
-    guard rotationObserver == nil else { return }
+    guard !rotationWatchInstalled else { return }
+    rotationWatchInstalled = true
     UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-    rotationObserver = NotificationCenter.default.addObserver(
-        forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main
-    ) { _ in
+    let check: (Notification) -> Void = { _ in
         guard let scene = windowScene() else { return }
         verify(scene, count: rotationCount, attempt: 1, after: 0.6)
+    }
+    NotificationCenter.default.addObserver(
+        forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main, using: check)
+    NotificationCenter.default.addObserver(
+        forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main, using: check)
+    // The launch itself may have ended in a wrong window before anything asked for an orientation.
+    if let scene = windowScene() {
+        verify(scene, count: rotationCount, attempt: 1, after: 1.2)
     }
 }
 
@@ -135,19 +142,20 @@ private func watchRotations() {
 /// orientation and lay the views out so winit sends a new `Resized`.
 private func verify(_ scene: UIWindowScene, count: Int, attempt: Int, after delay: TimeInterval) {
     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-        guard count == rotationCount else { return }
+        guard count == rotationCount, !presentationPending else { return }
         guard let window = scene.windows.first(where: \.isKeyWindow) ?? scene.windows.first else { return }
         let screen = scene.screen.bounds.size
         let bounds = window.bounds.size
         let covers = (abs(bounds.width - screen.width) < 1 && abs(bounds.height - screen.height) < 1)
             || (abs(bounds.width - screen.height) < 1 && abs(bounds.height - screen.width) < 1)
         let root = window.rootViewController
-        let gameCovers = root.map {
-            abs($0.view.bounds.width - bounds.width) < 1 && abs($0.view.bounds.height - bounds.height) < 1
-        } ?? true
-        if covers && gameCovers { return }
+        let gameCovers = root.map { fills($0.view.bounds.size, bounds) } ?? true
+        // The launcher is a full-screen modal over the game: it must cover the window too.
+        let top = topmost(root)
+        let presentedCovers = top === root || top.map { fills($0.view.bounds.size, bounds) } ?? true
+        if covers && gameCovers && presentedCovers { return }
         LauncherLog.write("rotation left window \(sizeText(bounds)) on a \(sizeText(screen)) screen (attempt \(attempt), device \(UIDevice.current.orientation.rawValue))")
-        // The window is right and only the game view lagged a layout: one pass is enough.
+        // The window is right and only a view lagged a layout: one pass is enough.
         if covers {
             layOut(window)
             return
@@ -175,16 +183,25 @@ private func verify(_ scene: UIWindowScene, count: Int, attempt: Int, after dela
 /// Lay the window's views out from its bounds, so winit reports the size it now has.
 private func layOut(_ window: UIWindow) {
     let root = window.rootViewController
-    root?.view.frame = window.bounds
-    root?.view.setNeedsLayout()
-    root?.view.layoutIfNeeded()
-    var top = root?.presentedViewController
+    let top = topmost(root)
+    for controller in top === root ? [root] : [root, top] {
+        controller?.view.frame = window.bounds
+        controller?.view.setNeedsLayout()
+        controller?.view.layoutIfNeeded()
+    }
+    LauncherLog.write("laid out window \(sizeText(window.bounds.size)); game view \(sizeText(root?.view.bounds.size ?? .zero)); launcher view \(sizeText(top === root ? .zero : top?.view.bounds.size ?? .zero))")
+}
+
+private func fills(_ a: CGSize, _ b: CGSize) -> Bool {
+    abs(a.width - b.width) < 1 && abs(a.height - b.height) < 1
+}
+
+private func topmost(_ controller: UIViewController?) -> UIViewController? {
+    var top = controller
     while let next = top?.presentedViewController {
         top = next
     }
-    top?.view.setNeedsLayout()
-    top?.view.layoutIfNeeded()
-    LauncherLog.write("laid out window \(sizeText(window.bounds.size)); game view \(sizeText(root?.view.bounds.size ?? .zero))")
+    return top
 }
 
 @available(iOS 16.0, *)
