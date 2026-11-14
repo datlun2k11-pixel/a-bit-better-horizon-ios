@@ -282,6 +282,25 @@ pub mod world_primitives;
 mod world_warp;
 use off_page::move_off_page;
 
+/// At most one line per `key` per `interval`: a swapchain condition repeats every frame until it heals, and
+/// the log wants its first line and how long it lasted, not sixty a second.
+fn surface_log_due(key: &'static str, interval: std::time::Duration) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match last.get(key) {
+        Some(at) if now.duration_since(*at) < interval => false,
+        _ => {
+            last.insert(key, now);
+            true
+        }
+    }
+}
+
 /// A section's instance: its camera-relative origin and, in `w`, the step of
 /// its fixed-point UVs (`terrain.wgsl`'s `terrain_uv`).
 /// The world pass again after occlusion culling's test: it loads both
@@ -8195,25 +8214,71 @@ impl Renderer {
         } else {
             self.surface.as_ref().map(|s| s.get_current_texture())
         };
-        self.last_wait = landed + queued + acquire.elapsed();
+        let acquire_time = acquire.elapsed();
+        self.last_wait = landed + queued + acquire_time;
+        // A swapchain that stalls the render thread is the start of a stutter a bug report cannot otherwise date.
+        if acquire_time > std::time::Duration::from_millis(50)
+            && surface_log_due("acquire-slow", std::time::Duration::from_secs(5))
+        {
+            log::warn!(
+                "Horizon renderer: the window surface took {:.0} ms to hand over a frame",
+                acquire_time.as_secs_f64() * 1000.0
+            );
+        }
         // Inside the acquire's time already.
         self.queue.take_waited();
         let (surface_frame, reconfigure) = match acquired {
             None => (None, false),
             Some(wgpu::CurrentSurfaceTexture::Success(f)) => (Some(f), false),
             Some(wgpu::CurrentSurfaceTexture::Suboptimal(f)) => (Some(f), true),
-            Some(wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded) => {
+            Some(wgpu::CurrentSurfaceTexture::Timeout) => {
+                if surface_log_due("surface-timeout", std::time::Duration::from_secs(5)) {
+                    log::warn!("Horizon renderer: the window surface timed out; skipping this frame");
+                }
+                return Ok(false);
+            }
+            Some(wgpu::CurrentSurfaceTexture::Occluded) => {
+                if surface_log_due("surface-occluded", std::time::Duration::from_secs(30)) {
+                    log::info!(
+                        "Horizon renderer: the window surface is occluded ({}x{})",
+                        self.config.width,
+                        self.config.height
+                    );
+                }
                 return Ok(false);
             }
             Some(wgpu::CurrentSurfaceTexture::Outdated) => {
+                if surface_log_due("surface-outdated", std::time::Duration::from_secs(5)) {
+                    log::warn!(
+                        "Horizon renderer: the window surface is out of date; configuring it again"
+                    );
+                }
                 self.configure_surface();
                 return Ok(false);
             }
             Some(wgpu::CurrentSurfaceTexture::Lost) => {
+                if surface_log_due("surface-lost", std::time::Duration::from_secs(5)) {
+                    log::warn!(
+                        "Horizon renderer: the window surface was lost ({}x{}); recreating it",
+                        self.config.width,
+                        self.config.height
+                    );
+                }
                 self.recreate_surface()?;
                 return Ok(false);
             }
             Some(wgpu::CurrentSurfaceTexture::Validation) => {
+                if surface_log_due("surface-validation", std::time::Duration::from_secs(5)) {
+                    log::warn!(
+                        "Horizon renderer: acquiring the window surface failed validation ({} in a row); {}",
+                        self.acquire_validation_failures + 1,
+                        if self.acquire_validation_failures == 0 {
+                            "configuring it again"
+                        } else {
+                            "recreating it"
+                        }
+                    );
+                }
                 // Acquire caught a validation error: the swapchain cannot be
                 // used as configured (wgpu reports a configuration raced with
                 // a submission this way). Give it a fresh configuration like

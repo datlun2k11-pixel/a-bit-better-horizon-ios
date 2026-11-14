@@ -26,6 +26,12 @@ fn into_app_sandbox() -> Result<std::path::PathBuf, String> {
     Ok(documents)
 }
 
+/// winit's own messages about the phone, filed in the game's log under a target that names them.
+#[cfg(target_os = "ios")]
+fn native_ios_log(message: &str) {
+    log::info!("Horizon: ios: {message}");
+}
+
 /// Start the game. The executable supplies the allocator and retains the mod API marker.
 pub fn main() {
     main_with(Default::default());
@@ -113,6 +119,11 @@ pub fn main_with(mods: crate::mod_api::Mods) {
         // The log's first line names the build, so a bug report that carries the log says which one it was.
         log::info!("Horizon {}", crash::version());
         crash::install(home.clone(), side);
+        // winit has no logger of its own on a phone: its lines stay in the device console, which is
+        // not in the log a player shares. Its side of a missed touch, a dead gesture or a memory
+        // warning belongs beside the game's, in latest.log.
+        #[cfg(target_os = "ios")]
+        winit::platform::ios::set_log_hook(Some(native_ios_log));
         // The Microsoft account a last start kept (the title screen's face button), signed in again.
         #[cfg(not(target_os = "ios"))]
         if side == "client" {
