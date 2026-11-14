@@ -212,6 +212,9 @@ pub struct Settings {
     pub touch: crate::touch::TouchSettings,
     /// The other touch layouts (`touch-layouts/`, Horizon's own).
     pub touch_profiles: crate::touch::TouchProfiles,
+    /// The menu pad's layout (`horizon-touch-menu.txt`, Horizon's own): a system layout for the
+    /// buttons menus draw, edited like the others but never a stick and never deleted.
+    pub touch_menu: crate::touch::TouchSettings,
     /// Horizon's optional extras (`horizon-extras.txt`), all off by default.
     pub extras: crate::extras::Extras,
     /// The Horizon mods turned on (`horizon-mods.txt`), all off by default.
@@ -304,6 +307,7 @@ impl Default for Settings {
             controller: Default::default(),
             touch: Default::default(),
             touch_profiles: Default::default(),
+            touch_menu: crate::touch::TouchSettings::menu_default(),
             extras: Default::default(),
             mods: Default::default(),
             shader_packs: Vec::new(),
@@ -382,6 +386,10 @@ impl Settings {
             .parent()
             .map(|dir| crate::touch::TouchProfiles::load(dir, &touch.profile))
             .unwrap_or_default();
+        let touch_menu = path
+            .parent()
+            .map(crate::touch::TouchSettings::load_menu)
+            .unwrap_or_else(crate::touch::TouchSettings::menu_default);
         let extras_text = path
             .parent()
             .and_then(|dir| fs::read_to_string(dir.join(crate::extras::FILE)).ok())
@@ -408,6 +416,7 @@ impl Settings {
                     controller,
                     touch,
                     touch_profiles,
+                    touch_menu,
                     extras,
                     mods,
                     ..Self::parse(&text)
@@ -418,6 +427,7 @@ impl Settings {
                 controller,
                 touch,
                 touch_profiles,
+                touch_menu,
                 extras,
                 mods,
                 ..Self::default()
@@ -540,6 +550,7 @@ impl Settings {
             controller: Default::default(),
             touch: Default::default(),
             touch_profiles: Default::default(),
+            touch_menu: crate::touch::TouchSettings::menu_default(),
             extras: Default::default(),
             mods: Default::default(),
             shader_packs: Vec::new(),
@@ -707,6 +718,7 @@ impl Settings {
             controller: self.controller.clone(),
             touch: self.touch.clone(),
             touch_profiles: self.touch_profiles.clone(),
+            touch_menu: self.touch_menu.clone(),
             extras: self.extras.clone(),
             mods: self.mods.clone(),
             video_modes: self.video_modes.clone(),
@@ -735,6 +747,7 @@ impl Settings {
             self.controller.save(dir);
             self.touch.save(dir);
             self.touch_profiles.save(dir, &self.touch);
+            self.touch_menu.save_menu(dir);
             let mut extras = self.extras.clone();
             extras.emote_key = self.keys.get("key.emote").to_owned();
             extras.save(dir);
@@ -764,9 +777,27 @@ impl Settings {
         names.append(&mut rest);
         names
     }
+    /// The touch layout the editor works on: the one in use, or the menus' system layout.
+    pub fn edited_touch(&self, menus: bool) -> &crate::touch::TouchSettings {
+        if menus {
+            &self.touch_menu
+        } else {
+            &self.touch
+        }
+    }
+    /// The same, to change it.
+    pub fn edited_touch_mut(&mut self, menus: bool) -> &mut crate::touch::TouchSettings {
+        if menus {
+            &mut self.touch_menu
+        } else {
+            &mut self.touch
+        }
+    }
     fn touch_layout_taken(&self, name: &str) -> bool {
-        // "Default" is the one every player has: a second one by that name would be a puzzle.
+        // "Default" is the one every player has: a second one by that name would be a puzzle. The
+        // menus' system layout is not a profile either.
         name.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
+            || name.eq_ignore_ascii_case(crate::touch::MENU_PROFILE)
             || name.eq_ignore_ascii_case(&self.touch.profile)
             || self
                 .touch_profiles

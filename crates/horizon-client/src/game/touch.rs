@@ -828,7 +828,7 @@ impl Game<'_> {
     /// Which of the screen's touch buttons is under `at`, in GUI pixels.
     fn menu_pad_control(&self, w: f32, h: f32, at: (f32, f32)) -> Option<Control> {
         self.settings
-            .touch
+            .touch_menu
             .menu_layout(w, h)
             .into_iter()
             .find(|(_, r)| touch::hit_rect(*r, at))
@@ -1394,7 +1394,7 @@ impl Game<'_> {
             return;
         }
         let atlas = &self.gui.atlas;
-        for (control, r) in self.settings.touch.menu_layout(batch.width, batch.height) {
+        for (control, r) in self.settings.touch_menu.menu_layout(batch.width, batch.height) {
             let held = self
                 .touch
                 .menu_pads
@@ -1407,7 +1407,7 @@ impl Game<'_> {
                 control,
                 r,
                 held,
-                self.settings.touch.style(control).opacity,
+                self.settings.touch_menu.style(control).opacity,
             );
         }
     }

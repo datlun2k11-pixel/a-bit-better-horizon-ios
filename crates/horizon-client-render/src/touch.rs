@@ -81,6 +81,19 @@ const MARGIN: f32 = 14.0;
 /// How far above the hotbar its slots still take a tap: a thumb lands high.
 const HOTBAR_REACH: f32 = 8.0;
 
+/// Whether a button is one of the menu pad's: the D-pad, Sneak and Jump.
+fn menu_control(control: Control) -> bool {
+    matches!(
+        control,
+        Control::Forward
+            | Control::Back
+            | Control::Left
+            | Control::Right
+            | Control::Sneak
+            | Control::Jump
+    )
+}
+
 /// Where every button is on a `w` x `h` GUI-pixel screen.
 pub fn layout(w: f32, h: f32) -> Vec<(Control, Rect)> {
     let s = button_size(h);
@@ -157,10 +170,14 @@ pub fn hit(layout: &[(Control, Rect)], at: (f32, f32)) -> Option<Control> {
 
 /// Horizon's touch overlay settings (`horizon-touch.txt`).
 pub const FILE: &str = "horizon-touch.txt";
+/// The menu pad's layout (`horizon-touch-menu.txt`): a system layout, not a profile.
+pub const MENU_FILE: &str = "horizon-touch-menu.txt";
 /// The layouts other than the active one: one file each, by name.
 pub const LAYOUTS_DIR: &str = "touch-layouts";
 /// The layout every player starts with.
 pub const DEFAULT_PROFILE: &str = "Default";
+/// The name the menus' system layout goes by.
+pub const MENU_PROFILE: &str = "Interaction";
 pub const MAX_PROFILE_NAME: usize = 16;
 
 /// A layout profile's name, which is also its file's stem (so it shows in the Files app): letters,
@@ -575,6 +592,29 @@ impl TouchSettings {
             Err(_) => Self::default(),
         }
     }
+    /// The menu pad's own layout: the default D-pad arrangement under [`MENU_PROFILE`].
+    pub fn menu_default() -> Self {
+        Self {
+            profile: MENU_PROFILE.to_owned(),
+            ..Self::default()
+        }
+    }
+    /// [`TouchSettings::load`] for the menu pad's system layout (`horizon-touch-menu.txt`). Menus step
+    /// between targets, so this layout is the D-pad's whatever its file says: it never has a stick.
+    pub fn load_menu(dir: &Path) -> Self {
+        let mut s = fs::read_to_string(dir.join(MENU_FILE))
+            .map_or_else(|_| Self::menu_default(), |text| Self::parse(&text));
+        s.profile = MENU_PROFILE.to_owned();
+        s.movement = Movement::DPad;
+        s
+    }
+    /// [`TouchSettings::save`] for the menu pad's layout: written once it differs from its defaults.
+    pub fn save_menu(&self, dir: &Path) {
+        let path = dir.join(MENU_FILE);
+        if *self != Self::menu_default() || path.exists() {
+            let _ = fs::write(path, self.serialize());
+        }
+    }
     /// Written once something differs from the defaults, so players who never touch the overlay get no new
     /// file.
     pub fn save(&self, dir: &Path) {
@@ -780,21 +820,20 @@ impl TouchSettings {
         self.layout_at(w, h, true)
     }
     /// The buttons that drive a screen's pointer (game/touch.rs): the D-pad, Sneak and Jump, where the
-    /// player put them and at their sizes. A stick layout gets the D-pad too: a screen steps from slot to
-    /// slot and button to button rather than steering.
+    /// player put them and at their sizes. They come from the D-pad template whatever this layout's
+    /// movement is: a screen steps from slot to slot and button to button rather than steering, so a
+    /// menu never gets a stick.
     pub fn menu_layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
         let mut v = layout(w, h);
-        v.retain(|(control, _)| {
-            matches!(
-                control,
-                Control::Forward
-                    | Control::Back
-                    | Control::Left
-                    | Control::Right
-                    | Control::Sneak
-                    | Control::Jump
-            ) && self.visible(*control)
-        });
+        v.retain(|(control, _)| menu_control(*control) && self.visible(*control));
+        self.styled_at(&mut v, w, h);
+        v
+    }
+    /// [`TouchSettings::menu_layout`] with the buttons the player turned off still in place: the menu
+    /// layout's editor shows them faintly so a long press can turn them back on.
+    pub fn menu_editor_layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
+        let mut v = layout(w, h);
+        v.retain(|(control, _)| menu_control(*control));
         self.styled_at(&mut v, w, h);
         v
     }
@@ -2014,6 +2053,39 @@ mod tests {
         s.set_hidden(Control::Sneak, true);
         expected.retain(|c| *c != Control::Sneak);
         assert_eq!(controls(&s), expected);
+    }
+
+    #[test]
+    fn the_menu_editor_shows_the_six_buttons_never_a_stick() {
+        let mut s = TouchSettings::menu_default();
+        assert_eq!(s.profile, MENU_PROFILE);
+        assert_eq!(s.movement, Movement::DPad);
+        let menu: Vec<Control> = s
+            .menu_editor_layout(600.0, 300.0)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        assert_eq!(menu.len(), 6);
+        assert!(!menu.contains(&Control::Stick));
+        // A hidden button stays in the editor so it can be turned back on.
+        s.set_hidden(Control::Jump, true);
+        let menu: Vec<Control> = s
+            .menu_editor_layout(600.0, 300.0)
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        assert!(menu.contains(&Control::Jump));
+        // A file that says "stick" still gets the D-pad: menus never steer.
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-touch-menu-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join(MENU_FILE), "profile:Interaction\nmovement:stick\n").unwrap();
+        let loaded = TouchSettings::load_menu(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.movement, Movement::DPad);
+        assert_eq!(loaded.profile, MENU_PROFILE);
     }
 
     #[test]

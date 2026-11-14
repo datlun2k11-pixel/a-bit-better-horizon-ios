@@ -68,8 +68,14 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 fn on_off(v: bool) -> Text {
     tr(if v { "options.on" } else { "options.off" })
 }
-/// A touch button's slider position (0..1) as its setting, stepped as the overlay's are.
-fn set_touch_slider(s: &mut Settings, target: TouchTarget, field: TouchField, v: f32) {
+/// A touch button's slider position (0..1) as its setting, stepped as the overlay's are. `t` is the
+/// layout the touch screens edit: the one in use, or the menus' own.
+fn set_touch_slider(
+    t: &mut crate::touch::TouchSettings,
+    target: TouchTarget,
+    field: TouchField,
+    v: f32,
+) {
     let v = v.clamp(0.0, 1.0);
     let (lo, hi) = match field {
         TouchField::Width | TouchField::Height => (crate::touch::MIN_SIZE, crate::touch::MAX_SIZE),
@@ -78,22 +84,19 @@ fn set_touch_slider(s: &mut Settings, target: TouchTarget, field: TouchField, v:
     let value = ((lo + v * (hi - lo)) * 100.0).round() / 100.0;
     match target {
         TouchTarget::Custom(id) => {
-            let (width, height) = s
-                .touch
-                .button(id)
-                .map_or((1.0, 1.0), |b| (b.width, b.height));
+            let (width, height) = t.button(id).map_or((1.0, 1.0), |b| (b.width, b.height));
             match field {
-                TouchField::Width => s.touch.set_button_size(id, value, height),
-                TouchField::Height => s.touch.set_button_size(id, width, value),
-                TouchField::Opacity => s.touch.set_button_opacity(id, value),
+                TouchField::Width => t.set_button_size(id, value, height),
+                TouchField::Height => t.set_button_size(id, width, value),
+                TouchField::Opacity => t.set_button_opacity(id, value),
             }
         }
         TouchTarget::Builtin(control) => {
-            let style = s.touch.style(control);
+            let style = t.style(control);
             match field {
-                TouchField::Width => s.touch.set_style_size(control, value, style.height),
-                TouchField::Height => s.touch.set_style_size(control, style.width, value),
-                TouchField::Opacity => s.touch.set_style_opacity(control, value),
+                TouchField::Width => t.set_style_size(control, value, style.height),
+                TouchField::Height => t.set_style_size(control, style.width, value),
+                TouchField::Opacity => t.set_style_opacity(control, value),
             }
         }
     }
@@ -1524,6 +1527,8 @@ enum Act {
     TouchProfileCreate,
     TouchProfileDelete(String),
     TouchProfileKeep,
+    /// Open the editor on the menus' system layout (the buttons menus draw), not the one in use.
+    TouchEditInteraction,
     /// A player's own touch button: add one, map one of its keys, clear that key (the Options/Delete
     /// popup is handled where it is drawn).
     TouchAdd,
@@ -1796,6 +1801,8 @@ pub struct OptionsUi {
     profile_name: ui::EditBox,
     /// The layout whose Delete was pressed once (the second press forgets it).
     touch_layout_delete: Option<String>,
+    /// The Touch Controls editor is arranging the menus' system layout rather than the one in use.
+    touch_editing_menus: bool,
     /// The shader pack option whose slider is held, and the handle's own position: it follows
     /// the pointer while the option takes the nearest of its values.
     /// The same for a Horizon pack's option: (pack, option, the handle's position, whether its
@@ -1934,6 +1941,7 @@ impl Default for OptionsUi {
             touch_name_id: None,
             profile_name,
             touch_layout_delete: None,
+            touch_editing_menus: false,
             shift: false,
 
             slider_value: None,
@@ -2361,6 +2369,7 @@ impl OptionsUi {
     }
     /// Jump straight to a page (control socket / tests).
     pub fn show(&mut self, page: Page) {
+        self.touch_editing_menus = false;
         if page != Page::Main {
             self.push(page);
         }
@@ -2447,6 +2456,7 @@ impl OptionsUi {
         self.touch_name_id = None;
         self.profile_name.focused = false;
         self.touch_layout_delete = None;
+        self.touch_editing_menus = false;
     }
     fn push(&mut self, page: Page) {
         self.stack.push(page);
@@ -2460,6 +2470,10 @@ impl OptionsUi {
         self.touch_name_id = None;
         self.profile_name.focused = false;
         self.touch_layout_delete = None;
+        // "Edit Layout..." arranges the layout in use: the menus' one is opened by its own entry.
+        if page == Page::TouchLayout {
+            self.touch_editing_menus = false;
+        }
         if page == Page::TouchLayouts {
             self.profile_name.set_value("");
         }
@@ -2506,9 +2520,10 @@ impl OptionsUi {
             return false;
         };
         let name = self.touch_name.value.clone();
-        let changed = s.touch.button(id).is_some_and(|b| b.name != name);
+        let t = s.edited_touch_mut(self.touch_editing_menus);
+        let changed = t.button(id).is_some_and(|b| b.name != name);
         if changed {
-            s.touch.set_button_name(id, name);
+            t.set_button_name(id, name);
         }
         changed
     }
@@ -3000,7 +3015,7 @@ impl OptionsUi {
                 (Text::literal("Delete"), PopupAct::Delete(id), true)
             }
             _ if crate::touch::can_hide(control) => {
-                let shown = s.touch.visible(control);
+                let shown = s.edited_touch(self.touch_editing_menus).visible(control);
                 (
                     Text::literal(if shown { "Turn Off" } else { "Turn On" }),
                     PopupAct::Visibility(control, !shown),
@@ -3382,6 +3397,19 @@ impl OptionsUi {
                     Row::Big(Opt::TouchPointer),
                     Row::Big(Opt::TouchInteract),
                 ];
+                // The buttons menus draw are a layout of their own: their own places and sizes.
+                if s.touch.pointer == crate::touch::PointerMode::Cursor {
+                    rows.push(Row::Buttons(
+                        button(
+                            0.0,
+                            0.0,
+                            310.0,
+                            Text::literal(format!("{} Layout...", crate::touch::MENU_PROFILE)),
+                            Act::TouchEditInteraction,
+                        ),
+                        None,
+                    ));
+                }
                 // The stick is the one button still sized here; every other button has its own options
                 // (in Edit Layout, hold it for a moment).
                 if stick {
@@ -3398,6 +3426,7 @@ impl OptionsUi {
                 let typed = self.profile_name.value.trim();
                 let taken = typed.eq_ignore_ascii_case(&s.touch.profile)
                     || typed.eq_ignore_ascii_case(crate::touch::DEFAULT_PROFILE)
+                    || typed.eq_ignore_ascii_case(crate::touch::MENU_PROFILE)
                     || s.touch_profiles
                         .layouts
                         .keys()
@@ -3433,6 +3462,27 @@ impl OptionsUi {
                         "Tap Create to start a layout by that name.".to_owned()
                     }),
                 ];
+                // The system layout the menus draw: edited here, but kept and never a stick.
+                rows.push(Row::Buttons(
+                    inactive(button(
+                        0.0,
+                        0.0,
+                        150.0,
+                        Text::literal(format!("{} (system)", crate::touch::MENU_PROFILE)),
+                        Act::None,
+                    )),
+                    Some(button(
+                        0.0,
+                        0.0,
+                        150.0,
+                        Text::literal("Edit"),
+                        Act::TouchEditInteraction,
+                    )),
+                ));
+                rows.push(Row::Note(
+                    "Interaction: the buttons drawn over menus (Inventory, Creative...)."
+                        .to_owned(),
+                ));
                 for layout in s.touch_layout_names() {
                     let active = layout == s.touch.profile;
                     if self.touch_layout_delete.as_deref() == Some(layout.as_str()) {
@@ -3482,10 +3532,13 @@ impl OptionsUi {
                 rows
             }
             Page::TouchOptions(id) => {
-                let Some(custom) = s.touch.button(id) else {
+                let Some(custom) = s.edited_touch(self.touch_editing_menus).button(id) else {
                     return vec![Row::Note("This button was deleted.".to_owned())];
                 };
-                let mapping = |slot: usize| match s.touch.button_key_name(id, slot) {
+                let mapping = |slot: usize| match s
+                    .edited_touch(self.touch_editing_menus)
+                    .button_key_name(id, slot)
+                {
                     Some(key) => Text::literal(crate::touch::key_label(key)),
                     None => Text::literal("Not Set"),
                 };
@@ -3591,7 +3644,7 @@ impl OptionsUi {
                 if !crate::touch::styled(control) {
                     return vec![Row::Note("This button has no options of its own.".to_owned())];
                 }
-                let style = s.touch.style(control);
+                let style = s.edited_touch(self.touch_editing_menus).style(control);
                 let slider = |field, caption: &str, value: f32, w: f32| Widget {
                     x: 0.0,
                     y: 0.0,
@@ -3640,14 +3693,14 @@ impl OptionsUi {
                 ]
             }
             Page::TouchKey(id, slot) => {
-                if s.touch.button(id).is_none() {
+                if s.edited_touch(self.touch_editing_menus).button(id).is_none() {
                     return vec![Row::Note("This button was deleted.".to_owned())];
                 }
                 let mut rows = vec![
                     Row::Note(format!(
                         "Choosing key {} of \"{}\".",
                         slot + 1,
-                        s.touch.button_label(id)
+                        s.edited_touch(self.touch_editing_menus).button_label(id)
                     )),
                     Row::Buttons(
                         button(
@@ -4133,6 +4186,7 @@ impl OptionsUi {
             Page::TouchLayout => {
                 // The overlay at the positions the game draws it; dragging a button moves it. The
                 // hotbar follows the HUD, so it is not part of the editor.
+                let menus = self.touch_editing_menus;
                 out.push(button(
                     4.0,
                     4.0,
@@ -4140,16 +4194,43 @@ impl OptionsUi {
                     tr("controls.reset"),
                     Act::TouchReset,
                 ));
-                out.push(button(68.0, 4.0, 60.0, Text::literal("Add"), Act::TouchAdd));
-                out.push(button(
-                    132.0,
-                    4.0,
-                    60.0,
-                    Text::literal("Layouts"),
-                    Act::Push(Page::TouchLayouts),
-                ));
+                // The menus' layout is the six buttons over a screen: it takes no new buttons and has
+                // no profiles to switch to, so Add and Layouts stay away.
+                if !menus {
+                    out.push(button(68.0, 4.0, 60.0, Text::literal("Add"), Act::TouchAdd));
+                    out.push(button(
+                        132.0,
+                        4.0,
+                        60.0,
+                        Text::literal("Layouts"),
+                        Act::Push(Page::TouchLayouts),
+                    ));
+                }
                 out.push(button(w - 64.0, 4.0, 60.0, tr("gui.done"), Act::Done));
-                for (control, r) in s.touch.editor_layout(w, h) {
+                if menus {
+                    out.push(Widget {
+                        x: 0.0,
+                        y: 15.0,
+                        w,
+                        h: 9.0,
+                        kind: WKind::Text {
+                            text: Text::literal(format!(
+                                "{} (system)",
+                                crate::touch::MENU_PROFILE
+                            )),
+                            color: u32::MAX,
+                            centered: true,
+                        },
+                        list: false,
+                        row: 0,
+                    });
+                }
+                let pieces = if menus {
+                    s.touch_menu.menu_editor_layout(w, h)
+                } else {
+                    s.touch.editor_layout(w, h)
+                };
+                for (control, r) in pieces {
                     if matches!(control, crate::touch::Control::Hotbar(_)) {
                         continue;
                     }
@@ -4255,7 +4336,7 @@ impl OptionsUi {
                 // field loses the focus.
                 if let Page::TouchOptions(id) = page {
                     let name = s
-                        .touch
+                        .edited_touch(self.touch_editing_menus)
                         .button(id)
                         .map_or_else(String::new, |b| b.name.clone());
                     if self.touch_name_id != Some(id) {
@@ -4765,7 +4846,8 @@ impl OptionsUi {
                         .as_ref()
                         .is_some_and(|(c, _)| c == control);
                     // A button the player turned off stays in the editor, faint, so it can be turned on.
-                    let visible = s.touch.visible(*control);
+                    let touch = s.edited_touch(self.touch_editing_menus);
+                    let visible = touch.visible(*control);
                     let faded = if visible { 1.0 } else { 0.35 };
                     if !visible {
                         let label = lang::get(crate::touch::control_caption(*control));
@@ -4786,14 +4868,14 @@ impl OptionsUi {
                             rect,
                             [0.0, 0.0],
                             held,
-                            s.touch.stick_opacity * faded,
+                            touch.stick_opacity * faded,
                         );
                     } else if let crate::touch::Control::Custom(id) = control {
-                        if let Some(button) = s.touch.button(*id) {
+                        if let Some(button) = touch.button(*id) {
                             crate::touch_draw::draw_custom(
                                 batch,
                                 atlas,
-                                &s.touch.button_label(*id),
+                                &touch.button_label(*id),
                                 rect,
                                 held,
                                 button.opacity,
@@ -4808,7 +4890,7 @@ impl OptionsUi {
                             *control,
                             rect,
                             held,
-                            s.touch.style(*control).opacity * faded,
+                            touch.style(*control).opacity * faded,
                         );
                     }
                 }
@@ -5219,7 +5301,8 @@ impl OptionsUi {
                     let (free_w, free_h) = ((size.0 - wd.w).max(1.0), (size.1 - wd.h).max(1.0));
                     let x = (x - grab.0).clamp(0.0, free_w);
                     let y = (y - grab.1).clamp(0.0, free_h);
-                    s.touch.set_placement(control, x / free_w, y / free_h);
+                    s.edited_touch_mut(self.touch_editing_menus)
+                        .set_placement(control, x / free_w, y / free_h);
                 }
                 return events;
             }
@@ -5261,7 +5344,12 @@ impl OptionsUi {
                     )
                 })
             {
-                set_touch_slider(s, target, field, ui::slider_value(wd.x, wd.w, x));
+                set_touch_slider(
+                    s.edited_touch_mut(self.touch_editing_menus),
+                    target,
+                    field,
+                    ui::slider_value(wd.x, wd.w, x),
+                );
                 events.push(Event::SliderDrag);
             }
             return events;
@@ -5281,11 +5369,12 @@ impl OptionsUi {
                             _ => self.push(Page::TouchStyle(control)),
                         },
                         PopupAct::Delete(id) => {
-                            s.touch.remove_button(id);
+                            s.edited_touch_mut(self.touch_editing_menus).remove_button(id);
                             events.push(Event::Changed);
                         }
                         PopupAct::Visibility(control, show) => {
-                            s.touch.set_hidden(control, !show);
+                            s.edited_touch_mut(self.touch_editing_menus)
+                                .set_hidden(control, !show);
                             events.push(Event::Changed);
                         }
                         PopupAct::None => {}
@@ -5426,7 +5515,7 @@ impl OptionsUi {
                         Act::Credits => events.push(Event::Credits),
                         Act::CopyAgentDetails => events.push(Event::CopyAgentDetails),
                         Act::TouchReset => {
-                            s.touch.reset_layout();
+                            s.edited_touch_mut(self.touch_editing_menus).reset_layout();
                             events.push(Event::Changed);
                         }
                         Act::TouchProfileSwitch(name) => {
@@ -5455,6 +5544,11 @@ impl OptionsUi {
                             }
                         }
                         Act::TouchProfileKeep => self.touch_layout_delete = None,
+                        Act::TouchEditInteraction => {
+                            self.push(Page::TouchLayout);
+                            self.touch_editing_menus = true;
+                            events.push(Event::ButtonClick);
+                        }
                         Act::TouchAdd => {
                             s.touch.add_button(size.0, size.1);
                             events.push(Event::Changed);
@@ -5522,7 +5616,12 @@ impl OptionsUi {
                 }
                 WKind::TouchSlider { target, field, .. } => {
                     self.dragging_style = Some((target, field));
-                    set_touch_slider(s, target, field, ui::slider_value(wd.x, wd.w, x));
+                    set_touch_slider(
+                        s.edited_touch_mut(self.touch_editing_menus),
+                        target,
+                        field,
+                        ui::slider_value(wd.x, wd.w, x),
+                    );
                     events.push(Event::SliderDrag);
                 }
                 _ => {}
@@ -5873,6 +5972,10 @@ impl OptionsUi {
         self.profile_name.focused = false;
         self.touch_layout_delete = None;
         self.can_change_value = false;
+        if page == Page::TouchLayout {
+            // Out of the editor: the layout in use is the one the touch pages show again.
+            self.touch_editing_menus = false;
+        }
         match page {
             Page::ShaderOptions | Page::ShaderPacks => {
                 if s.shader_options.as_ref().is_some_and(|o| o.changed) {
@@ -6493,7 +6596,7 @@ impl OptionsUi {
                         Act::Credits => events.push(Event::Credits),
                         Act::CopyAgentDetails => events.push(Event::CopyAgentDetails),
                         Act::TouchReset => {
-                            s.touch.reset_layout();
+                            s.edited_touch_mut(self.touch_editing_menus).reset_layout();
                             events.push(Event::Changed);
                         }
                         Act::TouchProfileSwitch(name) => {
@@ -6522,6 +6625,11 @@ impl OptionsUi {
                             }
                         }
                         Act::TouchProfileKeep => self.touch_layout_delete = None,
+                        Act::TouchEditInteraction => {
+                            self.push(Page::TouchLayout);
+                            self.touch_editing_menus = true;
+                            events.push(Event::ButtonClick);
+                        }
                         Act::TouchAdd => {
                             s.touch.add_button(self.size.0, self.size.1);
                             events.push(Event::Changed);
@@ -6968,6 +7076,103 @@ mod tests {
             .expect("the editor draws the new button");
         assert!(((wd.x + wd.w / 2.0) - size.0 / 2.0).abs() < 2.0);
         assert!(((wd.y + wd.h / 2.0) - size.1 / 2.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn the_menus_layout_is_arranged_on_its_own() {
+        use crate::touch::Control;
+        let atlas = atlas();
+        let mut s = Settings::default();
+        let mut ui = OptionsUi::default();
+        let size = (480.0, 480.0);
+        ui.show(Page::TouchLayouts);
+        let edit = ui
+            .layout(&s, size.0, size.1)
+            .0
+            .into_iter()
+            .find(|w| {
+                matches!(
+                    w.kind,
+                    WKind::Button {
+                        act: Act::TouchEditInteraction,
+                        ..
+                    }
+                )
+            })
+            .expect("the system layout has an Edit button");
+        ui.click(
+            &mut s,
+            &atlas,
+            edit.x + 2.0,
+            edit.y + 2.0,
+            size,
+            [960, 960],
+            false,
+            false,
+        );
+        assert_eq!(ui.page(), Page::TouchLayout);
+        let widgets = ui.layout(&s, size.0, size.1).0;
+        // The six buttons menus draw, never a stick, and no buttons of the other editor.
+        assert_eq!(
+            widgets
+                .iter()
+                .filter(|w| matches!(w.kind, WKind::TouchControl(_)))
+                .count(),
+            6
+        );
+        assert!(
+            !widgets
+                .iter()
+                .any(|w| matches!(w.kind, WKind::TouchControl(Control::Stick)))
+        );
+        assert!(!widgets.iter().any(|w| matches!(
+            w.kind,
+            WKind::Button {
+                act: Act::TouchAdd,
+                ..
+            }
+        )));
+        let jump = widgets
+            .iter()
+            .find(|w| matches!(w.kind, WKind::TouchControl(Control::Jump)))
+            .expect("the editor draws Jump");
+        let (px, py) = (jump.x + jump.w / 2.0, jump.y + jump.h / 2.0);
+        assert_eq!(
+            ui.click(&mut s, &atlas, px, py, size, [960, 960], false, false),
+            vec![Event::ButtonClick]
+        );
+        ui.click(&mut s, &atlas, 20.0, 20.0, size, [960, 960], true, false);
+        assert_eq!(ui.release(), vec![Event::Changed]);
+        // The menus' places, not the layout in use.
+        assert!(s.touch.placements.is_empty());
+        let placed = s.touch_menu.placements[&Control::Jump];
+        assert!(placed.x < 0.1 && placed.y < 0.1);
+        let done = ui
+            .layout(&s, size.0, size.1)
+            .0
+            .into_iter()
+            .find(|w| {
+                matches!(
+                    w.kind,
+                    WKind::Button {
+                        act: Act::Done,
+                        ..
+                    }
+                )
+            })
+            .expect("the editor has Done");
+        ui.click(
+            &mut s,
+            &atlas,
+            done.x + 2.0,
+            done.y + 2.0,
+            size,
+            [960, 960],
+            false,
+            false,
+        );
+        assert_eq!(ui.page(), Page::TouchLayouts);
+        assert!(!ui.touch_editing_menus);
     }
 
     #[test]
