@@ -10094,10 +10094,22 @@ impl Game<'_> {
             && let Some(text) = key_event.text.as_deref()
         {
             let text: String = text.chars().filter(|c| !c.is_control()).collect();
-            if !text.is_empty() && self.text_field_focused() && self.types_text() {
+            let focused = self.text_field_focused();
+            let types = self.types_text();
+            if !text.is_empty() && focused && types {
                 // UIKit software keys and Windows Alt codes are character
                 // callbacks too: keep dialog routing and native cancellation.
                 self.ime_commit(&text);
+            } else if !text.is_empty() {
+                log::info!(
+                    "Horizon: typed {text:?} dropped: options {}, page {:?}, keyboard focus {}, types {}, dialog {}, title {}",
+                    self.screen == Screen::Options,
+                    self.ui.options.page(),
+                    self.field_focused(),
+                    types,
+                    self.dialog_open(),
+                    self.title.is_some()
+                );
             }
             return;
         }
