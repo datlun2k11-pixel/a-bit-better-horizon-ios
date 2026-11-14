@@ -69,6 +69,19 @@ impl Game<'_> {
         if !ours {
             return;
         }
+        // The launcher's SwiftUI views cover the game and take the pointer: a phone's mouse
+        // reports relative motion instead of hover, so these window events are no longer
+        // filtered by a UIKit view above the game's.
+        if horizon_ios_launcher::covered()
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseWheel { .. }
+            )
+        {
+            return;
+        }
         // A disconnected guest is being removed on the next poll; its title must never own
         // global launcher actions or open a new world on the shared native event loop.
         if self.splitscreen.guest

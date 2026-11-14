@@ -7,11 +7,11 @@ use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
 use objc2_ui_kit::{
-    UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
+    UICoordinateSpace, UIDevice, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
     UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput,
     UIPanGestureRecognizer, UIPinchGestureRecognizer, UIPress, UIPressesEvent, UIResponder,
     UIRotationGestureRecognizer, UITapGestureRecognizer, UITextInputTraits, UITouch, UITouchPhase,
-    UITouchType, UITraitEnvironment, UIView,
+    UITouchType, UITraitEnvironment, UIUserInterfaceIdiom, UIView,
 };
 
 use super::app_state::{self, EventWrapper};
@@ -410,7 +410,7 @@ declare_class!(
 
 /// The device console (`os_log`): the game's own log has no winit messages on a phone, and a build that
 /// types nothing into a field needs the keyboard's side of the story beside the game's.
-fn log_to_console(message: &str) {
+pub(super) fn log_to_console(message: &str) {
     // The game's log, when it asked for these (`set_log_hook`): a phone's console is not in
     // the zip a player shares, its `logs/latest.log` is.
     if let Some(hook) = *LOG_HOOK
@@ -680,13 +680,27 @@ impl WinitView {
     }
 
     pub(crate) fn set_mouse_captured(&self, captured: bool) {
+        if self.ivars().mouse.captured() != captured {
+            log_to_console(&format!("mouse capture: {captured}"));
+        }
         self.ivars().mouse.capture(captured);
         self.update_mice();
     }
 
     pub(crate) fn update_mice(&self) {
         if let Some(window) = self.window() {
-            self.ivars().mouse.update(RootWindowId(window.id()));
+            let size = self.bounds().size;
+            let scale = self.contentScaleFactor() as f64;
+            // A phone has no system pointer to lock or to hover with: its mouse's relative
+            // motion is what the game's cursor follows.
+            let phone = UIDevice::currentDevice(MainThreadMarker::from(self)).userInterfaceIdiom()
+                == UIUserInterfaceIdiom::Phone;
+            self.ivars().mouse.update(
+                RootWindowId(window.id()),
+                (size.width * scale, size.height * scale),
+                scale,
+                phone,
+            );
         }
     }
 

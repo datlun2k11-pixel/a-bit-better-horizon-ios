@@ -192,6 +192,13 @@ pub trait WindowExtIOS {
     ///
     /// The default is to not recognize gestures.
     fn recognize_rotation_gesture(&self, should_recognize: bool);
+
+    /// Whether the system draws a hardware mouse's pointer itself.
+    ///
+    /// This is true on iPadOS, whose pointer hovers and clicks. It is false on iOS, where a
+    /// connected mouse is seen only through its relative motion, so an application that shows
+    /// a pointer in its own screens has to draw it.
+    fn has_system_pointer(&self) -> bool;
 }
 
 impl WindowExtIOS for Window {
@@ -256,6 +263,11 @@ impl WindowExtIOS for Window {
     #[inline]
     fn recognize_rotation_gesture(&self, should_recognize: bool) {
         self.window.maybe_queue_on_main(move |w| w.recognize_rotation_gesture(should_recognize));
+    }
+
+    #[inline]
+    fn has_system_pointer(&self) -> bool {
+        self.window.maybe_wait_on_main(|w| w.has_system_pointer())
     }
 }
 

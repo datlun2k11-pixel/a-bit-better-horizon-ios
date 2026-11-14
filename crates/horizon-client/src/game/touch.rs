@@ -1149,16 +1149,38 @@ impl Game<'_> {
         let Some(at) = self.touch.cursor else {
             return;
         };
-        let atlas = &self.gui.atlas;
-        // A classic arrow: the head's triangle and the tail hanging from it, scaled about the tip.
-        let head = [[0.0, 0.0], [0.0, 15.2], [11.6, 11.1]];
-        let tail = [[4.5, 12.2], [7.0, 18.0], [9.3, 16.9], [6.8, 11.2]];
-        // A solid black arrow, as the classic cursor sprite is: it needs a light edge to stay visible.
-        for grow in [1.6, 0.0] {
-            let color = if grow > 0.0 { u32::MAX } else { 0xFF000000 };
-            fill_poly(batch, atlas, at, &head, grow, color);
-            fill_poly(batch, atlas, at, &tail, grow, color);
+        draw_arrow(batch, &self.gui.atlas, at);
+    }
+
+    /// A hardware mouse on an iPhone: the system draws no pointer there, so a menu would have no
+    /// visible spot to click. The arrow is the one cursor mode draws for a finger.
+    #[cfg(target_os = "ios")]
+    pub(super) fn draw_hardware_cursor(&self, batch: &mut HudBatch) {
+        use winit::platform::ios::WindowExtIOS;
+
+        if self.captured
+            || !self.touch.hardware.used_mouse()
+            || !horizon_gamecontroller::mouse_connected()
+        {
+            return;
         }
+        let Some(window) = &self.window else { return };
+        if window.has_system_pointer() {
+            return;
+        }
+        draw_arrow(batch, &self.gui.atlas, self.cursor);
+    }
+}
+
+/// A classic mouse arrow whose tip is `at`: a black arrow needs a light edge to stay visible.
+fn draw_arrow(batch: &mut HudBatch, atlas: &HudAtlas, at: (f32, f32)) {
+    // The head's triangle and the tail hanging from it, scaled about the tip.
+    let head = [[0.0, 0.0], [0.0, 15.2], [11.6, 11.1]];
+    let tail = [[4.5, 12.2], [7.0, 18.0], [9.3, 16.9], [6.8, 11.2]];
+    for grow in [1.6, 0.0] {
+        let color = if grow > 0.0 { u32::MAX } else { 0xFF000000 };
+        fill_poly(batch, atlas, at, &head, grow, color);
+        fill_poly(batch, atlas, at, &tail, grow, color);
     }
 }
 

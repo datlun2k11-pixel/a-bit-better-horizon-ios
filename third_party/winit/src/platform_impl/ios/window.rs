@@ -9,8 +9,8 @@ use objc2_foundation::{
     CGFloat, CGPoint, CGRect, CGSize, MainThreadBound, MainThreadMarker, NSObjectProtocol,
 };
 use objc2_ui_kit::{
-    UIApplication, UICoordinateSpace, UIResponder, UIScreen, UIScreenOverscanCompensation,
-    UIViewController, UIWindow,
+    UIApplication, UICoordinateSpace, UIDevice, UIResponder, UIScreen,
+    UIScreenOverscanCompensation, UIUserInterfaceIdiom, UIViewController, UIWindow,
 };
 use tracing::{debug, warn};
 
@@ -276,18 +276,9 @@ impl Inner {
             return Err(ExternalError::NotSupported(NotSupportedError::new()));
         }
         let locked = mode == CursorGrabMode::Locked;
-        if locked {
-            // A nil scene lock state means this device does not support pointer locking.
-            let scene: Option<Retained<objc2::runtime::AnyObject>> = unsafe {
-                msg_send_id![&*self.window, windowScene]
-            };
-            let state: Option<Retained<objc2::runtime::AnyObject>> = scene.and_then(|scene| unsafe {
-                msg_send_id![&*scene, pointerLockState]
-            });
-            if state.is_none() {
-                return Err(ExternalError::NotSupported(NotSupportedError::new()));
-            }
-        }
+        // Only iPadOS has a system pointer to lock: a nil scene pointer lock state is a phone,
+        // where a grab still means relative mouse motion (see `hardware_mouse`). Refusing it
+        // there left the game believing no grab succeeded, so a Bluetooth mouse turned nothing.
         self.view_controller.set_pointer_locked(locked);
         self.view.set_mouse_captured(locked);
         Ok(())
@@ -689,6 +680,11 @@ impl Inner {
 
     pub fn recognize_rotation_gesture(&self, should_recognize: bool) {
         self.view.recognize_rotation_gesture(should_recognize);
+    }
+
+    pub fn has_system_pointer(&self) -> bool {
+        let mtm = MainThreadMarker::new().expect("has_system_pointer called off the main thread");
+        UIDevice::currentDevice(mtm).userInterfaceIdiom() == UIUserInterfaceIdiom::Pad
     }
 }
 

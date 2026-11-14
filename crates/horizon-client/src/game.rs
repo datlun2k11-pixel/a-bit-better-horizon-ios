@@ -6007,6 +6007,8 @@ impl Game<'_> {
         // Last of all, over every screen: the pointer is drawn by the game, so it must not be
         // missed on the screens that return early (options, win, debug options).
         self.draw_touch_cursor(&mut batch);
+        #[cfg(target_os = "ios")]
+        self.draw_hardware_cursor(&mut batch);
         batch
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {

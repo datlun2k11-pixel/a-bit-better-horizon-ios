@@ -21,6 +21,10 @@ impl InputMode {
         self.0 = Device::Mouse;
     }
 
+    pub(crate) fn used_mouse(&self) -> bool {
+        self.0 == Device::Mouse
+    }
+
     pub(crate) fn hides_touch(&self, keyboard: bool, mouse: bool) -> bool {
         match self.0 {
             Device::Touch => false,
