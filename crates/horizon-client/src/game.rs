@@ -6001,6 +6001,8 @@ impl Game<'_> {
         self.frame_graph
             .draw(self.settings.horizon.overlay, &mut batch, &self.gui.atlas);
         self.draw_pad_over_hud(&mut batch);
+        // The touch buttons over a menu, under the arrow they move.
+        self.draw_touch_menu_pad(&mut batch);
         // Finalize touch input after every screen, including title/options early
         // returns and prompts. Queued clicks require this drawn-pointer acknowledgement.
         self.draw_touch_close(&mut batch);

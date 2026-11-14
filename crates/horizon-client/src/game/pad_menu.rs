@@ -120,7 +120,7 @@ pub(super) struct MenuCursor {
     /// The stick moved the cursor last poll (it settles when let go).
     moving: bool,
     /// Gliding onto a slot or control: from, to, since.
-    glide: Option<((f32, f32), (f32, f32), Instant)>,
+    pub(super) glide: Option<((f32, f32), (f32, f32), Instant)>,
     /// Where the stick's current movement started.
     gesture: Option<(f32, f32)>,
     /// Pointer mode: the open screen's target centres last poll.
@@ -371,7 +371,7 @@ impl Game<'_> {
     }
 
     /// The open screen is one the crosshair drives, whatever is over it.
-    fn pad_pointer_screen(&self) -> bool {
+    pub(super) fn pad_pointer_screen(&self) -> bool {
         matches!(
             self.screen,
             Screen::Inventory
@@ -572,7 +572,7 @@ impl Game<'_> {
     }
 
     /// Send the window a pointer move to `at` (GUI pixels), as the mouse would.
-    fn pad_pointer_to(&mut self, event_loop: &dyn EventLoopCtl, at: (f32, f32)) {
+    pub(super) fn pad_pointer_to(&mut self, event_loop: &dyn EventLoopCtl, at: (f32, f32)) {
         let (Some(window), Some(batch)) = (self.window.as_ref(), self.gui_scale()) else {
             return;
         };
@@ -1048,7 +1048,7 @@ impl Game<'_> {
     }
 
     /// Pointer mode: hop the cursor to the nearest target that way.
-    fn pad_pointer_step(&mut self, event_loop: &dyn EventLoopCtl, button: Button) {
+    pub(super) fn pad_pointer_step(&mut self, event_loop: &dyn EventLoopCtl, button: Button) {
         if self.pad.menu.pos.is_none() {
             self.pad_take_pointer(event_loop);
             return;

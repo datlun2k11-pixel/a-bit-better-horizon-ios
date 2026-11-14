@@ -779,6 +779,25 @@ impl TouchSettings {
     pub fn editor_layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
         self.layout_at(w, h, true)
     }
+    /// The buttons that drive a screen's pointer (game/touch.rs): the D-pad, Sneak and Jump, where the
+    /// player put them and at their sizes. A stick layout gets the D-pad too: a screen steps from slot to
+    /// slot and button to button rather than steering.
+    pub fn menu_layout(&self, w: f32, h: f32) -> Vec<(Control, Rect)> {
+        let mut v = layout(w, h);
+        v.retain(|(control, _)| {
+            matches!(
+                control,
+                Control::Forward
+                    | Control::Back
+                    | Control::Left
+                    | Control::Right
+                    | Control::Sneak
+                    | Control::Jump
+            ) && self.visible(*control)
+        });
+        self.styled_at(&mut v, w, h);
+        v
+    }
     fn layout_at(&self, w: f32, h: f32, hidden_too: bool) -> Vec<(Control, Rect)> {
         let mut v = layout(w, h);
         if self.movement == Movement::Stick {
@@ -799,7 +818,34 @@ impl TouchSettings {
         if !hidden_too {
             v.retain(|(control, _)| self.visible(*control));
         }
-        for (control, r) in &mut v {
+        self.styled_at(&mut v, w, h);
+        // The player's buttons, after the built-in ones: each its own size.
+        let base = button_size(h);
+        for (id, button) in &self.buttons {
+            let side = |v: f32| {
+                (base * v.clamp(MIN_SIZE, MAX_SIZE))
+                    .round()
+                    .max(1.0)
+            };
+            let (bw, bh) = (side(button.width), side(button.height));
+            let x = button.placement.x * (w - bw).max(0.0);
+            let y = button.placement.y * (h - bh).max(0.0);
+            v.push((
+                Control::Custom(*id),
+                [
+                    x.clamp(0.0, (w - bw).max(0.0)),
+                    y.clamp(0.0, (h - bh).max(0.0)),
+                    bw,
+                    bh,
+                ],
+            ));
+        }
+        v
+    }
+    /// A built-in button's own size and the player's placement, applied in place. The hotbar follows the
+    /// HUD and keeps the size it is drawn at.
+    fn styled_at(&self, v: &mut [(Control, Rect)], w: f32, h: f32) {
+        for (control, r) in v.iter_mut() {
             if matches!(control, Control::Hotbar(_)) {
                 continue;
             }
@@ -825,28 +871,6 @@ impl TouchSettings {
                 bh,
             ];
         }
-        // The player's buttons, after the built-in ones: each its own size.
-        let base = button_size(h);
-        for (id, button) in &self.buttons {
-            let side = |v: f32| {
-                (base * v.clamp(MIN_SIZE, MAX_SIZE))
-                    .round()
-                    .max(1.0)
-            };
-            let (bw, bh) = (side(button.width), side(button.height));
-            let x = button.placement.x * (w - bw).max(0.0);
-            let y = button.placement.y * (h - bh).max(0.0);
-            v.push((
-                Control::Custom(*id),
-                [
-                    x.clamp(0.0, (w - bw).max(0.0)),
-                    y.clamp(0.0, (h - bh).max(0.0)),
-                    bw,
-                    bh,
-                ],
-            ));
-        }
-        v
     }
     pub fn visible(&self, control: Control) -> bool {
         matches!(
@@ -1959,6 +1983,37 @@ mod tests {
             placed(&editor, Control::Chat),
             placed(&layout(600.0, 300.0), Control::Chat)
         );
+    }
+
+    #[test]
+    fn a_menu_gets_only_the_dpad_sneak_and_jump() {
+        let mut s = TouchSettings::default();
+        let controls = |s: &TouchSettings| -> Vec<Control> {
+            s.menu_layout(600.0, 300.0)
+                .into_iter()
+                .map(|(c, _)| c)
+                .collect()
+        };
+        let mut expected = vec![
+            Control::Forward,
+            Control::Left,
+            Control::Sneak,
+            Control::Right,
+            Control::Back,
+            Control::Jump,
+        ];
+        assert_eq!(controls(&s), expected);
+        // Where the player put a button is where the menu gets it.
+        s.set_placement(Control::Jump, 0.1, 0.2);
+        assert_eq!(
+            placed(&s.menu_layout(600.0, 300.0), Control::Jump),
+            placed(&s.layout(600.0, 300.0), Control::Jump)
+        );
+        // A stick layout still gets the D-pad: a menu steps rather than steers. A hidden button stays away.
+        s.movement = Movement::Stick;
+        s.set_hidden(Control::Sneak, true);
+        expected.retain(|c| *c != Control::Sneak);
+        assert_eq!(controls(&s), expected);
     }
 
     #[test]
