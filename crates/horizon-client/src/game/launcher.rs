@@ -586,7 +586,7 @@ fn set_launcher_option(
     settings: &mut horizon_client::settings::Settings,
     path: &Path,
     line: &str,
-) -> Result<Value, String> {
+) -> std::result::Result<Value, String> {
     let words: Vec<&str> = line.split_whitespace().collect();
     let Some(key) = words.get(1).copied() else {
         return Err("options-set KEY VALUE".to_owned());
