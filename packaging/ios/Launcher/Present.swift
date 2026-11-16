@@ -138,31 +138,57 @@ private func watchRotations() {
 /// A turn UIKit could not finish leaves the window at the intersection of the portrait and
 /// landscape sizes — the game draws into a square beside black — and nothing lays it out again, so
 /// it stays that way until the app is restarted. Look once the turn had time to finish, ask the
-/// scene one more time, and as a last resort take the screen's size back for the requested
-/// orientation and lay the views out so winit sends a new `Resized`.
-private func verify(_ scene: UIWindowScene, count: Int, attempt: Int, after delay: TimeInterval) {
+/// scene one more time, and as a last resort take the screen's size back for the orientation the
+/// scene is actually in and lay the views out so winit sends a new `Resized`.
+private func verify(
+    _ scene: UIWindowScene, count: Int, attempt: Int, after delay: TimeInterval,
+    waited: Int = 0
+) {
     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-        guard count == rotationCount, !presentationPending else { return }
+        guard count == rotationCount else { return }
+        // Presenting lays the views out itself, but a stopped turn found here must not be dropped:
+        // check again once the presentation settles.
+        guard !presentationPending else {
+            if waited < 6 {
+                verify(scene, count: count, attempt: attempt, after: 0.5, waited: waited + 1)
+            }
+            return
+        }
         guard let window = scene.windows.first(where: \.isKeyWindow) ?? scene.windows.first else { return }
         let screen = scene.screen.bounds.size
         let bounds = window.bounds.size
-        let covers = (abs(bounds.width - screen.width) < 1 && abs(bounds.height - screen.height) < 1)
-            || (abs(bounds.width - screen.height) < 1 && abs(bounds.height - screen.width) < 1)
+        let short = min(screen.width, screen.height)
+        let long = max(screen.width, screen.height)
+        // The launcher turns with the device, so the size the window must have is the screen's in
+        // the scene's own orientation. A transposed window (the intersection size, or the previous
+        // turn's) is wrong here even though it is one of the screen's two sizes.
+        let orientation = sceneOrientation(scene)
+        let expected: CGSize? = orientation.isPortrait ? CGSize(width: short, height: long)
+            : orientation.isLandscape ? CGSize(width: long, height: short) : nil
+        let covers = expected.map { fills(bounds, $0) } ?? (
+            (abs(bounds.width - screen.width) < 1 && abs(bounds.height - screen.height) < 1)
+            || (abs(bounds.width - screen.height) < 1 && abs(bounds.height - screen.width) < 1))
         let root = window.rootViewController
         let gameCovers = root.map { fills($0.view.bounds.size, bounds) } ?? true
         // The launcher is a full-screen modal over the game: it must cover the window too.
         let top = topmost(root)
         let presentedCovers = top === root || top.map { fills($0.view.bounds.size, bounds) } ?? true
         if covers && gameCovers && presentedCovers { return }
-        LauncherLog.write("rotation left window \(sizeText(bounds)) on a \(sizeText(screen)) screen (attempt \(attempt), device \(UIDevice.current.orientation.rawValue))")
+        LauncherLog.write("rotation left window \(sizeText(bounds)) on a \(sizeText(screen)) screen in \(orientation.isPortrait ? "portrait" : "landscape") (attempt \(attempt), device \(UIDevice.current.orientation.rawValue))")
         // The window is right and only a view lagged a layout: one pass is enough.
         if covers {
             layOut(window)
             return
         }
+        // Asking for the last turn's orientation while the launcher is up is what left a
+        // landscape-sized window on a portrait screen (or the reverse) on a jailbroken phone: the
+        // launcher follows the device, so settle in the orientation it is in. The game is asked
+        // for the turn `turn` made.
         if attempt == 1 {
             if #available(iOS 16.0, *) {
-                scene.requestGeometryUpdate(.iOS(interfaceOrientations: rotationTarget)) { error in
+                let launcherUp = top is LauncherHostingController
+                let settle = (launcherUp ? mask(for: orientation) : nil) ?? rotationTarget
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: settle)) { error in
                     LauncherLog.write("rotation retry failed: \(error.localizedDescription)")
                 }
             } else {
@@ -171,13 +197,19 @@ private func verify(_ scene: UIWindowScene, count: Int, attempt: Int, after dela
             verify(scene, count: count, attempt: 2, after: 1.2)
             return
         }
-        let short = min(screen.width, screen.height)
-        let long = max(screen.width, screen.height)
-        let portrait = rotationTarget.contains(.portrait) && !rotationTarget.contains(.landscape)
-        window.frame = CGRect(origin: .zero, size: portrait
+        window.frame = CGRect(origin: .zero, size: orientation.isPortrait
             ? CGSize(width: short, height: long) : CGSize(width: long, height: short))
         layOut(window)
+        // A window frame set by hand can lose to a late scene layout: look again once.
+        if attempt < 3 { verify(scene, count: count, attempt: attempt + 1, after: 1.0) }
     }
+}
+
+/// The orientation the scene is drawing in now (the launcher follows the device; the game view
+/// controller then turns it back to landscape).
+private func sceneOrientation(_ scene: UIWindowScene) -> UIInterfaceOrientation {
+    if #available(iOS 16.0, *) { return scene.effectiveGeometry.interfaceOrientation }
+    return scene.interfaceOrientation
 }
 
 /// Lay the window's views out from its bounds, so winit reports the size it now has.
