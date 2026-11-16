@@ -38,9 +38,9 @@ jobs:
   ipa:
     # The native launcher uses the iOS 26 SDK (Liquid Glass). macos-15 defaults to Xcode 16.4.
     # MAC_RUNNER remains available for a maintainer-provided runner with Xcode 26 or newer.
-    # Standard Intel PR runners avoid the ARM hosted-pool capacity queue.
+    # The Intel pool avoids the ARM hosted-pool capacity queue that has left macos-26 jobs unacquired.
     # Both Rust and Xcode still explicitly target ARM64 iOS below.
-    runs-on: ${{ github.event_name == 'pull_request' && 'macos-26-intel' || vars.MAC_RUNNER || 'macos-26' }}
+    runs-on: ${{ vars.MAC_RUNNER || 'macos-26-intel' }}
     timeout-minutes: 90
     defaults:
       run:
