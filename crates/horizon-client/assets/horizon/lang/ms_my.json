@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Ciri ini belum tersedia di Horizon.",
   "Your display or system doesn't offer HDR output.": "Paparan atau sistem anda tidak menawarkan output HDR.",
   "Turn HDR on to use it.": "Hidupkan HDR untuk menggunakannya.",
+  "Turn VSync off to use it.": "Matikan VSync untuk menggunakannya.",
   "Your GPU or graphics API doesn't support it.": "GPU atau API grafik anda tidak menyokongnya.",
   "Not with software rendering, which runs it on the CPU.": "Tidak dengan pemaparan perisian, yang menjalankannya pada CPU.",
   "Out of video memory: off until the next start.": "Kehabisan memori video: mati sehingga permulaan seterusnya.",

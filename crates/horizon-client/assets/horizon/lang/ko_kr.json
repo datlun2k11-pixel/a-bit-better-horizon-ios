@@ -297,6 +297,7 @@
   "This feature is not yet available in Horizon.": "이 기능은 아직 Horizon에서 사용할 수 없습니다.",
   "Your display or system doesn't offer HDR output.": "디스플레이 또는 시스템이 HDR 출력을 지원하지 않습니다.",
   "Turn HDR on to use it.": "사용하려면 HDR을 켜세요.",
+  "Turn VSync off to use it.": "사용하려면 VSync를 끄세요.",
   "Your GPU or graphics API doesn't support it.": "GPU 또는 그래픽 API가 지원하지 않습니다.",
   "%s chunks": "%s개 청크",
   "%s per frame": "프레임당 %s",

@@ -534,6 +534,7 @@
   "%s mobs": "%s yaratık",
   "Only applies to asynchronous entity culling.": "Yalnızca eşzamansız varlık elemesine uygulanır.",
   "Turn HDR on to use it.": "Bu özelliği kullanmak için HDR'yi etkinleştirin.",
+  "Turn VSync off to use it.": "Kullanmak için VSync'i kapat.",
   "%s chunks": "%s parça",
   "%s per frame": "Kare başına %s",
   "%s MiB/frame": "Kare başına %s MiB",

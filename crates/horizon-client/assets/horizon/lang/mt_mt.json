@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Din il-karatteristika għadha mhix disponibbli fi Horizon.",
   "Your display or system doesn't offer HDR output.": "Il-wirja jew is-sistema tiegħek ma toffrix output HDR.",
   "Turn HDR on to use it.": "Ixgħel l-HDR biex tużah.",
+  "Turn VSync off to use it.": "Itfi VSync biex tużah.",
   "Your GPU or graphics API doesn't support it.": "Il-GPU jew l-API tal-grafika tiegħek ma jappoġġjawhx.",
   "Not with software rendering, which runs it on the CPU.": "Mhux bir-rendering tas-software, li jmexxih fuq is-CPU.",
   "Out of video memory: off until the next start.": "Memorja tal-vidjow eżawrita: mitfi sal-bidu li jmiss.",

@@ -211,6 +211,7 @@
   "Draws ice in the solid pass, without its see-through texture.": "Малює лід у суцільному проході, без прозорої текстури.",
   "Only applies to asynchronous entity culling.": "Застосовується лише для асинхронного відсікання сутностей.",
   "Turn HDR on to use it.": "Увімкніть HDR, щоб користуватися цим.",
+  "Turn VSync off to use it.": "Вимкніть VSync, щоб скористатися.",
   "Your GPU or graphics API doesn't support it.": "Ваш GPU або графічний API цього не підтримує.",
   "%s chunks": "%s чанків",
   "%s per frame": "%s на кадр",

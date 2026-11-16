@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Tính năng này chưa có ở Horizon.",
   "Your display or system doesn't offer HDR output.": "Màn hình hoặc hệ thống của bạn không cung cấp đầu ra HDR.",
   "Turn HDR on to use it.": "Bật HDR để sử dụng.",
+  "Turn VSync off to use it.": "Tắt VSync để dùng.",
   "Your GPU or graphics API doesn't support it.": "GPU hoặc API đồ họa của bạn không hỗ trợ nó.",
   "Not with software rendering, which runs it on the CPU.": "Không dùng được với kết xuất phần mềm, vốn chạy trên CPU.",
   "Out of video memory: off until the next start.": "Hết bộ nhớ đồ họa: tắt cho đến lần khởi động sau.",

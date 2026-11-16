@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Ky funksion nuk ofrohet ende në Horizon.",
   "Your display or system doesn't offer HDR output.": "Ekrani ose sistemi juaj nuk ofron dalje HDR.",
   "Turn HDR on to use it.": "Aktivizo HDR për ta përdorur.",
+  "Turn VSync off to use it.": "Fike VSync për ta përdorur.",
   "Your GPU or graphics API doesn't support it.": "GPU-ja juaj ose API grafike nuk e mbështet atë.",
   "Not with software rendering, which runs it on the CPU.": "Jo me vizatimin me softuer, i cili e ekzekuton në CPU.",
   "Out of video memory: off until the next start.": "Memoria video mbaroi: joaktiv deri në fillimin tjetër.",

@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Ši funkcija Horizonte dar nepasiekiama.",
   "Your display or system doesn't offer HDR output.": "Jūsų ekranas arba sistema nesiūlo HDR išvesties.",
   "Turn HDR on to use it.": "Norėdami jį naudoti, įjunkite HDR.",
+  "Turn VSync off to use it.": "Išjunkite VSync, kad galėtumėte naudoti.",
   "Your GPU or graphics API doesn't support it.": "Jūsų GPU arba grafikos API to nepalaiko.",
   "Not with software rendering, which runs it on the CPU.": "Neveikia su programiniu atvaizdavimu, kuris tai atlieka CPU.",
   "Out of video memory: off until the next start.": "Nepakanka vaizdo atminties: išjungta iki kito paleidimo.",

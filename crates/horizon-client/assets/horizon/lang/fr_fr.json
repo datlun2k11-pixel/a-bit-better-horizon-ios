@@ -313,6 +313,7 @@
   "%s mobs": "%s créatures",
   "Only applies to asynchronous entity culling.": "S'applique uniquement à l'occlusion asynchrone des entités.",
   "Turn HDR on to use it.": "Activez le HDR pour l'utiliser.",
+  "Turn VSync off to use it.": "Désactivez VSync pour l'utiliser.",
   "Your GPU or graphics API doesn't support it.": "Votre GPU ou votre API graphique ne le prend pas en charge.",
   "%s per frame": "%s par image",
   "%s MiB/frame": "%s MiB/image",

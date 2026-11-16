@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Šī funkcija programmā Horizon vēl nav pieejama.",
   "Your display or system doesn't offer HDR output.": "Jūsu displejs vai sistēma nepiedāvā HDR izvadi.",
   "Turn HDR on to use it.": "Lai to izmantotu, ieslēdziet HDR.",
+  "Turn VSync off to use it.": "Izslēdziet VSync, lai to lietotu.",
   "Your GPU or graphics API doesn't support it.": "Jūsu GPU vai grafikas API to neatbalsta.",
   "Not with software rendering, which runs it on the CPU.": "Nē ar programmatūras renderēšanu, kas to darbina uz CPU.",
   "Out of video memory: off until the next start.": "Nepietiek video atmiņas: izslēgts līdz nākamajai palaišanai.",

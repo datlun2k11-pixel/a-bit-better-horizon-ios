@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Táto funkcia zatiaľ nie je v Horizon dostupná.",
   "Your display or system doesn't offer HDR output.": "Váš displej alebo systém neponúka výstup HDR.",
   "Turn HDR on to use it.": "Ak ho chcete použiť, zapnite HDR.",
+  "Turn VSync off to use it.": "Vypnite VSync, aby ste to mohli použiť.",
   "Your GPU or graphics API doesn't support it.": "Váš GPU alebo grafické rozhranie API to nepodporuje.",
   "Not with software rendering, which runs it on the CPU.": "Nie so softvérovým vykresľovaním, ktoré to spúšťa na CPU.",
   "Out of video memory: off until the next start.": "Málo videopamäte: vypnuté do ďalšieho štartu.",

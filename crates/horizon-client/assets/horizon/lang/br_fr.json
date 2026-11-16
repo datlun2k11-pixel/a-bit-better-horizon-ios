@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "N'eo ket hegerz an elfenn-mañ c'hoazh e Horizon.",
   "Your display or system doesn't offer HDR output.": "Ho skramm pe ho reizhiad ne ginnig ket un disoc'h HDR.",
   "Turn HDR on to use it.": "Lakait HDR war-sav evit e implijout.",
+  "Turn VSync off to use it.": "Dizober VSync evit e implijout.",
   "Your GPU or graphics API doesn't support it.": "N'eo ket skoret gant ho GPU pe ho API grafikoù.",
   "Not with software rendering, which runs it on the CPU.": "Ket gant ar skeudenniñ dre veziant, a gas anezhañ war ar CPU.",
   "Out of video memory: off until the next start.": "Memor video a vank : diweredekaet betek ar c'hregiñ da heul.",

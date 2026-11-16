@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Njirimara a adịbeghị na Horizon.",
   "Your display or system doesn't offer HDR output.": "Ngosipụta ma ọ bụ sistemụ gị anaghị enye mmepụta HDR.",
   "Turn HDR on to use it.": "Gbanye HDR ka iji ya.",
+  "Turn VSync off to use it.": "Gbanyụọ VSync iji jiri ya.",
   "Your GPU or graphics API doesn't support it.": "API GPU ma ọ bụ eserese gị anaghị akwado ya.",
   "Not with software rendering, which runs it on the CPU.": "Ọ dịghị na software rendering, nke na-agba ya na CPU.",
   "Out of video memory: off until the next start.": "Video memory agwụla: gbanyụrụ ruo mgbe ị ga-eso malite.",

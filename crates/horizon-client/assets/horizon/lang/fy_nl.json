@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Dizze funksje is noch net beskikber yn Horizon.",
   "Your display or system doesn't offer HDR output.": "Jo display of systeem biedt gjin HDR-útfier.",
   "Turn HDR on to use it.": "Skeakelje HDR yn om it te brûken.",
+  "Turn VSync off to use it.": "Set VSync út om it te brûken.",
   "Your GPU or graphics API doesn't support it.": "Jo GPU of grafyske API stipet it net.",
   "Not with software rendering, which runs it on the CPU.": "Net mei software-rendering, dat rint it op 'e CPU.",
   "Out of video memory: off until the next start.": "Fideo-ûnthâld op: út oant de folgjende start.",

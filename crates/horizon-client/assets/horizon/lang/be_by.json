@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Гэтая функцыя яшчэ недаступная ў Horizon.",
   "Your display or system doesn't offer HDR output.": "Ваш дысплэй або сістэма не забяспечвае выхад HDR.",
   "Turn HDR on to use it.": "Уключыце HDR, каб выкарыстоўваць яго.",
+  "Turn VSync off to use it.": "Выключыце VSync, каб скарыстацца.",
   "Your GPU or graphics API doesn't support it.": "Ваш GPU або графічны API не падтрымлівае гэта.",
   "Not with software rendering, which runs it on the CPU.": "Не пры праграмным рэндэрынгу, які выконвае яго на CPU.",
   "Out of video memory: off until the next start.": "Не хапае відэапамяці: выключана да наступнага запуску.",

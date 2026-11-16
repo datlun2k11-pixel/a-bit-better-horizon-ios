@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Ĉi tiu funkcio ankoraŭ ne disponeblas en Horizon.",
   "Your display or system doesn't offer HDR output.": "Via ekrano aŭ sistemo ne ofertas HDR-eligon.",
   "Turn HDR on to use it.": "Ŝaltu HDR por uzi ĝin.",
+  "Turn VSync off to use it.": "Malŝaltu VSync por uzi ĝin.",
   "Your GPU or graphics API doesn't support it.": "Via GPU aŭ grafika API ne subtenas ĝin.",
   "Not with software rendering, which runs it on the CPU.": "Ne kun programa bildigo, kiu plenumas ĝin per la CPU.",
   "Out of video memory: off until the next start.": "Mankas videomemoro: malŝaltita ĝis la sekva starto.",

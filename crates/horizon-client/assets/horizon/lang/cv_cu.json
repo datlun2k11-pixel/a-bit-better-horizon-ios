@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Ку функци Horizon-ра хальлӗхе ҫук-ха.",
   "Your display or system doesn't offer HDR output.": "Сирӗн дисплей е система HDR тухӑҫне сӗнмест.",
   "Turn HDR on to use it.": "Ӑна усӑ курма HDR ҫутӑр.",
+  "Turn VSync off to use it.": "Turn VSync off to use it.",
   "Your GPU or graphics API doesn't support it.": "Сирӗн GPU е графика API ӑна пулӑшмасть.",
   "Not with software rendering, which runs it on the CPU.": "Софт-рендерингпа ҫук, вӑл ӑна процессор ҫинче ӗҫлеттерет.",
   "Out of video memory: off until the next start.": "Видеопамять пӗтнӗ: тепӗр пуҫламӑшчен сӳннӗ.",

@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Níl an ghné seo ar fáil fós i Horizon.",
   "Your display or system doesn't offer HDR output.": "Ní thairgeann do thaispeántas nó do chóras aschur HDR.",
   "Turn HDR on to use it.": "Cuir HDR ar siúl chun é a úsáid.",
+  "Turn VSync off to use it.": "Múch VSync chun é a úsáid.",
   "Your GPU or graphics API doesn't support it.": "Ní thacaíonn do GPU nó API grafaic leis.",
   "Not with software rendering, which runs it on the CPU.": "Ní leis an rindreáil bhogearraí, a ritheann é ar an CPU.",
   "Out of video memory: off until the next start.": "Cuimhne físe ídithe: as go dtí an chéad tús eile.",

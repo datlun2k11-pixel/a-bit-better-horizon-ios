@@ -408,6 +408,7 @@
   "%s mobs": "%s stworzeń",
   "Only applies to asynchronous entity culling.": "Dotyczy tylko asynchronicznego pomijania bytów.",
   "Turn HDR on to use it.": "Włącz HDR, aby tego użyć.",
+  "Turn VSync off to use it.": "Wyłącz VSync, aby z niego korzystać.",
   "Your GPU or graphics API doesn't support it.": "Twoje GPU lub API graficzne tego nie obsługuje.",
   "%s chunks": "%s chunków",
   "%s per frame": "%s na klatkę",

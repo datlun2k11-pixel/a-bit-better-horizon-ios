@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Deze functie is nog neet besjikbaar in Horizon.",
   "Your display or system doesn't offer HDR output.": "Uw display of systeem biedt gein HDR-oetvoer.",
   "Turn HDR on to use it.": "Slaag HDR in um ‘t te gebruke.",
+  "Turn VSync off to use it.": "Zet VSync oet om 't te broeken.",
   "Your GPU or graphics API doesn't support it.": "Uw GPU of grafieke-API ondersteunt ut neet.",
   "Not with software rendering, which runs it on the CPU.": "Neet mit softwarerendering, wat ‘t op de CPU deit.",
   "Out of video memory: off until the next start.": "Geheuge vaan de grafieke-kaart vol: oet tot de volgende start.",
