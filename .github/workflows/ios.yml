@@ -159,6 +159,7 @@ jobs:
       - name: Publish on the ios-nightly pre-release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           COMMIT: ${{ github.sha }}
           PR: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
