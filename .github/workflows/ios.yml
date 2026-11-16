@@ -1,6 +1,7 @@
 name: ios
 # The game for iPhone and iPad, and nothing else: the Rust game cross-compiled for aarch64-apple-ios, wrapped by
-# packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa. No tests run here. The .ipa is then posted to Discord when the repository secret
+# packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa plus the same archive named
+# .tipa for TrollStore. No tests run here. The .ipa is then posted to Discord when the repository secret
 # DISCORD_IPA_WEBHOOK is set.
 on:
   push:
@@ -87,10 +88,19 @@ jobs:
           if-no-files-found: ignore
       - name: Audit the unsigned distributable
         run: python3 tools/ci/ios_release.py Horizon-game-unsigned.ipa --expect-commit "$GITHUB_SHA" --run-number "$GITHUB_RUN_NUMBER" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Pack the TrollStore copy
+        # A .tipa is the same archive as the .ipa: the extension tells TrollStore to sign and register the
+        # app itself, so there is nothing to re-sign beforehand.
+        run: |
+          set -euo pipefail
+          cp Horizon-game-unsigned.ipa Horizon-game-unsigned.tipa
+          cmp Horizon-game-unsigned.ipa Horizon-game-unsigned.tipa
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-ios-game
-          path: Horizon-game-unsigned.ipa
+          path: |
+            Horizon-game-unsigned.ipa
+            Horizon-game-unsigned.tipa
           retention-days: 7
           if-no-files-found: error
       - name: Publish on the ios-nightly pre-release
@@ -116,13 +126,16 @@ jobs:
             echo
             echo "Download \`Horizon-game-unsigned.ipa\` below and install it with your developer tooling (AltStore,"
             echo "Sideloadly, Xcode, …): the .ipa is unsigned, so it must be re-signed for your own device."
+            echo
+            echo "On TrollStore, install \`Horizon-game-unsigned.tipa\` instead: it is the same archive, and TrollStore"
+            echo "signs it itself with no re-signing step."
           } > notes.md
           gh release delete ios-nightly --yes --cleanup-tag 2>/dev/null || true
           gh release create ios-nightly --prerelease --latest=false --target main \
             --title "iOS Nightly · $date · ${COMMIT:0:7}" \
             --notes-file notes.md \
-            Horizon-game-unsigned.ipa
-      - name: Send the .ipa to Discord
+            Horizon-game-unsigned.ipa Horizon-game-unsigned.tipa
+      - name: Send the builds to Discord
         # Delivery is optional: the IPA is already available in the run's artifacts.
         continue-on-error: true
         if: github.event_name != 'pull_request' && env.DISCORD_IPA_WEBHOOK != ''
@@ -132,12 +145,14 @@ jobs:
           set -uo pipefail
           content=$(printf '%s\n' \
             "**Horizon for iPhone and iPad, run #${GITHUB_RUN_NUMBER}**" \
-            "\`${GITHUB_REF_NAME}@${GITHUB_SHA::7}\`: an unsigned .ipa, with no assets" \
+            "\`${GITHUB_REF_NAME}@${GITHUB_SHA::7}\`: an unsigned .ipa and its TrollStore .tipa, with no assets" \
             "🤖 Posted by \`.github/workflows/ios.yml\`, not by a person.")
           response=$(mktemp)
           trap 'rm -f "$response"' EXIT
           if ! code=$(curl --connect-timeout 15 --max-time 120 -sS -o "$response" -w '%{http_code}' -X POST "$DISCORD_IPA_WEBHOOK" \
-            -F "content=$content" -F "file=@Horizon-game-unsigned.ipa;type=application/octet-stream"); then
+            -F "content=$content" \
+            -F "file=@Horizon-game-unsigned.ipa;type=application/octet-stream" \
+            -F "file=@Horizon-game-unsigned.tipa;type=application/octet-stream"); then
             echo "::warning::Could not reach Discord. The IPA is available in this run's artifacts."
             exit 0
           fi
