@@ -146,7 +146,7 @@ jobs:
       github.repository == 'datlun2k11-pixel/a-bit-better-horizon-ios' &&
       (github.event_name != 'pull_request' && github.ref == 'refs/heads/main' ||
        github.event_name == 'pull_request' &&
-       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association || '') &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
