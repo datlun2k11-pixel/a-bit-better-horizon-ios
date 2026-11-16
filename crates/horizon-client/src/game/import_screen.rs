@@ -280,6 +280,20 @@ impl Loading {
         Ok(())
     }
 
+    /// Give up on the download (`download-cancel`): the game's own screen takes over and its doors (Wi-Fi,
+    /// the Files app's folder) send the files instead. Nothing to give up on leaves the screen as it is.
+    pub(super) fn cancel_download(&mut self) {
+        let Some(import) = &mut self.import else {
+            return;
+        };
+        if let Some(download) = import.download.take() {
+            log::warn!("Horizon: the download was given up; the screen's other doors take over");
+            download.cancel();
+            import.error = None;
+            import.session = open_session(&import.home);
+        }
+    }
+
     /// Why the loader found nothing to start, as the screen says it.
     pub(super) fn import_reason(&self) -> Option<&str> {
         self.import.as_ref().map(|import| import.reason.as_str())
