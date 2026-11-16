@@ -1,8 +1,9 @@
 name: ios
 # The game for iPhone and iPad, and nothing else: the Rust game cross-compiled for aarch64-apple-ios, wrapped by
 # packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa plus the same archive named
-# .tipa for TrollStore. No tests run here. The .ipa is then posted to Discord when the repository secret
-# DISCORD_IPA_WEBHOOK is set.
+# .tipa for TrollStore. No tests run here. A build of main replaces the ios-nightly pre-release people install;
+# a pull request's build stops at the run's artifacts. The .ipa is then posted to Discord when the repository
+# secret DISCORD_IPA_WEBHOOK is set.
 on:
   push:
     branches: [main]
@@ -15,7 +16,7 @@ on:
   pull_request:
     branches: [main]
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: ios-${{ github.sha }}
   cancel-in-progress: false
@@ -103,38 +104,6 @@ jobs:
             Horizon-game-unsigned.tipa
           retention-days: 7
           if-no-files-found: error
-      - name: Publish on the ios-nightly pre-release
-        # The one place people try the newest iOS build: every CI build of this fork replaces the .ipa on
-        # this single pre-release, whose notes always name the newest commit built and uploaded. Forks of
-        # forks have no releases to publish to.
-        if: github.repository == 'datlun2k11-pixel/a-bit-better-horizon-ios'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-          REF_NAME: ${{ github.event.pull_request.head.ref || github.ref_name }}
-        run: |
-          set -euo pipefail
-          date=$(date -u +%Y-%m-%d)
-          {
-            echo "## Horizon iOS Nightly — unsigned test build"
-            echo
-            echo "> [!WARNING]"
-            echo "> This build has **not been reviewed or tested carefully**. It is an unsigned nightly for trying out"
-            echo "> the newest changes on iPhone and iPad; expect bugs and install it at your own risk."
-            echo
-            echo "**Latest commit built and uploaded:** \`${COMMIT}\` (\`${REF_NAME}\`, $date)"
-            echo
-            echo "Download \`Horizon-game-unsigned.ipa\` below and install it with your developer tooling (AltStore,"
-            echo "Sideloadly, Xcode, …): the .ipa is unsigned, so it must be re-signed for your own device."
-            echo
-            echo "On TrollStore, install \`Horizon-game-unsigned.tipa\` instead: it is the same archive, and TrollStore"
-            echo "signs it itself with no re-signing step."
-          } > notes.md
-          gh release delete ios-nightly --yes --cleanup-tag 2>/dev/null || true
-          gh release create ios-nightly --prerelease --latest=false --target main \
-            --title "iOS Nightly · $date · ${COMMIT:0:7}" \
-            --notes-file notes.md \
-            Horizon-game-unsigned.ipa Horizon-game-unsigned.tipa
       - name: Send the builds to Discord
         # Delivery is optional: the IPA is already available in the run's artifacts.
         continue-on-error: true
@@ -165,6 +134,50 @@ jobs:
               echo "::warning::Discord delivery failed (HTTP $code). The IPA is available in this run's artifacts."
               ;;
           esac
+
+  nightly:
+    needs: ipa
+    # The one place people try the newest iOS build: a build of main replaces the .ipa on this single
+    # pre-release, whose notes name the commit built. A pull request's build stops at the run's artifacts,
+    # so unreviewed code never reaches the release people install, and a fork's token could not publish.
+    if: >-
+      github.repository == 'datlun2k11-pixel/a-bit-better-horizon-ios' &&
+      github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: horizon-ios-game
+      - name: Publish on the ios-nightly pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          date=$(date -u +%Y-%m-%d)
+          {
+            echo "## Horizon iOS Nightly — unsigned test build"
+            echo
+            echo "> [!WARNING]"
+            echo "> This build has **not been reviewed or tested carefully**. It is an unsigned nightly for trying out"
+            echo "> the newest changes on iPhone and iPad; expect bugs and install it at your own risk."
+            echo
+            echo "**Latest commit built and uploaded:** \`${COMMIT}\` (\`main\`, $date)"
+            echo
+            echo "Download \`Horizon-game-unsigned.ipa\` below and install it with your developer tooling (AltStore,"
+            echo "Sideloadly, Xcode, …): the .ipa is unsigned, so it must be re-signed for your own device."
+            echo
+            echo "On TrollStore, install \`Horizon-game-unsigned.tipa\` instead: it is the same archive, and TrollStore"
+            echo "signs it itself with no re-signing step."
+          } > notes.md
+          gh release delete ios-nightly --yes --cleanup-tag 2>/dev/null || true
+          gh release create ios-nightly --prerelease --latest=false --target main \
+            --title "iOS Nightly · $date · ${COMMIT:0:7}" \
+            --notes-file notes.md \
+            Horizon-game-unsigned.ipa Horizon-game-unsigned.tipa
 
   release:
     needs: ipa

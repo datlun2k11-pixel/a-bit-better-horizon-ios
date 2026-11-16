@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -51,8 +51,12 @@ pub struct Download {
     received: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
     installing: Arc<AtomicU64>,
+    cancelled: Arc<AtomicBool>,
     done: mpsc::Receiver<Result<Installed, String>>,
 }
+
+/// What a download that was given up on ends with.
+const CANCELLED: &str = "the download was cancelled";
 
 impl Download {
     /// Start downloading `url` into `home` and installing it there. A finished archive already in
@@ -61,8 +65,14 @@ impl Download {
         let received = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(0));
         let installing = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let (sender, done) = mpsc::channel();
-        let (r, t, i) = (received.clone(), total.clone(), installing.clone());
+        let (r, t, i, c) = (
+            received.clone(),
+            total.clone(),
+            installing.clone(),
+            cancelled.clone(),
+        );
         thread::Builder::new()
             .name("horizon-download".into())
             .spawn(move || {
@@ -74,7 +84,7 @@ impl Download {
                         );
                         Ok(archive)
                     }
-                    None => fetch(&url, &home, &r, &t),
+                    None => fetch(&url, &home, &r, &t, &c),
                 };
                 let result = archive.and_then(|archive| {
                     i.store(1, Ordering::Relaxed);
@@ -93,8 +103,15 @@ impl Download {
             received,
             total,
             installing,
+            cancelled,
             done,
         })
+    }
+
+    /// Give up on the archive: the request in flight ends at its next chunk (or read timeout), and the
+    /// partial file goes. Used when the screen offers the game's other doors instead.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 
     pub fn stage(&self) -> Stage {
@@ -145,6 +162,17 @@ const PAUSE: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const PAUSE: Duration = Duration::from_millis(10);
 
+/// How long a request waits for bytes before it is taken as broken.
+#[cfg(not(test))]
+fn read_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+/// Short in tests, so a cancelled download's thread ends without waiting a minute.
+#[cfg(test)]
+fn read_timeout() -> Duration {
+    Duration::from_millis(200)
+}
+
 /// What stopped one request.
 enum Stop {
     /// The connection broke: try again from where it stopped.
@@ -162,17 +190,23 @@ fn fetch(
     home: &Path,
     received: &AtomicU64,
     total: &AtomicU64,
+    cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(60))
+        .timeout_read(read_timeout())
         .build();
     fs::create_dir_all(home).map_err(|e| e.to_string())?;
     let part = home.join(PARTIAL);
     let archive = home.join(DOWNLOADED);
     let mut tries = 0;
     loop {
-        match fetch_once(&agent, url, &part, received, total) {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&part);
+            let _ = fs::remove_file(home.join(PARTIAL_TAG));
+            return Err(CANCELLED.to_owned());
+        }
+        match fetch_once(&agent, url, &part, received, total, cancelled) {
             Ok(()) => break,
             Err(Stop::Failed(e)) => {
                 let _ = fs::remove_file(&part);
@@ -203,6 +237,7 @@ fn fetch_once(
     part: &Path,
     received: &AtomicU64,
     total: &AtomicU64,
+    cancelled: &AtomicBool,
 ) -> Result<(), Stop> {
     let tag_file = part.with_file_name(PARTIAL_TAG);
     let tag = fs::read_to_string(&tag_file)
@@ -270,6 +305,9 @@ fn fetch_once(
         // closed fails ("Socket is not connected", os error 57) instead of saying the body ended.
         if size != 0 && so_far >= size {
             break;
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(Stop::Failed(CANCELLED.into()));
         }
         let n = match reader.read(&mut buffer) {
             Ok(0) => break,
@@ -483,6 +521,28 @@ mod tests {
         assert!(home.join("resources/horizon-resources.json").is_file());
         assert!(!home.join("26.3.zip").exists());
         fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A screen that offers the game's other doors gives the download up: it ends with an error, and no
+    /// partial archive is left for the next run to resume.
+    #[test]
+    fn a_cancelled_download_stops() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            // Say nothing: the request is still waiting when it is cancelled.
+            thread::sleep(Duration::from_secs(2));
+        });
+        let home = home("cancelled");
+        let download = Download::start(format!("http://{address}/26.3.zip"), home.clone()).unwrap();
+        download.cancel();
+        let error = wait(&download).unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(!home.join(PARTIAL).exists());
+        let _ = fs::remove_dir_all(home);
     }
 
     /// The file changed on the server between two tries: the second request gets it whole, not a part of it.
