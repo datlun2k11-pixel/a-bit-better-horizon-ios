@@ -535,6 +535,10 @@ impl Loading {
                     };
                     request.answer(&answer.to_string());
                 }
+                "download-cancel" => {
+                    self.cancel_download();
+                    request.answer(r#"{"ok":true}"#);
+                }
                 "import" | "import-game-files" => start_import(request),
                 "launcher-session" => session_request(request),
                 "options-get" | "options-set" => {

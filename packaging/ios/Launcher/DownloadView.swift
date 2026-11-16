@@ -70,11 +70,18 @@ final class DownloadModel: ObservableObject {
     @Published private(set) var speed: Double = 0
     @Published private(set) var version = "26.3"
 
+    /// The download has brought nothing for a while: the alert offers the game's own screen instead.
+    @Published var stalled = false
+
     /// Dismiss the screen (Present: the download is over, or the player chose another way).
     var close: () -> Void = {}
     private var samples: [(at: Date, bytes: Int64)] = []
     /// A retry is on its way to the game.
     private var retrying = false
+    /// When the last byte arrived (or the screen went up): a download that stays quiet is not working.
+    private var quietSince = Date()
+    /// The server's connection wait is 20 seconds; past this the request is not coming back in time.
+    private static let stallAfter: TimeInterval = 15
 
     var fraction: Double {
         switch phase {
@@ -95,8 +102,31 @@ final class DownloadModel: ObservableObject {
                 close()
                 return
             }
+            checkStall()
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
+    }
+
+    /// No byte since the screen went up: the game files stay broken and the server is not answering.
+    /// The alert lets the player into the game, whose own screen can take the files over Wi-Fi or from Files.
+    private func checkStall() {
+        guard !stalled, phase == .starting || phase == .downloading else { return }
+        if Date().timeIntervalSince(quietSince) >= Self.stallAfter {
+            stalled = true
+        }
+    }
+
+    /// Give the download more time: the connection may just be slow.
+    func waitLonger() {
+        stalled = false
+        quietSince = Date()
+    }
+
+    /// Leave the download and show the game's own screen, which sends the files another way.
+    func enterGame() async {
+        stalled = false
+        _ = await Bridge.send("download-cancel")
+        close()
     }
 
     func retry() async {
@@ -124,15 +154,21 @@ final class DownloadModel: ObservableObject {
             if let version = state["version"] as? String {
                 self.version = version
             }
+            if bytes != received {
+                quietSince = Date()
+                stalled = false
+            }
             measure(bytes)
             received = bytes
             phase = .downloading
         case "installing":
             phase = .installing
             speed = 0
+            stalled = false
         case "failed":
             // A state asked before the retry reached the game still says the last failure.
             guard !retrying else { return }
+            stalled = false
             phase = .failed(state["error"] as? String ?? "The download stopped.")
             speed = 0
             samples = []
@@ -221,6 +257,12 @@ struct DownloadView: View {
             .padding(.vertical, 24)
         }
         .task { await model.run() }
+        .alert("Game files are missing or damaged", isPresented: $model.stalled) {
+            Button("OK") { Task { await model.enterGame() } }
+            Button("Keep waiting", role: .cancel) { model.waitLonger() }
+        } message: {
+            Text("The game files on this device are missing or damaged, and the download server is not answering. OK opens the game's own screen, where the files can come over Wi-Fi or from the Files app.")
+        }
     }
 
     private var failed: Bool {
