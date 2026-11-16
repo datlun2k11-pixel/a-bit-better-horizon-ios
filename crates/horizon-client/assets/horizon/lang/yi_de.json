@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "דער שטריך איז נאָך נישט בנימצא אין Horizon.",
   "Your display or system doesn't offer HDR output.": "דיין אַרויסווייַזן אָדער סיסטעם קען נישט פאָרשלאָגן HDR רעזולטאַט.",
   "Turn HDR on to use it.": "קער אויף HDR צו נוצן עס.",
+  "Turn VSync off to use it.": "לעשע אויס VSync צו ניצן עס.",
   "Your GPU or graphics API doesn't support it.": "דיין גפּו אָדער גראַפיקס אַפּי שטיצט עס נישט.",
   "Not with software rendering, which runs it on the CPU.": "נישט מיט ווייכוואַרג־רענדערונג, וואָס לויפט עס אויף דער CPU.",
   "Out of video memory: off until the next start.": "ניטאָ מער ווידעאָ־זכּרון: אַוועק ביז דעם קומענדיקן סטאַרט.",

@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "תכונה זו עדיין לא זמינה ב-Horizon.",
   "Your display or system doesn't offer HDR output.": "הצג או המערכת שלך אינם מציעים פלט HDR.",
   "Turn HDR on to use it.": "הפעל את HDR כדי להשתמש בו.",
+  "Turn VSync off to use it.": "כבה את VSync כדי להשתמש בו.",
   "Your GPU or graphics API doesn't support it.": "ה-GPU או ה-API הגרפי שלך לא תומכים בזה.",
   "Not with software rendering, which runs it on the CPU.": "לא עם רינדור תוכנה, שמריץ אותו על ה-CPU.",
   "Out of video memory: off until the next start.": "אזל זיכרון הווידאו: כבוי עד ההפעלה הבאה.",

@@ -403,6 +403,7 @@
   "%s mobs": "%s 个生物",
   "Only applies to asynchronous entity culling.": "仅适用于异步实体剔除。",
   "Turn HDR on to use it.": "开启 HDR 后才能使用。",
+  "Turn VSync off to use it.": "关闭垂直同步即可使用。",
   "Your GPU or graphics API doesn't support it.": "你的 GPU 或图形 API 不支持此功能。",
   "%s chunks": "%s 个区块",
   "%s per frame": "每帧 %s",

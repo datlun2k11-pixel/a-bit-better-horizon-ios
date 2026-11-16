@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "ಈ ವೈಶಿಷ್ಟ್ಯವು ಇನ್ನೂ Horizon ನಲ್ಲಿ ಲಭ್ಯವಿಲ್ಲ.",
   "Your display or system doesn't offer HDR output.": "ನಿಮ್ಮ ಡಿಸ್‌ಪ್ಲೇ ಅಥವಾ ಸಿಸ್ಟಂ HDR ಔಟ್‌ಪುಟ್ ಅನ್ನು ನೀಡುವುದಿಲ್ಲ.",
   "Turn HDR on to use it.": "ಅದನ್ನು ಬಳಸಲು HDR ಅನ್ನು ಆನ್ ಮಾಡಿ.",
+  "Turn VSync off to use it.": "ಇದನ್ನು ಬಳಸಲು VSync ಆಫ್ ಮಾಡಿ.",
   "Your GPU or graphics API doesn't support it.": "ನಿಮ್ಮ GPU ಅಥವಾ ಗ್ರಾಫಿಕ್ಸ್ API ಅದನ್ನು ಬೆಂಬಲಿಸುವುದಿಲ್ಲ.",
   "Not with software rendering, which runs it on the CPU.": "ಸಾಫ್ಟ್‌ವೇರ್ ರೆಂಡರಿಂಗ್‌ನೊಂದಿಗೆ ಅಲ್ಲ, ಅದು ಇದನ್ನು CPU ನಲ್ಲಿ ಚಲಾಯಿಸುತ್ತದೆ.",
   "Out of video memory: off until the next start.": "ವೀಡಿಯೊ ಮೆಮೊರಿ ಖಾಲಿಯಾಗಿದೆ: ಮುಂದಿನ ಪ್ರಾರಂಭದವರೆಗೆ ಆಫ್.",

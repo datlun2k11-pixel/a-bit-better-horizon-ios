@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Den här funktionen är ännu inte tillgänglig i Horizon.",
   "Your display or system doesn't offer HDR output.": "Din bildskärm eller ditt system erbjuder inte HDR-utgång.",
   "Turn HDR on to use it.": "Slå på HDR för att använda den.",
+  "Turn VSync off to use it.": "Stäng av VSync för att använda det.",
   "Your GPU or graphics API doesn't support it.": "Din GPU eller grafik-API stöder det inte.",
   "Not with software rendering, which runs it on the CPU.": "Inte med mjukvarurendering, som kör det på CPU:n.",
   "Out of video memory: off until the next start.": "Slut på videominne: av till nästa start.",

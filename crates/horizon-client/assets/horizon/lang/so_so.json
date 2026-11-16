@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Sifadan wali lagama heli karo Horizon.",
   "Your display or system doesn't offer HDR output.": "Bandhiggaagu ama nidaamkaagu ma bixiyo wax soo saarka HDR.",
   "Turn HDR on to use it.": "Daar HDR si aad u isticmaasho.",
+  "Turn VSync off to use it.": "Dami VSync si aad u isticmaasho.",
   "Your GPU or graphics API doesn't support it.": "GPU gaaga ama garaafyada API ma taageerto",
   "Not with software rendering, which runs it on the CPU.": "Kuma shaqayso rendering software-ka, kaas oo ku socda CPU-ga.",
   "Out of video memory: off until the next start.": "Xusuusta fiidyaha waa dhammaatay: damin ilaa bilowga xiga.",

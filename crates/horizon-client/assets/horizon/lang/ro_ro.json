@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Această funcție nu este încă disponibilă în Horizon.",
   "Your display or system doesn't offer HDR output.": "Ecranul sau sistemul dvs. nu oferă ieșire HDR.",
   "Turn HDR on to use it.": "Activați HDR pentru a-l folosi.",
+  "Turn VSync off to use it.": "Oprește VSync pentru a-l folosi.",
   "Your GPU or graphics API doesn't support it.": "GPU-ul dvs. sau API-ul grafic nu îl acceptă.",
   "Not with software rendering, which runs it on the CPU.": "Nu cu randarea software, care îl rulează pe CPU.",
   "Out of video memory: off until the next start.": "Memorie video insuficientă: oprit până la următoarea pornire.",

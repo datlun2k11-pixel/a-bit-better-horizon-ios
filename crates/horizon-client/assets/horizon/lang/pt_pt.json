@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Esta funcionalidade ainda não está disponível no Horizon.",
   "Your display or system doesn't offer HDR output.": "O teu ecrã ou sistema não oferece saída HDR.",
   "Turn HDR on to use it.": "Ativa o HDR para o usar.",
+  "Turn VSync off to use it.": "Desative o VSync para o usar.",
   "Your GPU or graphics API doesn't support it.": "A tua GPU ou API gráfica não suporta esta funcionalidade.",
   "Not with software rendering, which runs it on the CPU.": "Indisponível com renderização por software, que a executa na CPU.",
   "Out of video memory: off until the next start.": "Memória de vídeo esgotada: desligado até ao próximo arranque.",

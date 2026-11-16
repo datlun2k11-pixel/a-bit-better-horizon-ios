@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Ez a funkció még nem érhető el a Horizonban.",
   "Your display or system doesn't offer HDR output.": "Kijelzője vagy rendszere nem kínál HDR-kimenetet.",
   "Turn HDR on to use it.": "A használatához kapcsolja be a HDR-t.",
+  "Turn VSync off to use it.": "Kapcsold ki a VSync-et, hogy használhasd.",
   "Your GPU or graphics API doesn't support it.": "A GPU vagy a grafikus API nem támogatja.",
   "Not with software rendering, which runs it on the CPU.": "Szoftveres rendereléssel nem működik, mert azt a CPU futtatja.",
   "Out of video memory: off until the next start.": "Elfogyott a videomemória: a következő indításig ki.",

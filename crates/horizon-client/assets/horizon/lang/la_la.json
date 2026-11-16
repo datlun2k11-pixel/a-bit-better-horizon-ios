@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Haec factura nondum est in promptuHorizon.",
   "Your display or system doesn't offer HDR output.": "Ostentationem tuam seu ratio non offert HDR output.",
   "Turn HDR on to use it.": "Turn HDR in uti.",
+  "Turn VSync off to use it.": "VSync deactiva ut eo utare.",
   "Your GPU or graphics API doesn't support it.": "Tua GPU vel graphics API non sustinet.",
   "Not with software rendering, which runs it on the CPU.": "Non cum redditione programmatis, quae id in CPU agit.",
   "Out of video memory: off until the next start.": "Memoria video defecit: exstinctum usque ad proximum initium.",

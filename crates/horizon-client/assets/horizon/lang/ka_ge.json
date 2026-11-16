@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "ეს ფუნქცია ჯერ არ არის ხელმისაწვდომი Horizon-ში.",
   "Your display or system doesn't offer HDR output.": "თქვენი ეკრანი ან სისტემა არ გთავაზობთ HDR გამომავალს.",
   "Turn HDR on to use it.": "ჩართეთ HDR გამოსაყენებლად.",
+  "Turn VSync off to use it.": "გამოსაყენებლად გამორთე VSync.",
   "Your GPU or graphics API doesn't support it.": "თქვენი GPU ან გრაფიკული API მას არ უჭერს მხარს.",
   "Not with software rendering, which runs it on the CPU.": "არ მუშაობს პროგრამულ რენდერთან, რომელიც მას CPU-ზე ასრულებს.",
   "Out of video memory: off until the next start.": "ვიდეო მეხსიერება ამოიწურა: გამორთულია შემდეგ გაშვებამდე.",

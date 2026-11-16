@@ -142,6 +142,7 @@
   "This feature is not yet available in Horizon.": "Ova funkcija još nije dostupna u Horizon-u.",
   "Your display or system doesn't offer HDR output.": "Vaš ekran ili sistem ne nude HDR izlaz.",
   "Turn HDR on to use it.": "Uključite HDR da biste ga koristili.",
+  "Turn VSync off to use it.": "Isključite VSync da biste ga koristili.",
   "Your GPU or graphics API doesn't support it.": "Vaš GPU ili grafički API to ne podržava.",
   "%s chunks": "%s komada",
   "%s per frame": "%s po kadru",

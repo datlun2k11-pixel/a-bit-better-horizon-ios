@@ -1135,8 +1135,9 @@ impl Item {
     /// the saved values wait for an HDR display), and its sliders do something only
     /// while it is on; Translucent Batching switches only where the device can batch
     /// (`graphics::translucent_batching_offered`), its saved value waiting for one that can,
-    /// Smooth Gradients only where it can draw the 16-bit frame, the same way, and GPU Culling
-    /// only where it is offered (`graphics::gpu_culling_offer`), with the reason it isn't.
+    /// Smooth Gradients only where it can draw the 16-bit frame, the same way, GPU Culling
+    /// only where it is offered (`graphics::gpu_culling_offer`), with the reason it isn't, and
+    /// the present mode only with VSync off, where the renderer reads it.
     fn blocked(self, s: &Settings) -> Option<&'static str> {
         if !self.available() {
             return Some("This feature is not yet available in Horizon.");
@@ -1178,6 +1179,9 @@ impl Item {
             {
                 Some("Only applies to asynchronous entity culling.")
             }
+            // The renderer reads the choice only with VSync off
+            // (`window::chosen_present_mode`), so cycling it now changes nothing.
+            Item::Horizon(H::PresentMode) if s.vsync => Some("Turn VSync off to use it."),
             Item::Horizon(H::GpuCulling) => crate::graphics::gpu_culling_offer().reason(),
             // VideoSettingsScreen.tick: Max Anisotropy only works with Anisotropic filtering.
             Item::Vanilla(Opt::MaxAnisotropy) if s.file.int("textureFiltering") != 2 => {
@@ -2563,6 +2567,25 @@ mod tests {
         lights.cycle(&mut s, false, FB);
         assert!(s.extras.dynamic_lights);
         assert_eq!(lights.switch(&s), Some(true));
+    }
+
+    #[test]
+    fn present_mode_says_it_waits_for_vsync_to_be_off() {
+        let item = Item::Horizon(H::PresentMode);
+        let mut s = Settings::default();
+        assert!(s.vsync);
+        assert_eq!(item.blocked(&s), Some("Turn VSync off to use it."));
+        let mut ui = GraphicsUi::default();
+        let rect = row(&mut ui, &s, item);
+        let before = s.horizon.present_mode;
+        assert!(press(&mut ui, &mut s, (rect[0] + 4.0, rect[1] + 4.0)).is_empty());
+        assert_eq!(s.horizon.present_mode, before);
+        s.vsync = false;
+        assert_eq!(item.blocked(&s), None);
+        assert!(
+            press(&mut ui, &mut s, (rect[0] + 4.0, rect[1] + 4.0)).contains(&Action::Changed)
+        );
+        assert_ne!(s.horizon.present_mode, before);
     }
 
     #[test]

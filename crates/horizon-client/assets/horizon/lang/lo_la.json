@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "ຄຸນສົມບັດນີ້ຍັງບໍ່ທັນມີຢູ່ໃນ Horizon.",
   "Your display or system doesn't offer HDR output.": "ຈໍສະແດງຜົນ ຫຼືລະບົບຂອງເຈົ້າບໍ່ມີຜົນອອກມາ HDR.",
   "Turn HDR on to use it.": "ເປີດ HDR ເພື່ອໃຊ້ມັນ.",
+  "Turn VSync off to use it.": "ເປີດ VSync ອອກເພື່ອໃຊ້ງານ.",
   "Your GPU or graphics API doesn't support it.": "GPU ຫຼື API ກຣາຟິກຂອງທ່ານບໍ່ຮອງຮັບມັນ.",
   "Not with software rendering, which runs it on the CPU.": "ບໍ່ໃຊ້ໄດ້ກັບການສະແດງຜົນດ້ວຍຊອບແວ, ເຊິ່ງເຮັດວຽກຢູ່ເທິງ CPU.",
   "Out of video memory: off until the next start.": "ໜ່ວຍຄວາມຈຳວິດີໂອໝົດ: ປິດຈົນຮອດການເລີ່ມຄັ້ງຕໍ່ໄປ.",

@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Энэ функцийг Horizon-д хараахан ашиглах боломжгүй байна.",
   "Your display or system doesn't offer HDR output.": "Таны дэлгэц эсвэл систем HDR гаралтыг санал болгодоггүй.",
   "Turn HDR on to use it.": "Үүнийг ашиглахын тулд HDR-г асаана уу.",
+  "Turn VSync off to use it.": "Ашиглахын тулд VSync-г унтраа.",
   "Your GPU or graphics API doesn't support it.": "Таны GPU эсвэл график API үүнийг дэмждэггүй.",
   "Not with software rendering, which runs it on the CPU.": "Програм хангамжийн рендэрт боломжгүй, учир нь түүнийг CPU дээр гүйцэтгэдэг.",
   "Out of video memory: off until the next start.": "Видео санах ой дууссан: дараагийн эхлэлт хүртэл унтраалттай.",

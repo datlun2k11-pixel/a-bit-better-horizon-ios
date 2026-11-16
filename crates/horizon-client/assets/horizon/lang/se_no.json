@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Dát doaibma ii leat velá gávdnamis Horizon:s.",
   "Your display or system doesn't offer HDR output.": "Du čájáhus dahje ortnet ii fála HDR-bohtosa.",
   "Turn HDR on to use it.": "Bija HDR johtui vai beasat dan geavahit.",
+  "Turn VSync off to use it.": "Turn VSync off to use it.",
   "Your GPU or graphics API doesn't support it.": "Du GPU dahje grafihkka API ii doarjjo dan.",
   "Not with software rendering, which runs it on the CPU.": "Ii software-govvemiin, mii čađaha dan CPU:s.",
   "Out of video memory: off until the next start.": "Video-muitu váilu: heaittihuvvon gitta boahtte álggu rádjái.",

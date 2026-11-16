@@ -286,6 +286,7 @@
   "This feature is not yet available in Horizon.": "Ẹya yii ko tii wa ni Horizon.",
   "Your display or system doesn't offer HDR output.": "Ifihan tabi eto rẹ ko funni ni iṣelọpọ HDR.",
   "Turn HDR on to use it.": "Tan HDR lati lo.",
+  "Turn VSync off to use it.": "Pa VSync lati lo ó.",
   "Your GPU or graphics API doesn't support it.": "GPU rẹ tabi API eya aworan ko ṣe atilẹyin rẹ.",
   "Not with software rendering, which runs it on the CPU.": "Kì í ṣiṣẹ́ pẹ̀lú ìyàwòrán sọ́fítwéà, èyí tí ó ń ṣe é lórí CPU.",
   "Out of video memory: off until the next start.": "Kò sí àyè nínú ìrántí fídíò: ó wà ní pípa títí di ìbẹ̀rẹ̀ tó ń bọ̀.",

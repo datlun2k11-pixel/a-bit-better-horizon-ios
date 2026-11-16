@@ -297,6 +297,7 @@
   "This feature is not yet available in Horizon.": "この機能は Horizon ではまだ利用できません。",
   "Your display or system doesn't offer HDR output.": "お使いのディスプレイまたはシステムは HDR 出力を提供しません。",
   "Turn HDR on to use it.": "HDR をオンにして使用します。",
+  "Turn VSync off to use it.": "使用するにはVSyncをオフにしてください。",
   "Your GPU or graphics API doesn't support it.": "GPU またはグラフィックス API はそれをサポートしていません。",
   "%s chunks": "%s チャンク",
   "%s per frame": "フレームあたり%s",
