@@ -1,9 +1,10 @@
 name: ios
 # The game for iPhone and iPad, and nothing else: the Rust game cross-compiled for aarch64-apple-ios, wrapped by
 # packaging/ios/project.yml's HorizonGame target, and uploaded as an unsigned .ipa plus the same archive named
-# .tipa for TrollStore. No tests run here. A build of main replaces the ios-nightly pre-release people install;
-# a pull request's build stops at the run's artifacts. The .ipa is then posted to Discord when the repository
-# secret DISCORD_IPA_WEBHOOK is set.
+# .tipa for TrollStore. No tests run here. A build of main, or of an owner/collaborator pull request built from
+# a branch in this repository, replaces the ios-nightly pre-release people install; anyone else's pull request
+# stops at the run's artifacts. The .ipa is then posted to Discord when the repository secret
+# DISCORD_IPA_WEBHOOK is set.
 on:
   push:
     branches: [main]
@@ -137,12 +138,16 @@ jobs:
 
   nightly:
     needs: ipa
-    # The one place people try the newest iOS build: a build of main replaces the .ipa on this single
-    # pre-release, whose notes name the commit built. A pull request's build stops at the run's artifacts,
-    # so unreviewed code never reaches the release people install, and a fork's token could not publish.
+    # The one place people try the newest iOS build. A build of main, or of an owner/collaborator's pull
+    # request built from a branch in this repository, replaces the .ipa on this single pre-release, whose
+    # notes name the commit and pull request built. Anyone else's pull request stops at the run's artifacts:
+    # an outside fork's token is read-only, and its code reaches nightly only after review and merge.
     if: >-
       github.repository == 'datlun2k11-pixel/a-bit-better-horizon-ios' &&
-      github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/main' ||
+       github.event_name == 'pull_request' &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -155,9 +160,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT: ${{ github.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           set -euo pipefail
           date=$(date -u +%Y-%m-%d)
+          if [ -n "${PR:-}" ]; then
+            where="pull request #${PR} — ${PR_TITLE}"
+            target="$COMMIT"
+          else
+            where='`main`'
+            target=main
+          fi
           {
             echo "## Horizon iOS Nightly — unsigned test build"
             echo
@@ -165,7 +179,7 @@ jobs:
             echo "> This build has **not been reviewed or tested carefully**. It is an unsigned nightly for trying out"
             echo "> the newest changes on iPhone and iPad; expect bugs and install it at your own risk."
             echo
-            echo "**Latest commit built and uploaded:** \`${COMMIT}\` (\`main\`, $date)"
+            echo "**Latest commit built and uploaded:** \`${COMMIT}\` (${where}, $date)"
             echo
             echo "Download \`Horizon-game-unsigned.ipa\` below and install it with your developer tooling (AltStore,"
             echo "Sideloadly, Xcode, …): the .ipa is unsigned, so it must be re-signed for your own device."
@@ -174,7 +188,7 @@ jobs:
             echo "signs it itself with no re-signing step."
           } > notes.md
           gh release delete ios-nightly --yes --cleanup-tag 2>/dev/null || true
-          gh release create ios-nightly --prerelease --latest=false --target main \
+          gh release create ios-nightly --prerelease --latest=false --target "$target" \
             --title "iOS Nightly · $date · ${COMMIT:0:7}" \
             --notes-file notes.md \
             Horizon-game-unsigned.ipa Horizon-game-unsigned.tipa
