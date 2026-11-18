@@ -36,6 +36,12 @@ const DOUBLE_TAP: Duration = Duration::from_millis(300);
 /// pointer, which must not also click where it left it.
 const TAP_SLOP: f32 = 6.0;
 
+/// How far, as a share of the screen's smaller side, a cursor-mode finger may move in one event before the
+/// move is a false position rather than a drag: iOS sometimes hands a touch a stale or re-anchored place (a
+/// palm resting, a touch re-seated), and following it threw the arrow across the screen for a frame. One such
+/// move is dropped; the next is let through, so a real fast drag (a coalesced frame) still lands.
+const MENU_CURSOR_JUMP: f32 = 0.25;
+
 /// How long the second tap of a double tap has to stay still before it holds the left button: a touch that
 /// moves sooner is moving the arrow, and pressing where it started would click what the arrow is over.
 const HOLD_STILL: Duration = Duration::from_millis(120);
@@ -217,6 +223,8 @@ struct MenuFinger {
     scrolled: (f32, f32),
     /// Where the finger was last seen: in cursor mode it moves the pointer by its own movement.
     from: (f32, f32),
+    /// A cursor-mode move was dropped as a false position; the next far move is taken as real.
+    dropped_jump: bool,
     /// Loop iterations since it went down.
     frames: u8,
     /// When it went down.
@@ -246,6 +254,17 @@ fn clamp_point(point: (f32, f32), batch: Option<HudBatch>) -> (f32, f32) {
     match batch {
         Some(b) => (point.0.clamp(0.0, b.width), point.1.clamp(0.0, b.height)),
         None => point,
+    }
+}
+
+/// Whether a finger's reported move is too far to be a drag in one event: a false position, not a touch
+/// that moved (`MENU_CURSOR_JUMP`).
+fn cursor_move_is_jump(from: (f32, f32), to: (f32, f32), batch: Option<HudBatch>) -> bool {
+    match batch {
+        Some(b) => {
+            (to.0 - from.0).hypot(to.1 - from.1) > b.width.min(b.height) * MENU_CURSOR_JUMP
+        }
+        None => false,
     }
 }
 
@@ -1335,6 +1354,7 @@ impl Game<'_> {
                     id,
                     scrolled: at,
                     from: at,
+                    dropped_jump: false,
                     frames: 0,
                     started: Instant::now(),
                     pressed: false,
@@ -1372,7 +1392,11 @@ impl Game<'_> {
                 }
                 // Two fingers down and scrolling move neither the arrow, as on a trackpad, and the first
                 // finger keeps its place for when the other lifts.
-                let (from, scrolling) = (finger.from, finger.second.is_some());
+                let (from, scrolling, dropped_jump) = (
+                    finger.from,
+                    finger.second.is_some(),
+                    finger.dropped_jump,
+                );
                 let last = finger.scrolled;
                 if scrolling {
                     if let Some(f) = self.touch.menu.as_mut() {
@@ -1382,11 +1406,27 @@ impl Game<'_> {
                     return;
                 }
                 let pointer = if cursor_mode {
-                    let was = clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch());
-                    clamp_point(
-                        (was.0 + at.0 - from.0, was.1 + at.1 - from.1),
-                        self.touch_batch(),
-                    )
+                    let batch = self.touch_batch();
+                    let was = clamp_point(self.touch.cursor.unwrap_or(at), batch);
+                    let (dx, dy) = (at.0 - from.0, at.1 - from.1);
+                    // A false touch position (iOS hands one out now and then, a palm resting or a touch
+                    // re-seated) would throw the arrow across the screen. Drop the first such move and
+                    // keep reading from the last good place; the next far move is a real, coalesced drag.
+                    if !dropped_jump && cursor_move_is_jump(from, at, batch) {
+                        log::warn!(
+                            "touch menu: cursor move ({:.0}, {:.0}) -> ({:.0}, {:.0}), {:.0} px, ignored as a false touch position",
+                            from.0,
+                            from.1,
+                            at.0,
+                            at.1,
+                            dx.hypot(dy)
+                        );
+                        if let Some(f) = self.touch.menu.as_mut() {
+                            f.dropped_jump = true;
+                        }
+                        return;
+                    }
+                    clamp_point((was.0 + dx, was.1 + dy), batch)
                 } else {
                     at
                 };
@@ -1399,6 +1439,7 @@ impl Game<'_> {
                         let (dx, dy) = (at.0 - f.scrolled.0, at.1 - f.scrolled.1);
                         f.moved |= dx * dx + dy * dy > TAP_SLOP * TAP_SLOP;
                         f.from = at;
+                        f.dropped_jump = false;
                     }
                     return;
                 }
@@ -1890,5 +1931,31 @@ impl Game<'_> {
             }
         }
         buttons
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cursor_move_over_a_quarter_of_the_screen_is_a_false_position() {
+        let size = [1038, 480];
+        let limit = {
+            let batch = HudBatch::new(size);
+            batch.width.min(batch.height) * MENU_CURSOR_JUMP
+        };
+        assert!(!cursor_move_is_jump(
+            (10.0, 10.0),
+            (10.0 + limit * 0.5, 10.0),
+            Some(HudBatch::new(size))
+        ));
+        assert!(cursor_move_is_jump(
+            (10.0, 10.0),
+            (10.0 + limit * 2.0, 10.0),
+            Some(HudBatch::new(size))
+        ));
+        // Without a screen there is nothing to measure against: no move is a jump.
+        assert!(!cursor_move_is_jump((0.0, 0.0), (500.0, 500.0), None));
     }
 }
