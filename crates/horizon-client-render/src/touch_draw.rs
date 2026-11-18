@@ -84,7 +84,7 @@ enum StickLayer {
 
 /// The analog stick, drawn as pixel art: a dark disc, a light ring, and a thumb that follows the finger,
 /// each made of hard-edged cells on one grid. `analog` is the stick's `[left, forward]`, each -1..=1; the
-/// thumb sits towards the direction it moves the player, snapping from cell to cell.
+/// thumb sits towards the direction it moves the player and follows the finger without snapping.
 pub fn draw_stick(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -109,7 +109,7 @@ pub fn draw_stick(
 /// The grid is `cell = (radius / 9).round().max(2)` pixels across, centred on the stick's centre rounded to
 /// whole pixels, so every cell has whole-pixel edges. A cell joins a layer by its centre's distance from
 /// the stick's centre: the disc out to `0.94 * radius`, the ring between `0.86 * radius` and `radius`, and
-/// the thumb the cells within `0.32 * radius` of the thumb's centre, which snaps to the grid.
+/// the thumb the cells within `0.32 * radius` of the thumb's centre, which follows the finger smoothly.
 fn stick_cells(r: Rect, analog: [f32; 2]) -> Vec<(StickLayer, StickCell)> {
     let radius = r[2].min(r[3]) / 2.0;
     if radius <= 0.0 {
@@ -121,7 +121,8 @@ fn stick_cells(r: Rect, analog: [f32; 2]) -> Vec<(StickLayer, StickCell)> {
     let n = (radius / cell).ceil() as i32 + 1;
     let (ox, oy) = (cx - n as f32 * cell, cy - n as f32 * cell);
 
-    // The thumb's centre, snapped to the grid's cell corners so it moves a whole cell at a time.
+    // The thumb's centre follows the finger smoothly. Only the cells it paints sit on the grid: snapping
+    // the centre to cell corners made a slow or jittery finger pop the thumb a whole cell off the touch.
     let thumb = radius * 0.32;
     let (ax, ay) = (-analog[0], -analog[1]);
     let len = ax.hypot(ay);
@@ -131,8 +132,7 @@ fn stick_cells(r: Rect, analog: [f32; 2]) -> Vec<(StickLayer, StickCell)> {
         (ax, ay)
     };
     let reach = radius - thumb;
-    let snap = |t: f32, centre: f32| centre + ((t - centre) / cell).round() * cell;
-    let thumb_centre = (snap(cx + dx * reach, cx), snap(cy + dy * reach, cy));
+    let thumb_centre = (cx + dx * reach, cy + dy * reach);
 
     let (mut disc, mut ring, mut thumb_cells) = (Vec::new(), Vec::new(), Vec::new());
     for j in 0..2 * n {
@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn stick_cells_are_whole_pixels_and_the_thumb_snaps_to_the_grid() {
+    fn stick_cells_are_whole_pixels_and_the_thumb_follows_the_finger() {
         let all = stick_cells(STICK, [0.3, -0.8]);
         assert!(!all.is_empty());
         for (layer, c) in &all {
@@ -361,10 +361,26 @@ mod tests {
             assert_eq!((c.x - 30.0) % c.size, 0.0);
             assert_eq!((c.y - 20.0) % c.size, 0.0);
         }
-        let at_rest = cells(STICK, [0.0, 0.0], StickLayer::Thumb);
-        let nudged = cells(STICK, [0.0, 0.05], StickLayer::Thumb);
-        assert_eq!(at_rest, nudged, "a nudge under half a cell must not move the thumb");
-        let pushed = cells(STICK, [0.0, 1.0], StickLayer::Thumb);
-        assert_ne!(at_rest, pushed, "a full push must move the thumb");
+        // The bug this guards: snapping the thumb's centre to cell corners made it hop a whole cell off
+        // the finger whenever the touch jittered across a boundary. A move just past half a cell must
+        // shift the thumb by about that move, not by a cell.
+        let centroid = |analog: [f32; 2]| {
+            let thumb = cells(STICK, analog, StickLayer::Thumb);
+            let n = thumb.len() as f32;
+            let sum = thumb.iter().fold((0.0, 0.0), |(x, y), c| {
+                (x + c.x + c.size / 2.0, y + c.y + c.size / 2.0)
+            });
+            (sum.0 / n, sum.1 / n)
+        };
+        let rest = centroid([0.0, 0.0]);
+        let moved = centroid([0.0, 0.09]);
+        let dy = (moved.1 - rest.1).abs();
+        assert!(dy > 2.0, "a small move left the thumb behind ({dy} px)");
+        assert!(dy < 9.0, "a small move popped the thumb {dy} px, a whole cell");
+        let pushed = centroid([0.0, 1.0]);
+        assert!(
+            (pushed.1 - rest.1).abs() > 40.0,
+            "a full push must move the thumb to the ring"
+        );
     }
 }
