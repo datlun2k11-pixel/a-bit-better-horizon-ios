@@ -250,7 +250,7 @@ struct MenuFinger {
 }
 
 /// A menu pointer kept on the screen: a finger can drag past an edge without losing it.
-fn clamp_point(point: (f32, f32), batch: Option<HudBatch>) -> (f32, f32) {
+fn clamp_point(point: (f32, f32), batch: Option<&HudBatch>) -> (f32, f32) {
     match batch {
         Some(b) => (point.0.clamp(0.0, b.width), point.1.clamp(0.0, b.height)),
         None => point,
@@ -259,7 +259,7 @@ fn clamp_point(point: (f32, f32), batch: Option<HudBatch>) -> (f32, f32) {
 
 /// Whether a finger's reported move is too far to be a drag in one event: a false position, not a touch
 /// that moved (`MENU_CURSOR_JUMP`).
-fn cursor_move_is_jump(from: (f32, f32), to: (f32, f32), batch: Option<HudBatch>) -> bool {
+fn cursor_move_is_jump(from: (f32, f32), to: (f32, f32), batch: Option<&HudBatch>) -> bool {
     match batch {
         Some(b) => {
             (to.0 - from.0).hypot(to.1 - from.1) > b.width.min(b.height) * MENU_CURSOR_JUMP
@@ -981,8 +981,10 @@ impl Game<'_> {
                     // Grabbing first would warp the pointer to the window's centre and leave the
                     // screen without the click, so a second finger's drag lost what it carried.
                     if pressed {
-                        let at =
-                            clamp_point(self.touch.cursor.unwrap_or(self.cursor), self.touch_batch());
+                        let at = clamp_point(
+                            self.touch.cursor.unwrap_or(self.cursor),
+                            self.touch_batch().as_ref(),
+                        );
                         self.touch_pointer(event_loop, at);
                         self.touch.cursor = Some(self.cursor);
                     }
@@ -1145,7 +1147,10 @@ impl Game<'_> {
     /// Jump over a screen: the left button, held until the finger lifts, so a direction drags what the
     /// pointer carries from slot to slot and its release drops it.
     fn touch_menu_pad_click(&mut self, event_loop: &dyn EventLoopCtl, pressed: bool) {
-        let mut at = clamp_point(self.touch.cursor.unwrap_or(self.cursor), self.touch_batch());
+        let mut at = clamp_point(
+            self.touch.cursor.unwrap_or(self.cursor),
+            self.touch_batch().as_ref(),
+        );
         if pressed {
             // Over a slot or button, the click lands on its centre: a direction held with it then drags
             // from slot to slot, as a held A does for the pad.
@@ -1168,7 +1173,10 @@ impl Game<'_> {
             return;
         };
         // The screen finds what is under the pointer while drawing: have it agree with the arrow first.
-        let at = clamp_point(self.touch.cursor.unwrap_or(self.cursor), self.touch_batch());
+        let at = clamp_point(
+            self.touch.cursor.unwrap_or(self.cursor),
+            self.touch_batch().as_ref(),
+        );
         self.touch_pointer(event_loop, at);
         // Jump held: the step drags what the pointer carries across the slots, as A does.
         let dragging = self
@@ -1298,7 +1306,7 @@ impl Game<'_> {
                 // In cursor mode the finger drags the pointer a touchpad's mouse would, and a tap acts
                 // under it, so the gesture starts wherever the pointer was left.
                 let pointer = if cursor_mode {
-                    clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch())
+                    clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch().as_ref())
                 } else {
                     at
                 };
@@ -1407,12 +1415,12 @@ impl Game<'_> {
                 }
                 let pointer = if cursor_mode {
                     let batch = self.touch_batch();
-                    let was = clamp_point(self.touch.cursor.unwrap_or(at), batch);
+                    let was = clamp_point(self.touch.cursor.unwrap_or(at), batch.as_ref());
                     let (dx, dy) = (at.0 - from.0, at.1 - from.1);
                     // A false touch position (iOS hands one out now and then, a palm resting or a touch
                     // re-seated) would throw the arrow across the screen. Drop the first such move and
                     // keep reading from the last good place; the next far move is a real, coalesced drag.
-                    if !dropped_jump && cursor_move_is_jump(from, at, batch) {
+                    if !dropped_jump && cursor_move_is_jump(from, at, batch.as_ref()) {
                         log::warn!(
                             "touch menu: cursor move ({:.0}, {:.0}) -> ({:.0}, {:.0}), {:.0} px, ignored as a false touch position",
                             from.0,
@@ -1426,7 +1434,7 @@ impl Game<'_> {
                         }
                         return;
                     }
-                    clamp_point((was.0 + dx, was.1 + dy), batch)
+                    clamp_point((was.0 + dx, was.1 + dy), batch.as_ref())
                 } else {
                     at
                 };
@@ -1490,7 +1498,7 @@ impl Game<'_> {
                 // The tap acts under the pointer, wherever the finger is: it never brings the arrow to
                 // the finger, so the mouse stays where the player left it.
                 let pointer = if cursor_mode {
-                    clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch())
+                    clamp_point(self.touch.cursor.unwrap_or(at), self.touch_batch().as_ref())
                 } else {
                     at
                 };
@@ -1941,19 +1949,17 @@ mod tests {
     #[test]
     fn a_cursor_move_over_a_quarter_of_the_screen_is_a_false_position() {
         let size = [1038, 480];
-        let limit = {
-            let batch = HudBatch::new(size);
-            batch.width.min(batch.height) * MENU_CURSOR_JUMP
-        };
+        let batch = HudBatch::new(size);
+        let limit = batch.width.min(batch.height) * MENU_CURSOR_JUMP;
         assert!(!cursor_move_is_jump(
             (10.0, 10.0),
             (10.0 + limit * 0.5, 10.0),
-            Some(HudBatch::new(size))
+            Some(&batch)
         ));
         assert!(cursor_move_is_jump(
             (10.0, 10.0),
             (10.0 + limit * 2.0, 10.0),
-            Some(HudBatch::new(size))
+            Some(&batch)
         ));
         // Without a screen there is nothing to measure against: no move is a jump.
         assert!(!cursor_move_is_jump((0.0, 0.0), (500.0, 500.0), None));
