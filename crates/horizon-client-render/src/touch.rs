@@ -162,10 +162,12 @@ fn contains(r: Rect, (x, y): (f32, f32)) -> bool {
     x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]
 }
 
-/// The button under a point.
+/// The button under a point: the last one painted, which is drawn over the others, so a button moved onto
+/// another (or onto the hotbar) owns the touch it covers.
 pub fn hit(layout: &[(Control, Rect)], at: (f32, f32)) -> Option<Control> {
     layout
         .iter()
+        .rev()
         .find(|(_, r)| contains(*r, at))
         .map(|(c, _)| *c)
 }
@@ -1540,6 +1542,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_button_drawn_on_top_owns_a_shared_touch() {
+        let layout = vec![
+            (Control::Jump, [0.0, 0.0, 10.0, 10.0]),
+            (Control::Custom(1), [5.0, 5.0, 10.0, 10.0]),
+        ];
+        // The point both cover goes to the one painted last, over the other.
+        assert_eq!(hit(&layout, (6.0, 6.0)), Some(Control::Custom(1)));
+        // A point only the lower one covers still reaches it.
+        assert_eq!(hit(&layout, (1.0, 1.0)), Some(Control::Jump));
     }
 
     #[test]
