@@ -565,6 +565,13 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.about_to_wait_here(event_loop)
     }
+    /// Suspended with the game up: its settings go to their files (`Game::suspended`). While the resources
+    /// load there is no game yet and nothing arranged by hand to save.
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        if let App::Ready(split) = self {
+            ApplicationHandler::suspended(&mut **split, event_loop);
+        }
+    }
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         self.exiting_here(event_loop)
     }
