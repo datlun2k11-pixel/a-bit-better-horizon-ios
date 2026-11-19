@@ -14,7 +14,8 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-horizon-game = { path = "../horizon-game", default-features = false }
+horizon-addresses = { path = "../horizon-addresses" }
+horizon-game = { path = "../horizon-game" }
 horizon-platform = { path = "../horizon-platform" }
 horizon-heartbeat = { path = "../horizon-heartbeat" }
 horizon-friends = { path = "../horizon-friends", features = ["game"] }
@@ -29,9 +30,3 @@ winresource = "0.1"
 
 [lints]
 workspace = true
-
-[features]
-default = ["audio", "controllers", "horizon-extras"]
-audio = ["horizon-game/audio"]
-controllers = ["horizon-game/controllers"]
-horizon-extras = ["horizon-game/horizon-extras"]

@@ -14,25 +14,21 @@ else (videos, Discord and other community material) lives elsewhere.
 suggest something. A pull request for a roadmap item carries its `roadmap:<id>` label; ideas go to the suggestion
 queue (the hub, or `/suggest` on Discord) rather than to issues, which are for bugs.
 
-**Mod-related pull requests go to [arismoko/horizon](https://github.com/arismoko/horizon)**, the fork that carries the
-mod API and reviews and merges that work. That covers the mod API, native hooks and events for mods, native mods,
-content mods (`.hmod`), mixins, wasm mods, `cargo horizon-mod`, `horizon-mods`, mod builds and the registry, and
-their docs ([mods](docs/mods.md), [native mods](docs/native-mods.md)). Open the pull request there from your usual
-branch. Mod-related pull requests opened here are closed with a pointer to it. Engine extension points that Horizon's
-own crates register (the [layer split](docs/layers.md)), resource and shader pack formats, and gameplay fixes stay
-here.
+**Mod-related pull requests are opened here, like every other.** That covers the mod API, native hooks and events
+for mods, native mods, content mods (`.hmod`), mixins, wasm mods, `cargo horizon-mod`, `horizon-mods`, mod builds and
+the registry, and their docs ([mods](docs/mods.md), [native mods](docs/native-mods.md)).
 
 ## Build it
 
 - **Prerequisites:** Rust (stable), Python 3.11+, JDK 25, git 2.38 or newer, and on Linux the ALSA and udev headers
-  (`libasound2-dev libudev-dev`).
+  (`libasound2-dev libudev-dev`; Void Linux: `base-devel pkg-config alsa-lib-devel eudev-libudev-devel`).
 - **Resources:** Horizon never downloads the game; it prepares its resources from your own copy of Minecraft 26.3, as
   described in [Build from source](docs/native-client.md#run-from-a-checkout).
 - **Commands:**
 
   ```sh
   cargo run --release -p horizon-prepare -- --prepare --server-jar ~/Downloads/server.jar
-  cargo run --release -p horizon-client
+  cargo run --release -p horizon-game
   ```
 
 - **Launcher:** its own Cargo workspace in `launcher/` (`cd launcher && cargo run`; on NixOS, `nix-shell` first).
@@ -100,6 +96,18 @@ exact random calls. It has to work together with normal Minecraft:
   default. The game may offer to turn it on when it finds a Java mod; the player decides. It is promoted out of beta
   only after MSPT and RAM benchmarks against the Java client with the same mods ([#13914](https://github.com/horizon-rust/horizon/issues/13914)).
 
+## Licence
+
+Horizon is under the GNU Lesser General Public License, version 3 or any later version ([LICENSE](LICENSE)). The
+LGPL adds permissions to the GNU GPL version 3, whose text is in [LICENSES/GPL-3.0.txt](LICENSES/GPL-3.0.txt). What
+you contribute is under the same licence. Code merged before the move from MIT stays available under the MIT licence
+([LICENSES/MIT.txt](LICENSES/MIT.txt)).
+
+Code taken from another project must be under a licence the LGPL-3.0 accepts, such as MIT, BSD, ISC, zlib,
+Apache-2.0, MPL-2.0, LGPL-3.0 or LGPL-2.1-or-later. It keeps its copyright line and licence notice, and gets an entry
+in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Code under the GPL or the AGPL can't go in: it would put all of
+Horizon under that licence. If you aren't sure, ask on Discord first.
+
 ## Before asking for review
 
 Run the self-check and paste the block it prints into your pull request:
@@ -133,7 +141,8 @@ Work is tracked in GitHub issues, and an issue that is assigned is taken (so is 
 claimed on Discord with Kira's `/claim`): pick another, or ask its holder in the thread. Before you start, comment
 **`/claim`** on the issue; you are assigned at once, no role needed. No issue for your work yet? Open one (a line is
 enough), then claim it. `/unclaim` gives it back. Issues labelled `tracker`, `proposal` or `not claimable` aren't
-claimed whole: claim one of the issues a tracker lists, or open one for the part you take.
+claimed whole: claim one of the issues a tracker lists, or open one for the part you take. For the first hour after
+an issue is filed only its author can claim it, so whoever found a problem gets to fix it (issues filed by bots have no such hour).
 
 A claim with no open pull request linking the issue (`Fixes #123` in the description, or a draft) is released after
 5 days, with a comment: open a draft early. You can hold 8 open issues at a time, not counting the ones your
@@ -151,6 +160,8 @@ it (edited on every push, never repeated): talk to its author in the thread befo
   (`#[cfg(test)]` modules) don't count, and neither do lines moved unchanged (same text, whitespace ignored, runs of
   3 or more lines), so a refactor that moves code can be far bigger than 3000 lines.
   pr_ready counts it the same way and warns when a pull request is over.
+- **Small fixes of one kind are one change.** The same defect in several tools, or several small fixes to one tool
+  or harness, go in one pull request that lists each issue it fixes (`Fixes #1, Fixes #2`).
 - **Fill in the template**: what and why, the vanilla reference, the pr_ready block, screenshots for anything you
   can see.
 - **Tick "Allow edits by maintainers".** When something small is left (a lint, a rebase, a nit) we push the fixup
@@ -166,7 +177,9 @@ it (edited on every push, never repeated): talk to its author in the thread befo
 - **Tick its kind** in the template: `parity` (Horizon now does what vanilla does), `bug` (a crash or breakage),
   `perf`, `feature` (new for players), `extra` (Horizon-only, off by default), `tooling` or `docs`. A workflow sets
   that label from the box, else from the title, and area labels (`launcher`, `mobs`, `worldgen`, `rendering`...)
-  from the title and the paths you change.
+  from the title and the paths you change. A size label (`size: XS` up to 50 lines, `S` 150, `M` 500, `L` 3000,
+  `XL` over) counts the lines GitHub shows as added and removed outside Markdown and test files: what counts above,
+  but with moved lines and inline tests, which the label can't tell apart.
   `label:parity` is the list of real progress toward vanilla.
 - **Release labels** (we set them if you can't): `feature` also puts it under "New" in the release notes,
   `skip-release` when players see no change (tooling, docs, tests), nothing for a fix. `release-now` is for crash
@@ -174,6 +187,8 @@ it (edited on every push, never repeated): talk to its author in the thread befo
 
 Who reviews and merges: the Horizon Team, on CI for ordinary pull requests; risky ones (saves, network, world
 generation, the launcher's updates) wait for a local proof first ([merging](docs/release-flow.md#merging)).
+A bot, CodeRabbit, also comments when a pull request opens. Treat it like any reviewer: fix what's right, say why
+when it isn't, and resolve the thread. It can't block a merge; `@coderabbitai review` asks it to look again.
 
 Every merge to main is released automatically ([release flow](docs/release-flow.md)), so main always stays playable.
 How agents, checks, releases and signed updates keep this safe: [security](docs/security.md).

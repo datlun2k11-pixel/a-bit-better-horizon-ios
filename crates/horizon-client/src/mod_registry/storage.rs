@@ -125,7 +125,7 @@ fn read_journal(path: &Path) -> Result<Journal, String> {
         &Cancellation::default(),
     )?;
     let journal: Journal = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if !horizon_mods::index::valid_id(&journal.id) {
+    if !horizon_mod_package::index::valid_id(&journal.id) {
         return Err("invalid mod transaction id".into());
     }
     Ok(journal)

@@ -8,16 +8,15 @@ use crate::cit_assets::{self, model_id, sprite_id};
 use crate::hud::cit_glint::GlintTextures;
 use crate::items::ItemStack;
 use glam::Vec3;
+use horizon_assets::resource_source::ResourceSource;
 use horizon_assets::{
     item_bake::{BakedItemModel, bake_resolved},
     model::{Material, TextureSlot},
     resolve::{MISSING_MODEL, ModelLibrary},
 };
-#[cfg(test)]
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
@@ -82,9 +81,14 @@ fn legacy(name: &str) -> &str {
 
 /// The `max_damage` a CIT rule's `damage` test reads: the stack's own
 /// component when it holds a non-negative int, else `item_max`, its item's.
-/// An explicit component removal reads as zero.
 pub fn stack_max_damage(stack: &ItemStack, item_max: u32) -> u32 {
-    stack.max_damage(item_max)
+    stack
+        .data()
+        .and_then(|d| match d.other("minecraft:max_damage") {
+            Some(Tag::Int(v)) => u32::try_from(*v).ok(),
+            _ => None,
+        })
+        .unwrap_or(item_max)
 }
 
 /// The winning `kind` (Armor or Elytra) rule of a worn `stack` whose item has `item_max` max
@@ -96,7 +100,7 @@ pub fn worn_rule(rules: &CitRules, kind: Kind, stack: &ItemStack, item_max: u32)
 
 /// The rules at `root` and `library` with their models, or `library` alone without rules.
 pub(super) fn load(
-    root: &Path,
+    root: &ResourceSource,
     library: Arc<ModelLibrary>,
 ) -> (Arc<ModelLibrary>, Option<CitModels>) {
     let rules = CitRules::load(root);
@@ -366,7 +370,11 @@ impl ItemRenderer {
 mod tests {
     use super::*;
     use horizon_assets::item_model::{DisplayContext, NoEnv, StackView};
-    use std::{collections::BTreeSet, fs, path::PathBuf};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     const CIT: &str = "assets/minecraft/optifine/cit";
 
@@ -509,8 +517,21 @@ mod tests {
     }
 
     fn renderer(root: &Path) -> ItemRenderer {
-        let library = crate::model_library::ParsedModels::load(root).into_item_library();
-        ItemRenderer::load_with_library(root, library).unwrap()
+        let library = crate::model_library::ParsedModels::load(&ResourceSource::directory(
+            root.to_path_buf(),
+        ))
+        .into_item_library();
+        let data = crate::test_resources::item_data(
+            root,
+            horizon_world::native_load_context::DataLoadOrigin::ClientPreload,
+        )
+        .unwrap();
+        ItemRenderer::load_with_library(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+            library,
+            &data,
+        )
+        .unwrap()
     }
 
     fn rule(r: &ItemRenderer, name: &str) -> usize {
@@ -712,12 +733,6 @@ mod tests {
         assert_eq!(with(None), 384);
         assert_eq!(with(Some(Tag::Int(-1))), 384);
         assert_eq!(with(Some(Tag::String("20".into()))), 384);
-        let mut removed = ItemStack::new("minecraft:bow", 1);
-        removed.data_mut().set_other(
-            "!minecraft:max_damage",
-            Some(Tag::Compound(Default::default())),
-        );
-        assert_eq!(stack_max_damage(&removed, 384), 0);
     }
 
     fn armor_rules(text: &str) -> CitRules {

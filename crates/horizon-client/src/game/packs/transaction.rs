@@ -401,7 +401,7 @@ mod transaction_tests {
         let mods_dir = Game::game_dir().join(horizon_client::mod_list::DIR);
         std::fs::create_dir_all(&mods_dir).unwrap();
         let manifest = "id = \"ruby\"\nname = \"Ruby\"\nversion = \"1.0.0\"\napi = \"0.2\"\nside = \"both\"\ncapabilities = [\"registries\"]\n";
-        let bytes = horizon_mods::Package::write_files(
+        let bytes = horizon_mod_package::Package::write_files(
             manifest,
             None,
             &[(

@@ -7264,7 +7264,7 @@ mod tests {
             (px, py),
             Instant::now() - std::time::Duration::from_secs(1),
         ));
-        let mut batch = HudBatch::new([480, 480]);
+        let mut batch = HudBatch::scratch([480, 480]);
         ui.draw(&s, crate::gfx::EffectiveOutput::NONE, &mut batch, &atlas, (px, py));
         assert_eq!(ui.touch_popup, Some(Control::Custom(id)));
         assert!(ui.dragging_touch.is_none());
@@ -7351,7 +7351,7 @@ mod tests {
             (px, py),
             Instant::now() - std::time::Duration::from_secs(1),
         ));
-        let mut batch = HudBatch::new([480, 480]);
+        let mut batch = HudBatch::scratch([480, 480]);
         ui.draw(&s, crate::gfx::EffectiveOutput::NONE, &mut batch, &atlas, (px, py));
         assert_eq!(ui.touch_popup, Some(Control::Chat));
         let (widgets, _, _, _) = ui.layout(&s, size.0, size.1);
@@ -8091,7 +8091,7 @@ mod tests {
     }
 
     fn atlas() -> HudAtlas {
-        HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap()
+        HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory("/nonexistent/horizon-test-assets".into())).unwrap()
     }
 
     /// Picking another pack keeps the last one's changed options before the next one's are
@@ -8616,7 +8616,7 @@ mod tests {
         );
         // The pointer is still on the clicked widget: it carries the
         // description (`setTooltip`, drawn while hovered).
-        let mut on = HudBatch::new([480, 480]);
+        let mut on = HudBatch::scratch([480, 480]);
         ui.draw(
             &s,
             crate::gfx::EffectiveOutput::NONE,
@@ -8629,7 +8629,7 @@ mod tests {
         // `focus_from_keyboard` false) does not keep the tooltip against
         // the widget, like vanilla's `MenuTooltipPositioner` does for a
         // keyboard focus.
-        let mut off = HudBatch::new([480, 480]);
+        let mut off = HudBatch::scratch([480, 480]);
         ui.draw(
             &s,
             crate::gfx::EffectiveOutput::NONE,
@@ -8882,11 +8882,11 @@ mod tests {
                 })
                 .unwrap();
             let cursor = (option.x + 1.0, option.y + 1.0);
-            let mut actual = HudBatch::new([480, 480]);
+            let mut actual = HudBatch::scratch([480, 480]);
             ui.draw(&s, crate::gfx::EffectiveOutput::NONE, &mut actual, &atlas, cursor);
             let key = format!("options.inactivityFpsLimit.{mode}.tooltip");
             assert!(lang::has(&key));
-            let mut expected = HudBatch::new([480, 480]);
+            let mut expected = HudBatch::scratch([480, 480]);
             ui::tooltip(
                 &mut expected,
                 &atlas,
@@ -9471,7 +9471,7 @@ mod tests {
         let mut ui = OptionsUi::default();
         ui.show(Page::Language);
         let draw_hint = |ui: &mut OptionsUi| {
-            let mut batch = HudBatch::new([960, 640]);
+            let mut batch = HudBatch::scratch([960, 640]);
             ui.draw(
                 &settings,
                 crate::gfx::EffectiveOutput::NONE,
@@ -9559,7 +9559,7 @@ mod tests {
             let mut s = Settings::default();
             let mut ui = OptionsUi::default();
             ui.show(Page::KeyBinds);
-            let mut batch = HudBatch::new([480, 240]);
+            let mut batch = HudBatch::scratch([480, 240]);
             let size = (batch.width, batch.height);
             let (widgets, top, bottom, _) = ui.layout(&s, size.0, size.1);
             let row = widgets

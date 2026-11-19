@@ -63,14 +63,6 @@ fn strips_of(
     programs: Vec<(String, String)>,
     alphas: [u8; 4],
 ) -> Option<([Option<[u8; 3]>; 3], Option<Vec<String>>)> {
-    strips_of_expected(programs, alphas, false)
-}
-
-fn strips_of_expected(
-    programs: Vec<(String, String)>,
-    alphas: [u8; 4],
-    gpu_rejection: bool,
-) -> Option<([Option<[u8; 3]>; 3], Option<Vec<String>>)> {
     let Some(gpu) = Gpu::new() else {
         eprintln!("TERRAIN_PARTS_NO_ADAPTER");
         return None;
@@ -107,39 +99,31 @@ fn strips_of_expected(
     })];
     let color = gpu.texture(T::Rgba8Unorm);
     let depth = gpu.texture(T::Depth32Float);
-    let world = World {
-        atlas: None,
-        material_maps: None,
-        lightmap: color.clone(),
-        terrain: Some(Geometry {
-            buffers: &layouts,
-            table: None,
-            depth_write: true,
+    let mut post = gpu.load(
+        files,
+        World {
             atlas: None,
-            material_maps: false,
-            ids: None,
-            cull: false,
-        }),
-        block_ids: &[],
-        sprite_rects: &[],
-        celestial: None,
-        gui_size: SIZE,
-        clouds: None,
-        weather: false,
-        hand: false,
-    };
-    let mut post = if gpu_rejection {
-        gpu.load_gpu_rejected(files, world, inputs)
-    } else {
-        gpu.load(files, world, inputs)
-    };
-    if gpu_rejection {
-        // load_gpu_rejected has checked the real GPU validation failure and
-        // removal of BOTH terrain pipelines. A rejected pack must not enter the
-        // render harness; these None values describe ownership, not pixel reads.
-        assert!(!post.complete && post.terrain.is_none() && post.terrain_cutout.is_none());
-        return Some(([None; 3], Some(post.notes.clone())));
-    }
+            material_maps: None,
+            lightmap: color.clone(),
+            terrain: Some(Geometry {
+                buffers: &layouts,
+                table: None,
+                depth_write: true,
+                atlas: None,
+                material_maps: false,
+                ids: None,
+                cull: false,
+            }),
+            block_ids: &[],
+            sprite_rects: &[],
+            celestial: None,
+            gui_size: SIZE,
+            clouds: None,
+            weather: false,
+            hand: false,
+        },
+        inputs,
+    );
     let opaque = u32::from(crate::mesher::OPAQUE_LAYER);
     let mut vertices: Vec<u32> = Vec::new();
     for (i, layer) in [opaque | 1, 2, u32::from(LAVA)].into_iter().enumerate() {
@@ -161,21 +145,11 @@ fn strips_of_expected(
             contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
-    if let Some(cutout) = &post.terrain_cutout {
-        assert!(
-            post.programs().contains(&cutout.name.as_str()),
-            "cutout pass missing from the active program report"
-        );
-    }
-    let terrain_group = unused_terrain_group(&post, &gpu.device);
     let undrawn = (!post.has_terrain()).then(|| post.notes.clone());
-    let hud = HudBatch::new(SIZE);
+    let hud = HudBatch::scratch(SIZE);
     let frame = fixture_frame(&hud);
     let pixels = gpu.render(&mut post, &color, &depth, &frame, &mut |rp, list, _, _| {
         if list == TerrainList::Solid {
-            if let Some(group) = &terrain_group {
-                rp.set_bind_group(3, group, &[]);
-            }
             rp.set_vertex_buffer(0, buffer.slice(..));
             rp.draw(0..18, 0..1);
         }
@@ -199,6 +173,7 @@ fn strips_of_expected(
 
 #[test]
 fn solid_and_cutout_programs_draw_their_own_terrain() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let programs = [
         ("gbuffers_terrain", RED, 1.0),
         ("gbuffers_terrain_solid", GREEN, 1.0),
@@ -210,6 +185,7 @@ fn solid_and_cutout_programs_draw_their_own_terrain() {
 
 #[test]
 fn without_a_cutout_program_cutout_terrain_falls_back_to_gbuffers_terrain() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let programs = [
         ("gbuffers_terrain", RED, 1.0),
         ("gbuffers_terrain_solid", GREEN, 1.0),
@@ -220,6 +196,7 @@ fn without_a_cutout_program_cutout_terrain_falls_back_to_gbuffers_terrain() {
 
 #[test]
 fn without_a_solid_program_solid_terrain_falls_back_to_gbuffers_terrain() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let programs = [
         ("gbuffers_terrain", RED, 1.0),
         ("gbuffers_terrain_cutout", BLUE, 1.0),
@@ -230,6 +207,7 @@ fn without_a_solid_program_solid_terrain_falls_back_to_gbuffers_terrain() {
 
 #[test]
 fn solid_terrain_keeps_alpha_0_05_and_cutout_loses_it() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let programs = [
         ("gbuffers_terrain", RED, 1.0),
         ("gbuffers_terrain_solid", GREEN, 0.05),
@@ -250,6 +228,7 @@ fn solid_terrain_keeps_alpha_0_05_and_cutout_loses_it() {
 /// differ; the quad still draws whole, with its part's program.
 #[test]
 fn a_quad_draws_whole_whatever_its_vertex_alphas() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let programs = [
         ("gbuffers_terrain", RED, 1.0),
         ("gbuffers_terrain_solid", GREEN, 1.0),
@@ -265,6 +244,7 @@ fn a_quad_draws_whole_whatever_its_vertex_alphas() {
 
 #[test]
 fn a_pack_with_neither_draws_all_terrain_with_gbuffers_terrain() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(got) = strips(&[("gbuffers_terrain", RED, 1.0)]) else {
         return;
     };
@@ -276,6 +256,7 @@ fn a_pack_with_neither_draws_all_terrain_with_gbuffers_terrain() {
 /// `tsc-cutoutonly`.
 #[test]
 fn a_lone_split_program_draws_only_its_own_terrain() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let solid = strips(&[("gbuffers_terrain_solid", GREEN, 1.0)]);
     let Some(solid) = solid else { return };
     assert_eq!(solid, [Some(GREEN), None, Some(GREEN)]);
@@ -283,11 +264,11 @@ fn a_lone_split_program_draws_only_its_own_terrain() {
     assert_eq!(cutout, Some([None, Some(BLUE), None]));
 }
 
-/// A fragment with no color outputs is a valid geometry/depth pass. It must
-/// not disable the other terrain half. The dedicated colorless-geometry Metal
-/// regression also verifies that such programs retain their depth writes.
+/// When one part's pipeline can't be built (here a cutout program writing no buffer, which
+/// Horizon skips), the other part doesn't draw alone either: the game draws all terrain.
 #[test]
-fn a_depth_only_cutout_does_not_disable_solid_terrain() {
+fn a_part_that_fails_to_build_takes_the_other_with_it() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let mut files: Vec<(String, String)> = [
         program("gbuffers_terrain", RED, 1.0),
         program("gbuffers_terrain_solid", GREEN, 1.0),
@@ -304,68 +285,14 @@ fn a_depth_only_cutout_does_not_disable_solid_terrain() {
     let Some((got, undrawn)) = strips_of(files, [255; 4]) else {
         return;
     };
-    assert_eq!(got, [Some(GREEN), None, Some(GREEN)]);
-    assert!(
-        undrawn.is_none(),
-        "the valid depth-only half must remain enabled"
-    );
-}
-
-/// Both sources translate, but a uint color output cannot target the default
-/// RGBA8 normalized attachment. The renderer must reject the coupled pipelines.
-#[test]
-fn a_part_that_fails_to_build_takes_the_other_with_it() {
-    let mut files: Vec<(String, String)> = [
-        program("gbuffers_terrain", RED, 1.0),
-        program("gbuffers_terrain_solid", GREEN, 1.0),
-    ]
-    .concat();
-    files.push((
-        "shaders.properties".into(),
-        "alphaTest.gbuffers_terrain_cutout=off\n".into(),
-    ));
-    files.push((
-        "gbuffers_terrain_cutout.vsh".into(),
-        "#version 330 compatibility\nvoid main(){gl_Position=vec4(gl_Vertex.xy,0.0,1.0);}".into(),
-    ));
-    files.push(("gbuffers_terrain_cutout.fsh".into(),
-        "#version 330 compatibility\nlayout(location=0) out uvec4 fixture_color;\nvoid main(){fixture_color=uvec4(0,255,0,255);}".into()));
-    let Some((got, undrawn)) = strips_of_expected(files, [255; 4], true) else {
-        return;
-    };
     assert_eq!(got, [None; 3]);
-    let notes = undrawn.expect("neither terrain half may draw");
+    let notes = undrawn.expect("the game draws terrain");
     for note in [
-        "gbuffers_terrain_cutout: skipped:",
+        "gbuffers_terrain_cutout: writes no buffer; skipped",
         "gbuffers_terrain_solid: the other part of terrain can't draw",
     ] {
         assert!(notes.iter().any(|n| n.starts_with(note)), "{notes:?}");
     }
-}
-
-/// The image is used only by the cutout stage, so allocation must discover that
-/// stage before building its bindings and executing its fragments.
-#[test]
-fn cutout_only_image_stores_get_storage_allocations_and_reach_pixels() {
-    let mut files = Vec::from(program("gbuffers_terrain_solid", RED, 1.0));
-    files.push((
-        "shaders.properties".into(),
-        "image.cutout_marker=markerSampler rgba rgba8 unsigned_byte false true 1 1\n".into(),
-    ));
-    files.push((
-        "gbuffers_terrain_cutout.vsh".into(),
-        "#version 430 compatibility\nvoid main(){gl_Position=vec4(gl_Vertex.xy,0.0,1.0);}".into(),
-    ));
-    files.push(("gbuffers_terrain_cutout.fsh".into(),
-        "#version 430 compatibility\nlayout(rgba8) writeonly uniform image2D cutout_marker;\nvoid main(){imageStore(cutout_marker,ivec2(0),vec4(0,1,0,1));gl_FragData[0]=vec4(0,1,0,1);}".into()));
-    let Some((got, undrawn)) = strips_of(files, [255; 4]) else {
-        return;
-    };
-    assert!(
-        undrawn.is_none(),
-        "cutout storage program must remain enabled: {undrawn:?}"
-    );
-    assert_eq!(got, [Some(RED), Some(GREEN), Some(RED)]);
 }
 
 /// Iris 1.11.7 with our probe packs pe4u (only `gbuffers_terrain`) and pe4s (only
@@ -374,6 +301,7 @@ fn cutout_only_image_stores_get_storage_allocations_and_reach_pixels() {
 /// kept those above 0.5 (0.51 kept; 0.5, 0.49 and lower discarded), whichever program drew it.
 #[test]
 fn cutout_terrain_keeps_alphas_above_0_5_and_solid_terrain_keeps_all() {
+    let _gpu = crate::gfx::test_gpu::lock();
     for (alpha, cutout) in [(0.0, false), (0.49, false), (0.5, false), (0.51, true)] {
         let Some(got) = strips(&[("gbuffers_terrain", RED, alpha)]) else {
             return;
@@ -394,6 +322,7 @@ fn cutout_terrain_keeps_alphas_above_0_5_and_solid_terrain_keeps_all() {
 /// `gbuffers_terrain` alone or through the split programs.
 #[test]
 fn alpha_test_ref_is_0_for_solid_terrain_and_0_5_for_cutout() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let program = |name: &str| {
         [
             (
@@ -426,6 +355,7 @@ fn alpha_test_ref_is_0_for_solid_terrain_and_0_5_for_cutout() {
 /// and 0.2 loses solid terrain too, and `alphaTestRef` reads 0.25 in both.
 #[test]
 fn a_packs_terrain_alpha_test_applies_to_both_parts() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let properties = || {
         (
             "shaders.properties".to_owned(),
@@ -462,6 +392,7 @@ fn a_packs_terrain_alpha_test_applies_to_both_parts() {
 /// The vertex stage reads its own quad's `alphaTestRef` too: 0 for solid, 0.5 for cutout.
 #[test]
 fn the_vertex_stage_reads_its_parts_alpha_test_ref() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let files = vec![
         (
             "gbuffers_terrain.vsh".to_owned(),

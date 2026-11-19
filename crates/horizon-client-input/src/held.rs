@@ -17,6 +17,8 @@ pub enum Source {
     Touch,
     /// `horizon-ctl`'s `key` and `mouse` and the agent commands that walk and click.
     Agent,
+    /// A mod's `set_mapping_down`.
+    Mod,
 }
 
 impl Source {
@@ -26,6 +28,7 @@ impl Source {
             Source::Pad => 2,
             Source::Touch => 4,
             Source::Agent => 8,
+            Source::Mod => 16,
         }
     }
 }
@@ -44,11 +47,6 @@ impl HeldKeys {
     /// key), or the key a caller already holds as a key: most code wants [`HeldKeys::held`].
     pub fn raw(&self, key: &KeyCode) -> bool {
         self.held.contains_key(key)
-    }
-    /// The old way of asking, by a mapping's default key; clippy refuses it (`clippy.toml`). It
-    /// stays so that a change written against it says what to use instead.
-    pub fn contains(&self, key: &KeyCode) -> bool {
-        self.raw(key)
     }
     /// `source` holds `key`. True when nothing held it before.
     pub fn press(&mut self, key: KeyCode, source: Source) -> bool {

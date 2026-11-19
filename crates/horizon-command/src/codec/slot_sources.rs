@@ -45,7 +45,7 @@ fn holder_set(t: &Tag, reg: &Registries) -> Result<(), String> {
     holder(t, reg)
 }
 /// `ExtraCodecs.POSITIVE_INT`: `Codec.INT` takes any numeric tag's
-/// `Number.intValue()`, then `intRangeWithMessage(1, MAX_VALUE, ...)`.
+/// `intValue`, then `intRangeWithMessage(1, MAX_VALUE, ...)`.
 fn positive_int(t: &Tag) -> Result<(), String> {
     let value = match *t {
         Tag::Byte(v) => i32::from(v),
@@ -181,7 +181,7 @@ mod tests {
             r#"{type:"limit_slots",limit:1b,slot_source:"complete:one"}"#,
             r#"{type:"limit_slots",limit:2.5d,slot_source:"complete:one"}"#,
         ] {
-            let (tag, _) = horizon_world::nbt::parse_snbt(input).unwrap();
+            let (tag, _) = horizon_core::nbt::parse_snbt(input).unwrap();
             assert!(decode(&tag, &reg).is_ok(), "{input}");
         }
         for input in [
@@ -191,7 +191,7 @@ mod tests {
             r#"{type:"group",terms:"complete:missing"}"#,
             r#""complete:missing""#,
         ] {
-            let (tag, _) = horizon_world::nbt::parse_snbt(input).unwrap();
+            let (tag, _) = horizon_core::nbt::parse_snbt(input).unwrap();
             assert!(decode(&tag, &reg).is_err(), "{input}");
         }
         // NbtOps.getNumberValue's and ExtraCodecs.POSITIVE_INT's errors (26.3 bytecode).
@@ -215,7 +215,7 @@ mod tests {
         ] {
             // The top level wraps them in element_or_list's either error; only
             // the inner message is checked against the bytecode.
-            let (tag, _) = horizon_world::nbt::parse_snbt(input).unwrap();
+            let (tag, _) = horizon_core::nbt::parse_snbt(input).unwrap();
             let actual = decode(&tag, &reg).unwrap_err();
             assert!(actual.contains(error), "{input}: {actual}");
         }

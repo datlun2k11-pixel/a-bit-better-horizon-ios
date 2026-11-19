@@ -1,6 +1,6 @@
 use super::*;
 use crate::{font::Font, hud::Rect};
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 /// The Chat option's default: no restriction.
 fn full() -> ChatAbilities {
@@ -89,7 +89,7 @@ fn clicked_suggestion_reports_the_actual_length_limited_input() {
 fn font() -> Font {
     // The missing-glyph metrics let these tests run without game assets.
     Font::load(
-        Path::new("/nonexistent-horizon-chat-test-resources"),
+        &horizon_assets::resource_source::ResourceSource::default(),
         &HashMap::new(),
         &[],
         (1, 1),
@@ -391,6 +391,28 @@ fn a_double_click_in_the_chat_box_selects_the_word() {
     assert_eq!(screen.input.highlight, screen.input.cursor);
     assert!(screen.click(&m, &c, x, y));
     assert_eq!((screen.input.highlight, screen.input.cursor), (6, 11));
+    assert_eq!(screen.input.selected_text(), "world");
+}
+
+#[test]
+fn explicit_single_clicks_do_not_turn_into_word_selection() {
+    let font = font();
+    let m = Measure(&font);
+    let registries = Registries::default();
+    let c = Commands {
+        dispatcher: crate::command::vanilla::game_dispatcher(),
+        registries: &registries,
+    };
+    let mut screen = ChatScreen::new(&m, &c, "hello world", false, 0, 640, 360, full());
+    let x = f64::from(screen.input.x) + f64::from(font.width("hello world")) - 1.0;
+    let y = f64::from(screen.input.y) + 2.0;
+    for _ in 0..2 {
+        assert!(screen.click_event(&m, &c, x, y, false));
+        assert!((10..=11).contains(&screen.input.cursor));
+        assert_eq!(screen.input.highlight, screen.input.cursor);
+        assert_eq!(screen.input.selected_text(), "");
+    }
+    assert!(screen.click_event(&m, &c, x, y, true));
     assert_eq!(screen.input.selected_text(), "world");
 }
 
@@ -1252,7 +1274,10 @@ fn a_chat_option_change_keeps_the_readers_place_but_a_rescale_does_not() {
     chat.set_abilities(&font, ChatAbilities::new(ChatVisibility::System));
     assert_eq!(chat.scroll, 3);
     assert!(chat.new_since_scroll);
-    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    let atlas = crate::hud::HudAtlas::build(&crate::resource_source::ResourceSource::directory(
+        "/nonexistent/horizon-test-assets".into(),
+    ))
+    .unwrap();
     chat.rescale(&atlas);
     assert_eq!(chat.scroll, 0);
     assert!(!chat.new_since_scroll);

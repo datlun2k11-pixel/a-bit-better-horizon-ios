@@ -15,16 +15,14 @@ Sessions, each a fresh game and world (seed 7) per build:
   a banner, a framed item),
   and the HUD over light: chat over the sun, chat and the crosshair over lava, the pause
   menu over it.
-- golden_hour: the Golden Hour example pack (shader API 0.1) in SDR, the same scenes.
-- golden_hour_hdr: Golden Hour with offscreen HDR output on (HORIZON_HDR_OUTPUT=pq): each screenshot and its -hdr.png.
-- hdr_toggle: vanilla started with HDR on (the 16-bit frame), shot, HDR turned off from its settings page, shot.
-- golden_hour_0_2, golden_hour_0_2_hdr: the Golden Hour 0.2 pack (shader API 0.2) on HORIZON_HDR_FRAME=float, in SDR
-  and with HDR on; entities in SDR.
-- oit, hdr_oit: Improved Transparency with HDR off, and with HDR on the 16-bit frame.
-- visbuffer, hdr_visbuffer: the visibility buffer (HORIZON_VISBUFFER=1) with HDR off, and with HDR on the 16-bit frame.
-- float_hdr, float_oit, float_visbuffer: the float frame (HORIZON_HDR_FRAME=float) with HDR on, drawn forward, with
-  Improved Transparency and with the visibility buffer, the last on a 300-nit display with the HUD at half brightness.
-- float_unlit: the float frame with HDR on and HDR Lighting off, on that display.
+- golden_hour: the Golden Hour example pack in SDR, the same scenes.
+- golden_hour_hdr: Golden Hour with offscreen HDR output on (HORIZON_HDR_OUTPUT=pq), on the float frame: each
+  screenshot and its -hdr.png.
+- hdr_toggle: vanilla started with HDR on (the float frame), shot, HDR turned off from its settings page, shot.
+- oit, visbuffer: Improved Transparency, and the visibility buffer (HORIZON_VISBUFFER=1), with HDR off.
+- float_hdr, float_oit, float_visbuffer: HDR on, which draws the float frame: forward, with Improved Transparency
+  and with the visibility buffer, the last on a 300-nit display with the HUD at half brightness.
+- float_unlit: HDR on and the Vanilla look, on that display.
 - terrain_pack, terrain_pack_hdr: a shader API 0.2 test pack with a material stage, a shadow map and displacement
   (tools/fixtures/shaderpacks/frame_identity_terrain) over a resource pack of LabPBR heights the harness writes
   (relief_pack), on the float frame in SDR and with HDR on: day over water, night with light sources, and relief, a
@@ -36,12 +34,24 @@ Sessions, each a fresh game and world (seed 7) per build:
   target the material writes (tools/fixtures/shaderpacks/frame_identity_world), on the float frame in SDR: day over
   water, the sun, the night sky, rain by day and by night, and the End's sky; and with GPU pass timing on
   (horizon-ctl gpu-passes on), which draws the sky in a pass of its own, the sun and the night sky.
+- entity_off, entity_stage, and each with _hdr: the entity stage's fixture pack
+  (crates/horizon-shader-api/tests/samples/entity-stage) without and with its [entity] stage, which is vanilla's
+  own: the entities, in SDR, and with HDR output on and the block entities kept on the GPU; and items, which the
+  stage doesn't draw, under a dynamic light (Horizon Extras' dynamic lights are on in these sessions).
+- entity_traced: a test pack whose material stage traces rays on translucent terrain and whose entity stage tints the
+  entities (tools/fixtures/shaderpacks/entity_traced), frames drawn flat: the entities over water. Where the device
+  has ray queries, the material's pipelines read the frame's group joined with the ray scene and the entity stage's
+  the frame's own: the water drawn after the entities must find the material's group again (#13780).
+- horizon_hdr, and float_dim and horizon_hdr_dim: Horizon's HDR look drawn by its pack
+  (crates/horizon-shader-api/packs/horizon_hdr) with HDR output on, against float_hdr, the look itself; and both
+  on a 300-nit display, where the tone curve bends.
 
-Shader packs are read from the change's tree for both builds (tools/fixtures/shaderpacks, else the SDK's
-crates/horizon-shader-api/packs), so a base from before a fixture was added draws it too.
+Each build draws its own tree's shader packs (tools/fixtures/shaderpacks, else the SDK's
+crates/horizon-shader-api/packs, and the SDK's test samples), so a change that ports a pack to a new API draws its port
+and the base the original; a base from before a fixture was added draws the change's.
 
-The float frame's HDR shots are also held to their SDR ones in each build (hdr_gates, Tests 3 and 4): with HDR
-Lighting off the picture is HDR off's, and with it on the SDR screenshot is the HDR shot with light above white
+The float frame's HDR shots are also held to their SDR ones in each build (hdr_gates, Tests 3 and 4): with the
+Vanilla look the picture is HDR off's, and with Horizon's the SDR screenshot is the HDR shot with light above white
 scaled down to it, its hue kept, white HUD shows at UI Brightness and nothing passes the peak.
 
 Both builds draw on the same adapter: Mesa's lavapipe where its Vulkan driver is installed (Linux), else the machine's
@@ -51,6 +61,11 @@ Each session also checks, in each build, that it drew what it is for (the pack c
 their -hdr.png, the visibility buffer's line is in the session's whole log, timed passes were timed), so a pack that
 fails to load, or HDR that stays off, in both builds doesn't pass as identical, and a change that stops one doesn't
 either.
+In each build the fixture's entity stage must draw the entities as the pack without it does, within the rounding of
+the decode and encode around the stage, and leave what it doesn't draw exactly as it is (entity_gates).
+And in each build Horizon's HDR look drawn by its pack must be the look the game draws without a pack, within the
+rounding of the pack's route, where the pack reaches (look_gates). --sessions doesn't draw the pack's sessions
+without the ones they are held to.
 --build-base builds it anyway. The base builds in a worktree and target folder of its own under .local/frame-identity/,
 kept between runs so that a later base rebuilds only what changed.
 
@@ -59,6 +74,7 @@ On a difference it writes diff-<scene>.png beside the two shots: the base dimmed
   test_frame_identity_parity.py [--base REV] [--build-base] [--bin-dir DIR] [--base-bin-dir DIR] [--sessions a,b]
 """
 import argparse
+import io
 import json
 import math
 import os
@@ -66,6 +82,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import tomllib
@@ -89,11 +106,18 @@ SEED = '7'
 # horizon-mod-api-gen generates Rust from tools/native-hook-fragments/ (BUILT_FROM_TOOLS).
 NO_BINARY = ('tools/', 'tests/', '.github/')
 BUILT_FROM_TOOLS = ('tools/native-hook-fragments/',)
-BUILD = ['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-client', '-p', 'horizon-client-lib', '--bins']
+BUILD = ['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-game', '-p', 'horizon-client-lib', '--bins']
 # 🤖 Agent: Where the overworld scenes are built, high above seed 7's spawn, so terrain below hardly shows.
 X, Y, Z = 8, 160, 8
 # 🤖 Agent: The entities' corner, out of every other viewpoint's sight.
 EX, EZ = X - 28, Z - 30
+# 🤖 Agent: And the items' corner, as far on the other side.
+IX, IZ = X + 30, Z - 30
+# 🤖 Agent: The entity stage's fixture, which some sessions draw as it is and the others with the stage cut off
+# (the manifest at its table, and the file it then has no use for).
+SAMPLES = ROOT / 'crates/horizon-shader-api/tests/samples'
+SAMPLE_PACKS = {'entity_stage': (SAMPLES / 'entity-stage', None, None),
+                'entity_off': (SAMPLES / 'entity-stage', '\n[entity]', 'vanilla.wgsl')}
 
 
 def git(*args, cwd=ROOT):
@@ -373,6 +397,29 @@ def prepare(game):
                  '{Facing:2b,Item:{id:"minecraft:diamond",count:1}}')
     game.command(f'summon minecraft:arrow {EX + 2.0} {Y + 1.5} {EZ - 1.0} {{NoGravity:1b}}')
     game.command(f'summon minecraft:end_crystal {EX - 4.5} {Y} {EZ + 2.5} {{ShowBottom:0b}}')
+    # 🤖 Agent: Items, which Horizon lights itself under any pack: two shown three blocks large by displays and one in
+    # an unseen frame, at night over a dynamic light, so the light changes across each of their faces. The light is
+    # a torch a husk holds in a closed cell under the floor (dynamic lights shine through blocks).
+    game.command(f'fill {IX - 5} {Y - 1} {IZ - 5} {IX + 5} {Y - 1} {IZ + 4} minecraft:stone')
+    game.command(f'fill {IX - 5} {Y} {IZ + 4} {IX + 5} {Y + 4} {IZ + 4} minecraft:white_concrete')
+    game.command(f'fill {IX - 1} {Y - 4} {IZ} {IX + 1} {Y - 2} {IZ + 2} minecraft:stone')
+    game.command(f'fill {IX} {Y - 3} {IZ + 1} {IX} {Y - 2} {IZ + 1} minecraft:air')
+    game.command(f'summon minecraft:husk {IX + 0.5} {Y - 3} {IZ + 1.5} {{{still},PersistenceRequired:1b,'
+                 'equipment:{mainhand:{id:"minecraft:torch",count:1}}}')
+    large = ('transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0f,0f],'
+             'scale:[3f,3f,3f]}')
+    for x, item in ((-2.5, 'white_concrete'), (2.5, 'paper')):
+        game.command(f'summon minecraft:item_display {IX + 0.5 + x} {Y + 2} {IZ + 1.5} '
+                     f'{{item:{{id:"minecraft:{item}",count:1}},{large}}}')
+    game.command(f'summon minecraft:item_frame {IX} {Y + 3} {IZ + 3} '
+                 '{Facing:2b,Invisible:1b,Item:{id:"minecraft:diamond",count:1}}')
+    # 🤖 Agent: The water mirror's plane is scanned only when the camera enters another 8-block cell: its other
+    # trigger, the game time, stands still in a frozen world (Game::water_plane). Until then it is what the last
+    # scan found, the sea at spawn or nothing, depending on which frames came before the chunks. Stepping onto the
+    # platform's edge, out of the viewpoints' cell, once the pool is built and loaded has it found there, and the
+    # first shot steps back.
+    game.command(f'tp @s {X + 0.5} {Y} {Z + 7.5}')
+    game.settle()
 
 
 def prepare_end(game):
@@ -396,6 +443,7 @@ SCENES = {
     'glass': ('overworld', 6000, (X - 23.5, Y, Z - 3.5), 0, 5),
     'nether': ('the_nether', 18000, (0.5, 61, -4.5), 0, 15),
     'entities': ('overworld', 6000, (EX + 0.5, Y, EZ - 4.5), 0, 5),
+    'items': ('overworld', 18000, (IX + 0.5, Y, IZ - 4.5), 0, 5),
     # 🤖 Agent: The HUD over light (HUD below): chat over the sun high in the sky, the hotbar over the sky; and the same
     # view without chat, which shows where the sun's light passes white (hdr_gates).
     'hud_sun': ('overworld', 4000, (X + 0.5, Y + 3, Z - 9.5), -70, -85),
@@ -489,42 +537,53 @@ SESSIONS = {
     'auto_unknown': ('hdr:auto\n', {'HORIZON_HDR_OUTPUT': 'pq'}, ['day_water', 'night_lights'], False),
     'golden_hour': ('', {'HORIZON_SHADER_PACK': 'golden_hour'}, WORLD, False),
     'golden_hour_hdr': ('hdr:true\n', {'HORIZON_SHADER_PACK': 'golden_hour', 'HORIZON_HDR_OUTPUT': 'pq'},
-                        ['day_water', 'night_lights'], False),
-    'hdr_toggle': ('hdr:true\n', {'HORIZON_HDR_OUTPUT': 'pq'}, ['day_water', 'night_lights'], True),
-    'golden_hour_0_2': ('', {'HORIZON_SHADER_PACK': 'golden_hour_0_2', 'HORIZON_HDR_FRAME': 'float'},
                         ['day_water', 'night_lights', 'entities'], False),
-    'golden_hour_0_2_hdr': ('hdr:true\n', {'HORIZON_SHADER_PACK': 'golden_hour_0_2',
-                        'HORIZON_HDR_FRAME': 'float', 'HORIZON_HDR_OUTPUT': 'pq'}, ['day_water', 'night_lights'], False),
+    'hdr_toggle': ('hdr:true\n', {'HORIZON_HDR_OUTPUT': 'pq'}, ['day_water', 'night_lights', 'entities'], True),
     'oit': ('', {}, ['day_water', 'night_lights'], False),
-    'hdr_oit': ('hdr:true\n', {'HORIZON_HDR_OUTPUT': 'pq'},
-                        ['day_water', 'night_lights'], False),
     # 🤖 Agent: The visibility buffer draws only frames drawn flat, which frames without a pack are by default only on
     # Metal and some Intel drivers.
     'visbuffer': ('', {'HORIZON_VISBUFFER': '1', 'HORIZON_FLAT_DRAWS': '1'}, ['day_water', 'night_lights'], False),
-    'hdr_visbuffer': ('hdr:true\n', {'HORIZON_HDR_OUTPUT': 'pq', 'HORIZON_VISBUFFER': '1', 'HORIZON_FLAT_DRAWS': '1'},
-                      ['day_water', 'night_lights'], False),
-    'float_hdr': ('hdr:true\n', {'HORIZON_HDR_FRAME': 'float', 'HORIZON_HDR_OUTPUT': 'pq'}, WORLD + list(HUD), False),
-    'float_oit': ('hdr:true\n', {'HORIZON_HDR_FRAME': 'float', 'HORIZON_HDR_OUTPUT': 'pq'}, WORLD, False),
+    'float_hdr': ('hdr:true\n', {'HORIZON_HDR_OUTPUT': 'pq'}, WORLD + list(HUD), False),
+    'float_oit': ('hdr:true\n', {'HORIZON_HDR_OUTPUT': 'pq'}, WORLD, False),
     # 🤖 Agent: On a display with little headroom (300 nits), the HUD at half brightness: the tone curve and the HUD's
     # composite have the least room there (hdr_gates). An older file's 50% of a 200-nit paper white: it reads as 100
     # nits, so builds from before UI Brightness was in nits draw the same.
-    'float_visbuffer': ('hdr:true\nhdrPeak:300\nhdrPaperWhite:200\nhdrUiBrightness:50\n', {'HORIZON_HDR_FRAME': 'float',
-                        'HORIZON_HDR_OUTPUT': 'pq', 'HORIZON_VISBUFFER': '1', 'HORIZON_FLAT_DRAWS': '1'},
+    'float_visbuffer': ('hdr:true\nhdrPeak:300\nhdrPaperWhite:200\nhdrUiBrightness:50\n',
+                        {'HORIZON_HDR_OUTPUT': 'pq', 'HORIZON_VISBUFFER': '1', 'HORIZON_FLAT_DRAWS': '1'},
                         WORLD + list(HUD), False),
-    # 🤖 Agent: HDR Lighting off, at that headroom too, where the tone curve's knee is at white: the picture is SDR's
-    # (hdr_gates).
-    'float_unlit': ('hdr:true\nhdrLighting:false\nhdrPeak:300\n', {'HORIZON_HDR_FRAME': 'float',
-                    'HORIZON_HDR_OUTPUT': 'pq'}, WORLD + list(HUD) + ['sun'], False),
-    'terrain_pack': ('', {'HORIZON_SHADER_PACK': 'frame_identity_terrain', 'HORIZON_HDR_FRAME': 'float'},
+    # 🤖 Agent: The Vanilla look, at that headroom too, where the tone curve's knee is at white: the picture is SDR's
+    # (hdr_gates). hdrLighting:false is the same look to a base from before hdrLook, which then draws the same.
+    'float_unlit': ('hdr:true\nhdrLighting:false\nhdrLook:vanilla\nhdrPeak:300\n', {'HORIZON_HDR_OUTPUT': 'pq'},
+                    WORLD + list(HUD) + ['sun'], False),
+    'terrain_pack': ('', {'HORIZON_SHADER_PACK': 'frame_identity_terrain'},
                      ['day_water', 'night_lights', 'relief', 'entities', 'night_sky', 'rain_day'], False),
-    'terrain_pack_hdr': ('hdr:true\n', {'HORIZON_SHADER_PACK': 'frame_identity_terrain', 'HORIZON_HDR_FRAME': 'float',
-                         'HORIZON_HDR_OUTPUT': 'pq'}, ['day_water', 'night_lights', 'relief'], False),
-    'world_plain': ('', {'HORIZON_HDR_FRAME': 'float'}, ['night_sky', 'end_sky', 'rain_day', 'rain_night'], False),
-    'world_pack': ('', {'HORIZON_SHADER_PACK': 'frame_identity_world', 'HORIZON_HDR_FRAME': 'float'},
+    'terrain_pack_hdr': ('hdr:true\n', {'HORIZON_SHADER_PACK': 'frame_identity_terrain', 'HORIZON_HDR_OUTPUT': 'pq'},
+                         ['day_water', 'night_lights', 'relief'], False),
+    'world_plain': ('', {}, ['night_sky', 'end_sky', 'rain_day', 'rain_night'], False),
+    'world_pack': ('', {'HORIZON_SHADER_PACK': 'frame_identity_world'},
                    ['day_water', 'sun', 'night_sky', 'end_sky', 'rain_day', 'rain_night'], False),
-    'world_pack_timed': ('', {'HORIZON_SHADER_PACK': 'frame_identity_world', 'HORIZON_HDR_FRAME': 'float'},
-                         ['sun', 'night_sky'], False),
+    'world_pack_timed': ('', {'HORIZON_SHADER_PACK': 'frame_identity_world'}, ['sun', 'night_sky'], False),
+    # 🤖 Agent: The entity stage's fixture without its stage and with it (entity_gates): in SDR with the block
+    # entities drawn each frame, as by default, and with HDR on with them kept on the GPU (blockEntityCache), which
+    # draws them with a pipeline of their own.
+    'entity_off': ('', {'HORIZON_SHADER_PACK': 'entity_off'}, ['entities', 'items'], False),
+    'entity_stage': ('', {'HORIZON_SHADER_PACK': 'entity_stage'}, ['entities', 'items'], False),
+    'entity_off_hdr': ('hdr:true\nblockEntityCache:true\n',
+                       {'HORIZON_SHADER_PACK': 'entity_off', 'HORIZON_HDR_OUTPUT': 'pq'}, ['entities', 'items'], False),
+    'entity_stage_hdr': ('hdr:true\nblockEntityCache:true\n', {'HORIZON_SHADER_PACK': 'entity_stage',
+                                                               'HORIZON_HDR_OUTPUT': 'pq'}, ['entities', 'items'], False),
+    # 🤖 Agent: Horizon's HDR look drawn by its pack, at float_hdr's settings (look_gates); and the look and the pack
+    # on a display below the scene's peak, where the tone curve, the pack's [tonemap], bends what shines.
+    'horizon_hdr': ('hdr:true\n', {'HORIZON_SHADER_PACK': 'horizon_hdr', 'HORIZON_HDR_OUTPUT': 'pq'}, WORLD, False),
+    'float_dim': ('hdr:true\nhdrPeak:300\n', {'HORIZON_HDR_OUTPUT': 'pq'}, ['night_lights', 'nether'], False),
+    'horizon_hdr_dim': ('hdr:true\nhdrPeak:300\n', {'HORIZON_SHADER_PACK': 'horizon_hdr', 'HORIZON_HDR_OUTPUT': 'pq'},
+                        ['night_lights', 'nether'], False),
+    # 🤖 Agent: Flat frames on any GPU: drawn per section, translucent terrain gets a pass of its own, which binds the
+    # material's group anyway.
+    'entity_traced': ('', {'HORIZON_SHADER_PACK': 'entity_traced', 'HORIZON_FLAT_DRAWS': '1'}, ['entities'], False),
 }
+# 🤖 Agent: The sessions whose entities stand over water, translucent terrain drawn after them.
+OVER_WATER = ('entity_traced',)
 # 🤖 Agent: The sessions drawn with GPU pass timing on, which draws the sky in a timed pass of its own.
 TIMED = ('world_pack_timed',)
 # 🤖 Agent: The session a pack's pictures are held against in scenes the usual one (session_checks) doesn't shoot.
@@ -538,8 +597,31 @@ RELIEF_PACKS = ('frame_identity_terrain',)
 GRAPHICS = 'hdrPaperWhite:203\nhdrPeak:1000\ntaa:false\nfxaa:false\nframeGeneration:off\n'
 
 
-def pack_dir(pack):
-    return next(d / pack for d in PACK_DIRS if (d / pack).is_dir())
+# 🤖 Agent: The base's own copies of PACK_DIRS and SAMPLES (base_packs).
+BASE_PACKS = RUN / 'base-packs'
+
+
+def base_packs(base):
+    """Writes the shader packs as `base` has them into BASE_PACKS, where pack_dir finds the base's."""
+    shutil.rmtree(BASE_PACKS, ignore_errors=True)
+    BASE_PACKS.mkdir(parents=True)
+    folders = [d.relative_to(ROOT).as_posix() for d in (*PACK_DIRS, SAMPLES)]
+    present = [f for f in folders if git('ls-tree', '-d', '--name-only', base, f)]
+    if present:
+        tar = subprocess.run(['git', 'archive', base, *present], cwd=ROOT, check=True, capture_output=True).stdout
+        with tarfile.open(fileobj=io.BytesIO(tar)) as archive:
+            archive.extractall(BASE_PACKS, filter='data')
+
+
+def pack_dir(pack, label='change'):
+    """The folder of `pack` that the `label` build draws: the base's own where it has one, else the change's."""
+    def find(root):
+        if pack in SAMPLE_PACKS:
+            folder = root / SAMPLE_PACKS[pack][0].relative_to(ROOT)
+            return folder if folder.is_dir() else None
+        return next((root / d.relative_to(ROOT) / pack for d in PACK_DIRS
+                     if (root / d.relative_to(ROOT) / pack).is_dir()), None)
+    return (label == 'base' and find(BASE_PACKS)) or find(ROOT)
 
 
 # 🤖 Agent: relief_pack's heights, 0..1 at texel (x, y) of a 16-texel block texture: round bumps on stone, ripples
@@ -587,15 +669,23 @@ def run_session(name, label, bin_dir, out, env_base, args):
         relief_pack(folder / 'resourcepacks' / 'relief')
         options += 'resourcePacks:["vanilla","file/relief"]\n'
     (folder / 'options.txt').write_text(options)
+    if name.startswith('entity_'):
+        # 🤖 Agent: The items scene's light.
+        (folder / 'horizon-extras.txt').write_text('dynamicLights:true\n')
     if pack:
-        shutil.copytree(pack_dir(pack), folder / 'shaderpacks' / pack)
+        _, cut, unused = SAMPLE_PACKS.get(pack) or (None, None, None)
+        shutil.copytree(pack_dir(pack, label), folder / 'shaderpacks' / pack)
+        if cut:
+            manifest = folder / 'shaderpacks' / pack / 'horizon-shaders.toml'
+            manifest.write_text(manifest.read_text(encoding='utf-8').split(cut)[0], encoding='utf-8')
+            (folder / 'shaderpacks' / pack / unused).unlink()
     env = lab.game_env(env_base, HORIZON_STILL='1', **extra)
     out.mkdir(parents=True, exist_ok=True)
     game = Game(bin_dir, folder, env, args)
     started = time.monotonic()
     try:
         game.launch()
-        if name in ('oit', 'hdr_oit', 'float_oit'):
+        if name in ('oit', 'float_oit'):
             # 🤖 Agent: Old unversioned options run through the graphics-mode migration, which resets this switch.
             game.ctl('options-set', 'improvedTransparency', 'true')
             option = game.ctl('options-get', 'improvedTransparency')
@@ -603,6 +693,8 @@ def run_session(name, label, bin_dir, out, env_base, args):
                 raise RuntimeError(f'Improved Transparency was not requested: {option}')
             lab.write_json(out / f'{name}.option.json', option)
         prepare(game)
+        if name in OVER_WATER:
+            game.command(f'fill {EX - 5} {Y - 1} {EZ - 1} {EX + 5} {Y - 1} {EZ + 1} minecraft:water')
         if 'end_sky' in scenes:
             prepare_end(game)
         if name in TIMED:
@@ -635,9 +727,10 @@ def save_log(game, path):
     Path(path).write_text(str(game.ctl('logs', '--lines', 10 ** 9, check=False)), encoding='utf-8')
 
 
-def session_checks(shots, sessions):
+def session_checks(shots, sessions, label='change'):
     """That each session drew what it is for, so a pack that fails to load, or HDR that doesn't turn on, in both
-    builds can't pass as identical: HDR shots have their -hdr.png and only they do, and the pack changes the picture."""
+    builds can't pass as identical: HDR shots have their -hdr.png and only they do, and the pack changes the picture.
+    `label` is the build that drew them: its log names the version of the pack that build draws (`pack_dir`)."""
     problems = []
     for name in sessions:
         graphics, extra, scenes, toggle = SESSIONS[name]
@@ -651,7 +744,9 @@ def session_checks(shots, sessions):
         # 🤖 Agent: the pack's pictures against the same scenes without it: vanilla's, or with HDR on hdr_toggle's
         # first shots (the same settings), sidecars included; PLAIN's where that session doesn't shoot the scene.
         without = 'float_hdr' if name == 'float_oit' else ('hdr_toggle' if hdr else 'vanilla')
-        if 'HORIZON_SHADER_PACK' in extra:
+        # 🤖 Agent: Not the look's pack, whose pictures are meant to be the ones without it (look_gates); the load
+        # line below says it ran.
+        if 'HORIZON_SHADER_PACK' in extra and name not in LOOK_PAIRS:
             same = []
             for s in scenes:
                 plain = next((w for w in (without, PLAIN) if w in sessions and s in SESSIONS[w][2]), None)
@@ -671,7 +766,7 @@ def session_checks(shots, sessions):
         # 🤖 Agent: and whether the pack loaded (scenes no session without it shoots have nothing to compare with),
         # and the LabPBR maps its displacement needs.
         pack = extra.get('HORIZON_SHADER_PACK')
-        manifest = pack_dir(pack) / 'horizon-shaders.toml' if pack else None
+        manifest = pack_dir(pack, label) / 'horizon-shaders.toml' if pack else None
         if manifest and manifest.exists():
             meta = tomllib.loads(manifest.read_text(encoding='utf-8'))
             if f'shader pack {meta["id"]} {meta["version"]}: ' not in text:
@@ -685,9 +780,108 @@ def session_checks(shots, sessions):
         pairs = [(shots / f'{without}.{s}{x}', shots / f'{name}.{s}{x}')
                  for s in scenes for x in ('.png', '-hdr.png')]
         pairs = [(a, b) for a, b in pairs if a.exists() and b.exists()]
-        if name in ('oit', 'hdr_oit', 'float_oit') and without in sessions and pairs and all(
+        if name in ('oit', 'float_oit') and without in sessions and pairs and all(
                 compare(a, b, None) is None for a, b in pairs):
             problems.append(f'{name}: the same as without Improved Transparency: it didn\'t run')
+    return problems
+
+
+# 🤖 Agent: The most a channel may differ between the entity stage's fixture and the same pack without the stage.
+# Entities: the stage's colours are decoded going in and its result encoded again, which rounds differently in
+# places. Items: the stage doesn't draw them, so nothing.
+ENTITY_STEPS = {'entities': 1, 'items': 0}
+
+
+def entity_gates(shots, sessions):
+    """The fixture's entity stage is vanilla's own, so its pictures are the pack's without the stage, within the
+    scene's ENTITY_STEPS on any channel: the 8-bit screenshots and, with HDR on, the HDR shots' 10-bit codes."""
+    problems = []
+    for suffix in ('', '_hdr'):
+        off, on = f'entity_off{suffix}', f'entity_stage{suffix}'
+        if off not in sessions or on not in sessions:
+            continue
+        for scene in SESSIONS[on][2]:
+            for kind in ('.png', '-hdr.png') if suffix else ('.png',):
+                _, a = pixels(shots / f'{off}.{scene}{kind}')
+                _, b = pixels(shots / f'{on}.{scene}{kind}')
+                steps = [max(abs(x - y) for x, y in zip(p, q)) for p, q in zip(a, b)]
+                differing, largest = sum(1 for s in steps if s), max(steps)
+                print(f'  {on}.{scene}{kind} against {off}: {differing} of {len(steps)} pixels differ, '
+                      f'largest step {largest}', flush=True)
+                step = ENTITY_STEPS[scene]
+                if largest > step:
+                    problems.append(f'{on}.{scene}{kind}: {sum(1 for s in steps if s > step)} pixels differ '
+                                    f'from {off} by more than {step}, largest step {largest}')
+    return problems
+
+
+# 🤖 Agent: Horizon's HDR look drawn by its pack: each of the pack's sessions, with the session that draws the look
+# itself at the same settings.
+LOOK_PAIRS = {'horizon_hdr': 'float_hdr', 'horizon_hdr_dim': 'float_dim'}
+# 🤖 Agent: The most a channel may differ between the two, of the 8-bit screenshot's 255 and of the HDR shot's 1023.
+# The pack's route rounds apart from the look's own: its stages take linear light and return it, so each pixel goes
+# through more 2.2 powers, the whole picture is decoded into a half-float target for [tonemap] and encoded again,
+# and the lift's mark, which has 8 bits, falls on the other side of a step for a few texels.
+LOOK_STEPS = {'.png': 1, '-hdr.png': 2}
+# 🤖 Agent: What the pack doesn't reach in a scene, as fractions of the picture (x0, y0, x1, y1): the End crystal
+# beside the cow, whose glass is drawn from both sides (the pack's README, "What it can't draw yet": the back faces
+# of a model that shines and is drawn from both sides).
+LOOK_APART = {'entities': ((0.73, 0.42, 0.83, 0.63),)}
+# 🤖 Agent: The stages the pack's load line must name (its manifest's names). Without one, or without the pack, the
+# game draws that part of the look itself, and the pictures would match without the pack having drawn them.
+LOOK_STAGES = ('Blocks', 'Entities', 'Tone curve')
+
+
+def look_gates(shots, sessions):
+    """Horizon's HDR look drawn by its pack (the look file's functions, called from the shader API's material,
+    entity and tonemap stages) is the look the game draws without a pack, within LOOK_STEPS on any channel of the
+    screenshot and of the HDR shot, where the pack reaches: blocks, entities and block entities. The scenes hold
+    nothing else that shines (no sun, moon or stars in view, no particles, no dropped items, no light source in
+    fog), but for what LOOK_APART names. Not held: the pixels under the crosshair and the hotbar, where the HUD's
+    8-bit target turns a rounding step of the world under it into one of its own; and in the screenshot the pixels
+    the look's own screenshot shows with a channel at white, which a screenshot clips channel by channel under a pack
+    and by the brightest channel with the look (the README's "Screenshots and world icons in HDR"; the HDR shot holds
+    them). A pixel only the pack's screenshot shows white is held."""
+    problems = []
+    for packed, plain in LOOK_PAIRS.items():
+        if packed not in sessions or plain not in sessions:
+            continue
+        log = shots / f'{packed}.log'
+        # 🤖 Agent: "[time] [Render thread/INFO]: shader pack horizon_hdr 1.0.0: Blocks, Entities, Tone curve in 58 ms".
+        lines = [line.split('shader pack horizon_hdr ', 1)[1].split(': ', 1)[-1].rsplit(' in ', 1)[0].split(', ')
+                 for line in (log.read_text(encoding='utf-8') if log.exists() else '').splitlines()
+                 if 'shader pack horizon_hdr ' in line and ' ms' in line]
+        if not any(all(s in labels for s in LOOK_STAGES) for labels in lines):
+            problems.append(f'{packed}: the log has no load line of horizon_hdr with {", ".join(LOOK_STAGES)}')
+            continue
+        for scene in SESSIONS[packed][2]:
+            for kind, most in LOOK_STEPS.items():
+                first, second = shots / f'{plain}.{scene}{kind}', shots / f'{packed}.{scene}{kind}'
+                # 🤖 Agent: A missing shot is session_checks' to report.
+                if not (first.is_file() and second.is_file()):
+                    continue
+                width, a = pixels(first)
+                other, b = pixels(second)
+                if (width, len(a)) != (other, len(b)):
+                    problems.append(f'{packed}.{scene}{kind}: not the size of {plain}\'s')
+                    continue
+                height = len(a) // width
+                apart = hud_boxes(width, height) + tuple(
+                    (x0 * width, y0 * height, x1 * width, y1 * height) for x0, y0, x1, y1 in LOOK_APART.get(scene, ()))
+                held = [(i, max(abs(x - y) for x, y in zip(p, q))) for i, (p, q) in enumerate(zip(a, b))
+                        if not (kind == '.png' and 255 in p)
+                        and not any(x0 <= i % width < x1 and y0 <= i // width < y1 for x0, y0, x1, y1 in apart)]
+                steps = [s for _, s in held]
+                largest = max(steps, default=0)
+                print(f'  {packed}.{scene}{kind} against {plain}: {sum(1 for s in steps if s)} of {len(steps)} '
+                      f'pixels held differ, largest step {largest}', flush=True)
+                over = [i for i, s in held if s > most]
+                if not steps:
+                    problems.append(f'{packed}.{scene}{kind}: no pixel is held')
+                elif over:
+                    problems.append(f'{packed}.{scene}{kind}: {len(over)} pixels differ from {plain} by more than '
+                                    f'{most}, largest step {largest}, first at {over[0] % width},{over[0] // width}: '
+                                    f'{a[over[0]]} against {b[over[0]]} ({width}x{height})')
     return problems
 
 
@@ -731,8 +925,12 @@ def hud_boxes(width, height):
     window's, scaled by the desktop's)."""
     scale = max(1, min(width // 320, height // 240))
     x, y = width // 2, height // 2
+    # 🤖 Agent: The hotbar centres in GUI pixels, the window's width divided by the scale and rounded up: at an odd GUI
+    # width (854 wide at 2 is 427) it and its selected slot start a pixel left of the shot's middle. The crosshair's
+    # box covers its sprite either way and stays where it was, so that no more of the world is left out.
+    bar = -(-width // scale) // 2 * scale
     return ((x - 9 * scale, y - 9 * scale, x + 9 * scale, y + 9 * scale),
-            (x - 92 * scale, height - 24 * scale, x + 92 * scale, height))
+            (bar - 92 * scale, height - 24 * scale, bar + 92 * scale, height))
 
 
 def shows(sdr, paper, cap=float('inf')):
@@ -803,13 +1001,13 @@ HUD_WHITE = 200
 
 
 def hdr_gates(shots, sessions):
-    """With HDR Lighting off (float_unlit), the picture is SDR's: its SDR screenshot is HDR off's within a step of
+    """With the Vanilla look (float_unlit), the picture is SDR's: its SDR screenshot is HDR off's within a step of
     rounding (two in at most 1 pixel in 10 000, where the float frame blends several times), and its HDR shot is
     that screenshot's picture. Where the sun's light passes white (above_white of the sun shot, in sun and hud_sun)
     and HDR off clips it too, the screenshot clips it and the HDR shot keeps it, so there the HDR shot is only never darker; and the later
     blends over that light come out brighter than vanilla's over its clipped sky (Why gamma storage), so there the
     screenshot isn't held to HDR off.
-    With HDR Lighting on, the SDR screenshot is the HDR shot with light above white scaled down to it, its hue kept
+    With Horizon's look, the SDR screenshot is the HDR shot with light above white scaled down to it, its hue kept
     (`scaled`; in the world scenes, outside the HUD), nothing passes the peak, and the night's lights pass paper white. White in the screenshot under the HUD is
     the HUD's white at UI Brightness times paper white, the world's light from paper white up, or one over the other,
     which lies between them; each HUD scene shows HUD_WHITE pixels of it at the HUD's white itself."""
@@ -829,11 +1027,11 @@ def hdr_gates(shots, sessions):
 
     for name in sessions:
         graphics, extra = GRAPHICS + SESSIONS[name][0], SESSIONS[name][1]
-        # 🤖 Agent: Without a pack: a 0.2 pack's [tonemap] maps its own picture for each output.
-        if 'HORIZON_HDR_FRAME' not in extra or 'HORIZON_SHADER_PACK' in extra or 'hdr:true' not in graphics:
+        # 🤖 Agent: Without a pack: a pack's [tonemap] maps its own picture for each output.
+        if 'HORIZON_SHADER_PACK' in extra or 'hdr:true' not in graphics:
             continue
         paper, peak, ui = setting(name, 'hdrPaperWhite'), setting(name, 'hdrPeak'), setting(name, 'hdrUiBrightness', 100)
-        lighting = 'hdrLighting:false' not in graphics
+        lighting = 'hdrLook:vanilla' not in graphics
         for scene in SESSIONS[name][2]:
             if not (shots / f'{name}.{scene}-hdr.png').exists():
                 continue
@@ -894,10 +1092,13 @@ def hdr_gates(shots, sessions):
     return problems
 
 
-def build_checks(shots, sessions):
-    """session_checks and hdr_gates in each build's folder, each problem naming its build."""
-    return [f'{label}: {p}' for label in ('base', 'change')
-            for p in session_checks(shots / label, sessions) + hdr_gates(shots / label, sessions)]
+def build_checks(shots, sessions, base_sessions=None):
+    """session_checks, hdr_gates, entity_gates and look_gates in each build's folder, each problem naming its build.
+    The base is checked on `base_sessions` (the ones it drew with the pack), by default the same as the change."""
+    base_sessions = sessions if base_sessions is None else base_sessions
+    return [f'{label}: {p}' for label, drawn in (('base', base_sessions), ('change', sessions))
+            for p in session_checks(shots / label, drawn, label) + hdr_gates(shots / label, drawn)
+            + entity_gates(shots / label, drawn) + look_gates(shots / label, drawn)]
 
 
 def main():
@@ -914,9 +1115,14 @@ def main():
     unknown = [s for s in sessions if s not in SESSIONS]
     if unknown:
         sys.exit(f'unknown sessions: {unknown}')
+    # 🤖 Agent: Without the session it is held to, look_gates would skip the pack's.
+    alone = [f'{p} needs {LOOK_PAIRS[p]}' for p in sessions if p in LOOK_PAIRS and LOOK_PAIRS[p] not in sessions]
+    if alone:
+        sys.exit(f'--sessions leaves out a session another is held to: {", ".join(alone)}')
     base = base_revision(args.base)
     head = git('rev-parse', 'HEAD')
     print(f'base {base[:10]}, change {head[:10]}', flush=True)
+    base_packs(base)
 
     timings = {}
     started = time.monotonic()
@@ -945,12 +1151,18 @@ def main():
 
     shots = RUN / 'shots'
     shutil.rmtree(shots, ignore_errors=True)
-    failures, compared = [], 0
+    failures, compared, base_sessions = [], 0, list(sessions)
     for name in sessions:
         for label, bin_dir in (('base', base_bin), ('change', head_bin)):
             session_started = time.monotonic()
             run_session(name, label, bin_dir, shots / label, env, args)
             timings[f'{name}_{label}_s'] = round(time.monotonic() - session_started)
+        if "[entity] stage isn't drawn yet" in (shots / 'base' / f'{name}.log').read_text(encoding='utf-8'):
+            # 🤖 Agent: A base from before the game drew the entity stage refuses the fixture pack and draws without
+            # it: nothing of this session's to compare the change with.
+            print(f'  {name}: the base refuses the pack, so it is not compared', flush=True)
+            base_sessions.remove(name)
+            continue
         for path in sorted((shots / 'base').glob(f'{name}.*.png')):
             other = shots / 'change' / path.name
             compared += 1
@@ -966,7 +1178,7 @@ def main():
         failures += [f'{n}: the base wrote no such screenshot' for n in extra]
     if compared == 0:
         failures.append('no screenshots were taken')
-    failures += build_checks(shots, sessions)
+    failures += build_checks(shots, sessions, base_sessions)
     lab.write_json(RUN / 'report.json', {'base': base, 'change': head, 'lavapipe': str(icd) if icd else None,
                                          'compared': compared, 'failures': failures, 'timings': timings})
     print(json.dumps(timings), flush=True)

@@ -33,7 +33,6 @@ struct Uniform {
     mode: u32,
     pad: [u32; 2],
     hdr_settings: [f32; 4],
-    hdr_gains: [f32; 4],
     hdr_light: [f32; 4],
 }
 
@@ -216,8 +215,7 @@ impl CustomSky {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Custom sky shader"),
             source: wgpu::ShaderSource::Wgsl(
-                (include_str!("../hdr_light.wgsl").to_owned() + include_str!("custom_sky.wgsl"))
-                    .into(),
+                (super::wgsl_prefix::HDR_LIGHT.to_owned() + include_str!("custom_sky.wgsl")).into(),
             ),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -270,8 +268,7 @@ impl CustomSky {
                         },
                         targets: &[Some(wgpu::ColorTargetState {
                             format,
-                            // The frame's alpha is HDR output's mark (hdr.wgsl): the sky
-                            // under the layers keeps its own.
+                            // The sky under the layers keeps its alpha.
                             blend: Some(wgpu::BlendState {
                                 color: blend(mode),
                                 alpha: wgpu::BlendComponent {
@@ -410,7 +407,6 @@ impl CustomSky {
                 mode: mode as u32,
                 pad: [0; 2],
                 hdr_settings: globals.hdr_settings,
-                hdr_gains: globals.hdr_gains,
                 hdr_light: globals.hdr_light,
             };
             let offset = STRIDE * self.frame.len() as u64;
@@ -458,6 +454,7 @@ mod tests {
 
     #[test]
     fn the_grid_holds_each_face_once_and_faces_point_out() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mut cells: Vec<_> = Face::ALL
             .iter()
             .map(|f| f.cell().map(|x| (x * 6.0) as i32))
@@ -519,6 +516,7 @@ mod tests {
 
     #[test]
     fn every_mode_gives_its_documented_result() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let close = |a: f32, b: f32| assert!((a - b).abs() < 1e-6, "{a} != {b}");
         // Full brightness and alpha, a sky texel of 0.4 under a layer texel of 0.8.
         let (d, t) = (0.4, 0.8);
@@ -544,8 +542,9 @@ mod tests {
 
     #[test]
     fn the_shader_validates() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let module = naga::front::wgsl::parse_str(
-            &(include_str!("../hdr_light.wgsl").to_owned() + include_str!("custom_sky.wgsl")),
+            &(super::super::wgsl_prefix::HDR_LIGHT.to_owned() + include_str!("custom_sky.wgsl")),
         )
         .unwrap();
         naga::valid::Validator::new(
@@ -558,6 +557,7 @@ mod tests {
 
     #[test]
     fn the_box_covers_every_face_with_its_cell() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let mesh = mesh();
         assert_eq!(mesh.len(), 36);
         for v in &mesh {
@@ -568,13 +568,14 @@ mod tests {
     }
     #[test]
     fn written_custom_sky_modes_keep_their_factors_and_light() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let instance = crate::gfx::test_gpu::instance();
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             return;
         };
         let (device, queue) =
             pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-        let source = include_str!("../hdr_light.wgsl").to_owned()
+        let source = super::super::wgsl_prefix::HDR_LIGHT.to_owned()
             + include_str!("custom_sky.wgsl")
             + r#"
 @vertex fn test_vertex(@builtin(vertex_index) i: u32) -> Out {
@@ -666,7 +667,6 @@ mod tests {
                 mode: mode_index as u32,
                 pad: [0; 2],
                 hdr_settings: [5.0, 4.0, 1.0, f32::from(u8::from(debug))],
-                hdr_gains: [1.6, 2.4, 2.8, 4.0],
                 hdr_light: [0.0, 0.0, 1.0, f32::from(u8::from(written))],
             };
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

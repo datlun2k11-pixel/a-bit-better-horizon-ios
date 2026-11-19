@@ -2,7 +2,7 @@
 //! naming it, and the game folder the launcher shares.
 use super::*;
 
-pub(super) fn scratch(name: &str) -> PathBuf {
+fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "horizon-mod-registry-{name}-{}",
         std::process::id()
@@ -17,9 +17,8 @@ fn ruby(version: &str) -> Vec<u8> {
     let manifest = format!(
         "id = \"ruby\"\nname = \"Ruby\"\nversion = \"{version}\"\napi = \"0.2\"\nside = \"both\"\ncapabilities = [\"registries\"]\n"
     );
-    horizon_mods::Package::write_files(
+    horizon_mod_package::Package::write_files(
         &manifest,
-        None,
         &[(
             "assets/ruby/lang/en_us.json",
             br#"{"item.ruby.ruby": "Ruby"}"#,
@@ -53,7 +52,7 @@ fn registry(version: &str, bytes: &[u8], url: &str) -> Index {
         "id": "zoom", "kind": "native-mod", "name": "Zoom", "summary": "Zoom",
         "license": "MIT", "source": "https://github.com/someone/zoom", "downloads": 99,
         "versions": [{ "version": "1", "api": "0.2", "game": crate::mod_registry::GAME,
-            "file": file("zoom-1.hnmod", 1, "b".repeat(64)) }]
+            "file": file("zoom-1.hmod", 1, "b".repeat(64)) }]
     });
     let text = serde_json::json!({ "schema": 1, "projects": [ruby, old, native] }).to_string();
     Index::parse_local(&text).unwrap()
@@ -64,93 +63,6 @@ fn serve(bytes: Vec<u8>) -> impl Fn(&str, u64) -> Result<Vec<u8>, String> {
         true => Ok(bytes.clone()),
         false => Err("too large".into()),
     }
-}
-
-pub(super) fn generation_package(version: &str, marker: &str) -> Vec<u8> {
-    let manifest = format!(
-        "id=\"ruby\"\nname=\"Ruby\"\nversion=\"{version}\"\napi=\"0.2\"\nside=\"both\"\ncapabilities=[\"registries\"]\n"
-    );
-    horizon_mods::Package::write_files(
-        &manifest,
-        None,
-        &[("assets/ruby/marker.txt", marker.as_bytes())],
-    )
-    .unwrap()
-}
-
-pub(super) fn read_generation(home: &Path) -> (String, Vec<u8>) {
-    let path = home.join(crate::mod_list::DIR).join("ruby.hmod");
-    let package = horizon_mods::Package::read(&path).unwrap();
-    let content = horizon_mods::Content::read_declaring(&path, &package.manifest, &[]).unwrap();
-    (
-        package.manifest.version,
-        content.file("assets/ruby/marker.txt").unwrap(),
-    )
-}
-
-#[test]
-fn a_content_snapshot_holds_one_generation_across_manifest_and_asset_reads() {
-    use std::sync::mpsc;
-    let home = scratch("snapshot-update");
-    let old = generation_package("1", "old");
-    let new = generation_package("2", "new");
-    install(
-        &registry("1", &old, "file:///ruby.hmod"),
-        &home,
-        "ruby",
-        &serve(old),
-    )
-    .unwrap();
-    let reader_home = home.clone();
-    let (ready, parsed) = mpsc::channel();
-    let (release, waiting) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        with_content_snapshot(&reader_home, || {
-            let path = reader_home.join(crate::mod_list::DIR).join("ruby.hmod");
-            let package = horizon_mods::Package::read(&path).unwrap();
-            ready.send(()).unwrap();
-            waiting.recv().unwrap();
-            let content =
-                horizon_mods::Content::read_declaring(&path, &package.manifest, &[]).unwrap();
-            (
-                package.manifest.version,
-                content.file("assets/ruby/marker.txt").unwrap(),
-            )
-        })
-        .unwrap()
-    });
-    parsed.recv_timeout(Duration::from_secs(5)).unwrap();
-    let writer_home = home.clone();
-    let (probe, probed) = mpsc::channel();
-    let writer = std::thread::spawn(move || {
-        // A real OS-lock probe makes the interleaving deterministic: the
-        // snapshot must own the gate at the midpoint of its two file reads.
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(writer_home.join(".mod-browser.lock"))
-            .unwrap();
-        let blocked = matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock));
-        drop(file);
-        probe.send(blocked).unwrap();
-        install(
-            &registry("2", &new, "file:///ruby.hmod"),
-            &writer_home,
-            "ruby",
-            &serve(new),
-        )
-    });
-    let blocked = probed.recv_timeout(Duration::from_secs(5)).unwrap();
-    release.send(()).unwrap();
-    let snapshot = reader.join().unwrap();
-    writer.join().unwrap().unwrap();
-    assert!(
-        blocked,
-        "content snapshot released the writer gate between reads"
-    );
-    assert_eq!(snapshot, ("1".into(), b"old".to_vec()));
-    assert_eq!(read_generation(&home), ("2".into(), b"new".to_vec()));
-    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -185,7 +97,10 @@ fn an_install_is_checked_then_recorded_as_the_launchers_own() {
     let path = home.join("horizon-mods/ruby.hmod");
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(
-        horizon_mods::Package::read(&path).unwrap().manifest.id,
+        horizon_mod_package::Package::read(&path)
+            .unwrap()
+            .manifest
+            .id,
         "ruby"
     );
     let record: serde_json::Value =
@@ -209,6 +124,154 @@ fn an_install_is_checked_then_recorded_as_the_launchers_own() {
     assert_eq!(record["entries"].as_array().unwrap().len(), 2);
     assert_eq!(record["entries"][1]["version"], "1.1");
     fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn install_holds_the_shared_lock_through_download_and_releases_it_on_error() {
+    let bytes = ruby("1.0");
+    let index = registry("1.0", &bytes, "file:///ruby.hmod");
+    let home = scratch("transaction-error");
+    let error = install(&index, &home, "ruby", &|_, _| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert!(horizon_mod_package::install_lock::try_lock_home(&home).is_none());
+                })
+                .join()
+                .unwrap();
+        });
+        Err("download failed".into())
+    })
+    .unwrap_err();
+    assert_eq!(error, "download failed");
+    assert!(!home.join(MANIFEST).exists());
+    assert!(!home.join("horizon-mods/ruby.hmod").exists());
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _guard = horizon_mod_package::install_lock::try_lock_home(&home).unwrap();
+            })
+            .join()
+            .unwrap();
+    });
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn install_reads_the_manifest_after_the_other_installer_finishes() {
+    let bytes = ruby("1.0");
+    let index = registry("1.0", &bytes, "file:///ruby.hmod");
+    let home = scratch("transaction-read");
+    std::thread::scope(|scope| {
+        let guard = horizon_mod_package::install_lock::lock_home(&home).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = &home;
+        let registry = &index;
+        let worker = scope.spawn(move || {
+            tx.send(()).unwrap();
+            install(registry, target, "ruby", &serve(bytes)).unwrap();
+        });
+        rx.recv().unwrap();
+        let mut installed = Installed::default();
+        installed.entries.push(serde_json::json!({
+            "source": "modrinth", "project": "pack", "file": "resourcepacks/pack.zip"
+        }));
+        installed.save(&home).unwrap();
+        drop(guard);
+        worker.join().unwrap();
+    });
+    let installed = Installed::load(&home).unwrap();
+    assert_eq!(installed.entries.len(), 2);
+    assert_eq!(installed.entries[0]["project"], "pack");
+    assert!(installed.position("ruby").is_some());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn a_lock_error_never_downloads_or_changes_installed_files() {
+    let bytes = ruby("1.0");
+    let index = registry("1.0", &bytes, "file:///ruby.hmod");
+    let home = scratch("lock-error");
+    fs::create_dir(home.join(".mod-browser.lock")).unwrap();
+    let error = install(&index, &home, "ruby", &|_, _| {
+        panic!("lock errors must refuse the operation before downloading")
+    })
+    .unwrap_err();
+    assert!(error.contains("cannot lock mod browser"), "{error}");
+    assert!(!home.join(MANIFEST).exists());
+    assert!(!home.join("horizon-mods").exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn a_native_pin_is_not_replaced_by_a_content_version_of_the_same_project() {
+    let bytes = ruby("1.1");
+    let index = registry("1.1", &bytes, "file:///ruby.hmod");
+    let home = scratch("native-pin");
+    // A missing native file is still the launcher's pin, not permission for
+    // the game to replace its metadata or switch its kind.
+    let entry = serde_json::json!({
+        "source": "horizon", "project": "ruby", "version": "1.0",
+        "file": "horizon-native-mods/ruby.hmod", "pin": "exact-build"
+    });
+    let manifest = serde_json::json!({ "entries": [entry] }).to_string();
+    fs::write(home.join(MANIFEST), &manifest).unwrap();
+    let error = install(&index, &home, "ruby", &|_, _| {
+        panic!("a native pin must be refused before download")
+    })
+    .unwrap_err();
+    assert!(error.contains("launcher"), "{error}");
+    assert_eq!(fs::read_to_string(home.join(MANIFEST)).unwrap(), manifest);
+    assert!(!home.join("horizon-mods/ruby.hmod").exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn an_unrecognized_managed_entry_is_not_replaced() {
+    let bytes = ruby("1.1");
+    let index = registry("1.1", &bytes, "file:///ruby.hmod");
+    let home = scratch("unknown-entry");
+    let manifest = serde_json::json!({ "entries": [{
+        "source": "horizon", "project": "ruby", "version": "1.0",
+        "pin": "exact-build"
+    }] })
+    .to_string();
+    fs::write(home.join(MANIFEST), &manifest).unwrap();
+    let error = install(&index, &home, "ruby", &|_, _| {
+        panic!("unknown managed metadata must be refused before download")
+    })
+    .unwrap_err();
+    assert!(error.contains("launcher"), "{error}");
+    assert_eq!(fs::read_to_string(home.join(MANIFEST)).unwrap(), manifest);
+    assert!(!home.join("horizon-mods/ruby.hmod").exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn an_unreadable_manifest_is_not_treated_as_an_empty_installation() {
+    let bytes = ruby("1.0");
+    let index = registry("1.0", &bytes, "file:///ruby.hmod");
+    let home = scratch("invalid-manifest");
+    for manifest in ["not json", r#"{"entries": {}}"#] {
+        fs::write(home.join(MANIFEST), manifest).unwrap();
+        let error = install(&index, &home, "ruby", &|_, _| {
+            panic!("an unreadable manifest must be refused before download")
+        })
+        .unwrap_err();
+        assert!(error.contains(MANIFEST), "{error}");
+        assert_eq!(fs::read_to_string(home.join(MANIFEST)).unwrap(), manifest);
+        assert!(!home.join("horizon-mods/ruby.hmod").exists());
+    }
+    fs::remove_file(home.join(MANIFEST)).unwrap();
+    fs::create_dir(home.join(MANIFEST)).unwrap();
+    let error = install(&index, &home, "ruby", &|_, _| {
+        panic!("a manifest read error must be refused before download")
+    })
+    .unwrap_err();
+    assert!(error.contains(MANIFEST), "{error}");
+    assert!(home.join(MANIFEST).is_dir());
+    assert!(!home.join("horizon-mods/ruby.hmod").exists());
+    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -252,216 +315,47 @@ fn a_mod_the_player_put_there_is_never_replaced() {
     fs::remove_dir_all(&home).unwrap();
 }
 
+/// A wasm package can declare only registries too; the browser must inspect the package,
+/// rather than treat that capability list as proof that it contains no code.
 #[test]
-fn concurrent_installs_keep_both_records_and_matching_packages() {
-    use std::sync::Barrier;
-    let first = ruby("1.0");
-    let second = horizon_mods::Package::write_files(
-        "id=\"sapphire\"\nname=\"Sapphire\"\nversion=\"1.0\"\napi=\"0.2\"\nside=\"both\"\ncapabilities=[\"registries\"]\n",
-        None, &[],
-    ).unwrap();
-    let mut index = registry("1.0", &first, "file:///ruby.hmod");
-    let mut project = index.project("ruby").unwrap().clone();
-    project.id = "sapphire".into();
-    project.name = "Sapphire".into();
-    project.versions[0].file.name = "sapphire.hmod".into();
-    project.versions[0].file.url = "file:///sapphire.hmod".into();
-    project.versions[0].file.size = second.len() as u64;
-    project.versions[0].file.sha256 = index::sha256(&second);
-    index.projects.push(project);
-    let index = Arc::new(index);
-    let barrier = Arc::new(Barrier::new(2));
-    let home = scratch("concurrent");
-    let threads: Vec<_> = [("ruby", first.clone()), ("sapphire", second.clone())]
-        .into_iter()
-        .map(|(id, bytes)| {
-            let index = index.clone();
-            let barrier = barrier.clone();
-            let home = home.clone();
-            std::thread::spawn(move || {
-                install(&index, &home, id, &|_, _| {
-                    barrier.wait();
-                    Ok(bytes.clone())
-                })
-            })
-        })
-        .collect();
-    for thread in threads {
-        thread.join().unwrap().unwrap();
-    }
-    let installed = Installed::load_checked(&home).unwrap();
-    assert_eq!(installed.entries.len(), 2);
-    for (id, bytes) in [("ruby", first), ("sapphire", second)] {
-        assert_eq!(
-            fs::read(home.join(crate::mod_list::DIR).join(format!("{id}.hmod"))).unwrap(),
-            bytes
-        );
-        assert_eq!(
-            installed.entries[installed.position(id).unwrap()]["checksum"],
-            format!("SHA-256:{}", index::sha256(&bytes))
-        );
-    }
-    fs::remove_dir_all(home).unwrap();
-}
-
-#[test]
-fn local_and_cached_index_bounds_reject_a_valid_prefix_with_excess_data() {
-    let home = scratch("index-bounds");
-    let path = home.join("index.json");
-    let mut bytes = br#"{"schema":1,"projects":[]}"#.to_vec();
-    bytes.resize(MAX_INDEX as usize + 1, b' ');
-    fs::write(&path, &bytes).unwrap();
-    let cancel = Arc::new(Cancellation::default());
-    assert!(fetch_text(path.to_str().unwrap(), &cancel).is_err());
-    fs::create_dir_all(home.join("mod-browser")).unwrap();
-    fs::write(home.join(CACHE), bytes).unwrap();
-    assert!(load_index(&home, home.join("missing.json").to_str().unwrap()).is_err());
-    assert!(read_bounded(&b"1234"[..], 3, &cancel).is_err());
-    assert_eq!(read_bounded(&b"123"[..], 3, &cancel).unwrap(), b"123");
-    fs::remove_dir_all(home).unwrap();
-}
-
-#[test]
-fn managed_index_shutdown_closes_a_stalled_tls_handshake() {
-    use std::{io::Read, net::TcpListener, sync::mpsc};
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("https://{}/index.json", listener.local_addr().unwrap());
-    let (accepted, ready) = mpsc::channel();
-    let peer = std::thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut bytes = [0; 4096];
-        assert!(socket.read(&mut bytes).unwrap() > 0);
-        accepted.send(()).unwrap();
-        // Deliberately never reply to ClientHello.
-        loop {
-            match socket.read(&mut bytes) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
-    let cancel = Arc::new(Cancellation::default());
-    let worker_cancel = cancel.clone();
-    let home = scratch("stalled-tls");
-    let worker_home = home.clone();
-    let (done, result) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        done.send(load_index_managed(&worker_home, &url, &worker_cancel))
-            .unwrap();
-    });
-    ready.recv_timeout(Duration::from_secs(5)).unwrap();
-    cancel.cancel();
-    assert!(
-        result
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap()
-            .is_err()
+fn code_packages_never_reach_the_content_browser_install_path() {
+    // The smallest shared group member: `dylink.0` memory info and the three guest exports.
+    let module = &[
+        b"\0asm\x01\0\0\0".as_slice(),
+        b"\0\x0f\x08dylink.0\x01\x04\0\0\0\0",
+        b"\x01\x04\x01\x60\0\0",
+        b"\x03\x04\x03\0\0\0",
+        b"\x07\x2e\x03\x0ehorizon_layout\0\0\x0ahorizon_in\0\x01\x0chorizon_hook\0\x02",
+        b"\x0a\x0a\x03\x02\0\x0b\x02\0\x0b\x02\0\x0b",
+    ]
+    .concat()[..];
+    let manifest = format!(
+        "id = \"ruby\"\nname = \"Ruby\"\nversion = \"1.0\"\napi = \"0.2\"\nside = \"both\"\ncapabilities = [\"registries\"]\n[wasm]\nsha512 = \"{}\"\ntoolchain = \"1.99.1\"\nbuilt_with = \"test\"\n",
+        horizon_mod_package::manifest::sha512_of(module)
     );
-    worker.join().unwrap();
-    peer.join().unwrap();
-    assert_eq!(cancel.attached_sockets(), 0);
-    assert!(!home.join(CACHE).exists());
-    fs::remove_dir_all(home).unwrap();
-}
+    let bytes =
+        horizon_mod_package::Package::write_files(&manifest, &[("mod.wasm", module)]).unwrap();
+    let index = registry("1.0", &bytes, "file:///ruby.hmod");
+    let home = scratch("code");
+    let error = install(&index, &home, "ruby", &serve(bytes.clone())).unwrap_err();
+    assert!(error.contains("code mods"), "{error}");
+    assert!(!home.join("horizon-mods/ruby.hmod").exists());
+    assert!(!home.join("mod-browser/downloads/ruby.hmod.part").exists());
+    assert!(!home.join(MANIFEST).exists());
 
-#[test]
-fn cancelling_after_download_preserves_the_installed_pair() {
-    let home = scratch("cancel-before-commit");
-    let old = ruby("1");
-    install(
-        &registry("1", &old, "file:///ruby.hmod"),
-        &home,
-        "ruby",
-        &serve(old.clone()),
-    )
-    .unwrap();
-    let manifest = fs::read(home.join(MANIFEST)).unwrap();
-    let new = ruby("2");
-    let index = registry("2", &new, "file:///ruby.hmod");
-    let cancel = Cancellation::default();
-    assert!(
-        install_managed(
-            &index,
-            &home,
-            "ruby",
-            &|_, _| {
-                cancel.cancel();
-                Ok(new.clone())
-            },
-            &cancel
-        )
-        .is_err()
-    );
+    // A code package installed through the launcher is not silently replaced by content.
+    fs::create_dir_all(home.join("horizon-mods")).unwrap();
+    fs::write(home.join("horizon-mods/ruby.hmod"), &bytes).unwrap();
+    fs::write(home.join(MANIFEST), serde_json::json!({"entries": [{
+        "source": "horizon", "project": "ruby", "version": "1.0", "file": "horizon-mods/ruby.hmod"
+    }]}).to_string()).unwrap();
+    let content = ruby("1.1");
+    let index = registry("1.1", &content, "file:///ruby.hmod");
+    let error = install(&index, &home, "ruby", &serve(content)).unwrap_err();
+    assert!(error.contains("code mods"), "{error}");
     assert_eq!(
-        fs::read(home.join(crate::mod_list::DIR).join("ruby.hmod")).unwrap(),
-        old
+        fs::read(home.join("horizon-mods/ruby.hmod")).unwrap(),
+        bytes
     );
-    assert_eq!(fs::read(home.join(MANIFEST)).unwrap(), manifest);
-    fs::remove_dir_all(home).unwrap();
-}
-
-#[test]
-fn waiting_for_another_home_commit_can_be_cancelled() {
-    use std::sync::mpsc;
-    let home = scratch("cancel-lock-wait");
-    let held = storage::lock_home(&home, &Cancellation::default()).unwrap();
-    let cancel = Arc::new(Cancellation::default());
-    let worker_cancel = cancel.clone();
-    let worker_home = home.clone();
-    let (done, result) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let result = storage::lock_home(&worker_home, &worker_cancel);
-        done.send(result.is_err()).unwrap();
-    });
-    cancel.cancel();
-    assert!(result.recv_timeout(Duration::from_secs(2)).unwrap());
-    worker.join().unwrap();
-    drop(held);
-    fs::remove_dir_all(home).unwrap();
-}
-
-#[test]
-fn a_cancelled_snapshot_does_not_wait_for_another_publisher_or_read_files() {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    };
-    let home = scratch("cancel-snapshot-wait");
-    let held = storage::lock_home(&home, &Cancellation::default()).unwrap();
-    let cancel = Arc::new(Cancellation::default());
-    let worker_cancel = cancel.clone();
-    let read = Arc::new(AtomicBool::new(false));
-    let worker_read = read.clone();
-    let worker_home = home.clone();
-    let (started, entered) = mpsc::channel();
-    let (done, result) = mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        started.send(()).unwrap();
-        let snapshot = with_content_snapshot_managed(&worker_home, &worker_cancel, || {
-            worker_read.store(true, Ordering::SeqCst);
-        });
-        done.send(snapshot).unwrap();
-    });
-    entered.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(matches!(
-        result.recv_timeout(Duration::from_millis(50)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
-    cancel.cancel();
-    let error = result
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap()
-        .unwrap_err();
-    assert!(error.contains("cancelled"), "{error}");
-    assert!(
-        !read.load(Ordering::SeqCst),
-        "cancelled snapshot entered file-reading callback"
-    );
-    // The publisher is still locked: completion cannot depend on releasing it.
-    worker.join().unwrap();
-    drop(held);
     fs::remove_dir_all(home).unwrap();
 }

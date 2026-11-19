@@ -1,13 +1,22 @@
-//! The stages' WGSL against the Rust definitions: the preludes of both lines compile, the
-//! frame's WGSL layout is the uploaded struct's, 0.1's WGSL is what it always was, 0.2's is
-//! what it was before `[ray_tracing]` for a pack without the key, and
-//! docs/api/shaders-reference.md and shaders-reference-0.2.md are up to date. Rewrite the
-//! references with `HORIZON_WRITE_DOCS=1 cargo test -p horizon-shader-api --test it reference::`.
+//! The stages' WGSL against the Rust definitions: the preludes compile, the frame's WGSL layout
+//! is the uploaded struct's, the WGSL of a pack without `[ray_tracing]` is what it was before the
+//! key, and docs/api/shaders-reference-0.2.md is up to date. Rewrite the reference with
+//! `HORIZON_WRITE_DOCS=1 cargo test -p horizon-shader-api --test it reference::`.
 use horizon_shader_api::{
-    Api, Frame, Pack, StageKind, compose, package::sha256_hex, reference, stages::Tracing,
+    Frame, Pack, StageKind, compose,
+    package::sha256_hex,
+    reference,
+    stages::{Tracing, light_source_entries, lit_entries, shaded_entries},
 };
 use naga::valid::Capabilities;
 use std::path::Path;
+
+/// The stage's entry points for a pack that doesn't name `shaded_tint`, `lit_tint` or the
+/// light-source fields.
+fn entries_of(kind: StageKind) -> String {
+    let entries = lit_entries(&shaded_entries(kind.entries(), false), None);
+    light_source_entries(&entries, None)
+}
 
 fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
@@ -40,9 +49,8 @@ fn entity(input: EntityInput) -> Surface {
 
 #[test]
 fn the_reference_prints_vanilla_s_entity_function_as_it_is_checked() {
-    let doc = reference::markdown(Api::V0_2);
+    let doc = reference::markdown();
     assert!(doc.contains(&format!("```wgsl\n{VANILLA_ENTITY}```")));
-    assert!(!reference::markdown(Api::V0_1).contains("EntityInput"));
 }
 
 /// Vanilla's look, written as each stage.
@@ -64,55 +72,53 @@ fn vanilla(kind: StageKind) -> &'static str {
             "fn tonemap(input: TonemapInput) -> vec3<f32> { return input.color; }\n"
         }
         StageKind::Entity => VANILLA_ENTITY,
+        StageKind::Compute | StageKind::BeforeWorld => {
+            "fn compute(input: ComputeInput) {}
+"
+        }
     }
 }
 
 #[test]
 fn every_stage_compiles_with_vanilla_s_function() {
-    for api in Api::SERVED {
-        for &kind in api.stages() {
-            let text = format!(
-                "{}{}{}",
-                kind.prelude(api),
-                vanilla(kind),
-                kind.entries(api)
-            );
-            let module = validate(&text);
-            assert!(
-                module
-                    .entry_points
-                    .iter()
-                    .all(|e| e.name.starts_with("horizon_")),
-                "{api} {kind:?}"
-            );
-        }
+    for kind in StageKind::ALL {
+        let text = format!("{}{}{}", kind.prelude(), vanilla(kind), entries_of(kind));
+        let module = validate(&text);
+        assert!(
+            module
+                .entry_points
+                .iter()
+                .all(|e| e.name.starts_with("horizon_")),
+            "{kind:?}"
+        );
     }
-    assert_eq!(Api::V0_1.stages().len(), 5);
-    assert!(!Api::V0_1.stages().contains(&StageKind::Tonemap));
-    assert!(!Api::V0_1.stages().contains(&StageKind::Entity));
 }
 
 /// A pack with `[ray_tracing]`: every stage without the scene, on any device, and with it, on
 /// one with ray queries.
 #[test]
-fn every_0_2_stage_compiles_under_ray_tracing() {
-    let api = Api::V0_2;
+fn every_stage_compiles_under_ray_tracing() {
     let traces = "fn post(input: PostInput) -> vec4<f32> {\n    \
                   let hit = trace(view_position(input.uv, input.depth), frame.sun_direction, frame.ray_distance);\n    \
-                  return select(input.color, hit.albedo * hit.tint, hit.distance >= 0.0 && frame.has_ray_tracing == 1u);\n}\n";
+                  let maps = hit_normal_map(hit) * hit_specular_map(hit) * f32(block_pbr_maps()) + hit.tangent;\n    \
+                  let water = trace_layers(hit.position, frame.sun_direction, 8.0, RAY_SOLID | RAY_TRANSLUCENT);\n    \
+                  let wet = f32(trace_any_layers(hit.position, hit.normal, 8.0, RAY_TRANSLUCENT)) * water.albedo.a;\n    \
+                  let own = maps * hit.emission * f32(hit.fluid) * f32(hit.translucent) + wet;\n    \
+                  return select(input.color, hit.albedo * hit.tint + own, hit.distance >= 0.0 && frame.has_ray_tracing == 1u);\n}\n";
     let shaded = "fn material(input: MaterialInput) -> Surface {\n    \
-                  let lit = f32(!trace_any(input.position, frame.sun_direction, frame.ray_distance));\n    \
+                  let lit = f32(!trace_any(input.position, frame.sun_direction, frame.ray_distance))\n        \
+                      * hit_specular_map(trace(input.position, input.normal, 8.0)).r;\n    \
                   return Surface(input.albedo * input.tint * vec4<f32>(input.lightmap * lit, 1.0));\n}\n";
-    for &kind in api.stages() {
+    for kind in StageKind::ALL {
         let own = match kind {
             StageKind::Post => traces,
             StageKind::Material => shaded,
             _ => vanilla(kind),
         };
-        let stub = kind.prelude_traced(api, Tracing::Stub);
-        validate(&format!("{stub}{own}{}", kind.entries(api)));
-        let scene = kind.prelude_traced(api, Tracing::Scene);
-        let text = format!("{scene}{own}{}", kind.entries(api));
+        let stub = kind.prelude_traced(Tracing::Stub);
+        validate(&format!("{stub}{own}{}", entries_of(kind)));
+        let scene = kind.prelude_traced(Tracing::Scene);
+        let text = format!("{scene}{own}{}", entries_of(kind));
         validate_for(&text, Capabilities::default() | Capabilities::RAY_QUERY);
         // Only the post and material stages' modules need the device's ray queries.
         let rays = matches!(kind, StageKind::Post | StageKind::Material);
@@ -121,134 +127,99 @@ fn every_0_2_stage_compiles_under_ray_tracing() {
     }
 }
 
-/// The SHA-256 of the material stage's 0.2 prelude for a `[ray_tracing]` pack whose material
-/// calls `trace` or `trace_any`, without the scene and with it.
+/// The SHA-256 of the material stage's prelude for a `[ray_tracing]` pack whose material
+/// calls a trace function, without the scene and with it.
 const PINNED_TRACED_MATERIAL: [(Tracing, &str); 2] = [
     (
         Tracing::Stub,
-        "75f7c8b4dee77eb30e07cde8c753c19aaa7c1149ab42a711520144a8c4f9121c",
+        "023aaffa02bca0c7ce0d6a2b577b0b0af8495a411dd822a40ef4409c739210d6",
     ),
     (
         Tracing::Scene,
-        "18f84e67f797242de0b36834c31a48c8b115c839e2347f2e2adfdf740340fd67",
+        "3a67f6454a3f339e10030dd27d896fba89d76db6b35d4db895fcd1209cf16773",
     ),
 ];
 
 #[test]
 fn the_traced_material_prelude_is_unchanged() {
     for (tracing, prelude) in PINNED_TRACED_MATERIAL {
-        let have = StageKind::Material.prelude_traced(Api::V0_2, tracing);
+        let have = StageKind::Material.prelude_traced(tracing);
         assert_eq!(sha256_hex(have.as_bytes()), prelude, "{tracing:?}");
     }
 }
 
-/// The SHA-256 of 0.1's prelude and entries of each stage, as they were before 0.2: the line
-/// packs run on today doesn't move.
-const PINNED_0_1: [(StageKind, &str, &str); 5] = [
-    (
-        StageKind::Sky,
-        "5a12b39ea8b56ad8deead04aa848671ceebde05cdd35af029d1bca5fe1e4cb51",
-        "8fa92b1f28b48f70f7704cd1db183d5720484c1c92f779542a5805cd8d540fbc",
-    ),
-    (
-        StageKind::Vertex,
-        "1ba03e6acd07fc26e267f58fe65aaa607976faab1834d16f55c694e15eacf885",
-        "0c512329404218b074bd5140c2dcb4268721ad2b280d5d516a8066ffc2a78f97",
-    ),
-    (
-        StageKind::Material,
-        "1f165861a0f74fa58bab41d9770798fd80ccbc12b61fa8ede7bb4804bcbea24e",
-        "9dfaf3b191390a268a43bb3ecb8cbc1739e083b4e7c1783b58c76b332afe88cc",
-    ),
-    (
-        StageKind::Weather,
-        "174ad066203226f4b28848d6cc2037df75c9ea68481bbff8b73eca469d9b5bb7",
-        "6fd42fe9ab23d5aca1ca0bb61d9021cad149e795574d892fcd8178a3dae15032",
-    ),
-    (
-        StageKind::Post,
-        "4b1b7b6c7b1149657965a178a879535975ed76d09524c294d4350c6c06db83ab",
-        "a1d88de49274e1d9aed65d2a7fd500e9e385a7a7c9fbb6f9064d4bdbd3a8d6da",
-    ),
-];
-
-#[test]
-fn the_0_1_wgsl_is_unchanged() {
-    for (kind, prelude, entries) in PINNED_0_1 {
-        let have = (
-            sha256_hex(kind.prelude(Api::V0_1).as_bytes()),
-            sha256_hex(kind.entries(Api::V0_1).as_bytes()),
-        );
-        assert_eq!(have, (prelude.to_owned(), entries.to_owned()), "{kind:?}");
-    }
-}
-
-/// The SHA-256 of 0.2's prelude and entries of each stage for a pack without `[ray_tracing]`, as
-/// they were before the key: a pack that doesn't ask for the scene is built from the same WGSL.
+/// The SHA-256 of the prelude and entries of each stage for a pack without `[ray_tracing]`, as
+/// they were before the key but for what changed for every pack since (the frame's fog fields,
+/// the post stage's `history`, the terrain's looks): a pack that doesn't ask for the scene is
+/// built from the same WGSL.
 const PINNED_0_2: [(StageKind, &str, &str); 6] = [
     (
         StageKind::Sky,
-        "13320fd37a8b7de9011742b88709c820d7f89b2709e35313bd8e667c27eaf233",
+        "88322d6f72dbda324d890c2f7a2dfa4c963e027bf422b952851c48a5f0d2ae67",
         "54bac4d416d804d8a96e1e31a6d62460f77573634c1e7bec16670641355d678a",
     ),
     (
         StageKind::Vertex,
-        "43afb61a66484dc1afe032322b9c35648ec5d93e4ea7b453e8ac1c5bb4c1d54c",
-        "f30235a35a2ec15f502efcea364a4470227325fcef36328b5cd04528a916a8ba",
+        "d1a57e56014b96daafd07e4fe14a99f4e80d706d2032d26bdbac74bbfee436a7",
+        "c77929934ce1572c21697f1e3328434638701370f5a7a94a9f3268d52d378636",
     ),
     (
         StageKind::Material,
-        "44421906ba871e4bde6a5e89e659a376dd97e2b4debb82c8fae56fba280b3be3",
-        "6716c28ae0e699d15695da89c0848ae9d242c0e146b8487aff463ccc19bff4d2",
+        "7f5fc7fbca82bcb3ac0bbe45e38be645012698d6102913cd38696b7fd40c762d",
+        "8b69597d65e4cadc049206cf473c144c07b1e61902a3ee3afb0a4ca137c00033",
     ),
     (
         StageKind::Weather,
-        "6055a97e6f8df727508899bfd332374179a51f85e3377581b4b867b7cbef1aa2",
+        "336a93c79c08005cad9246ac88aaea4dad1ecd5d72f391e95fb55cc8a94e401d",
         "c2e4dabacd487692038c3fbf5708aed72a12d951c15184ceaf61ee1bb61b4982",
     ),
     (
         StageKind::Post,
-        "2c9d8e0d342e5314ca4216780e94d26f0e5ea7eb8b779acd7c995ccb80cfe32a",
+        "de8725d1bd09091439222978f5c5c8f73d16c18c61125f5be395cb1104105993",
         "f1ffc3c9e0692e1d1f49de4a34ae90b93f7f2eda2eaa42ce936f630139cc4648",
     ),
     (
         StageKind::Tonemap,
-        "1261f4b8f021ed0cea25333e87d8277043f226ac1ab5b3387390bb18fbf3144d",
+        "c17c9c25f183c3d49db5a819249b79a61252e7eb18006021f6e493d1c95e6070",
         "2dcf7ee0874daeb033058ed55323b74c0da5de4a170cece2e6192500714c0b6a",
     ),
 ];
 
 #[test]
-fn the_0_2_wgsl_of_a_pack_without_ray_tracing_is_unchanged() {
+fn the_wgsl_of_a_pack_without_ray_tracing_is_unchanged() {
     for (kind, prelude, entries) in PINNED_0_2 {
         let have = (
-            sha256_hex(kind.prelude(Api::V0_2).as_bytes()),
-            sha256_hex(kind.entries(Api::V0_2).as_bytes()),
+            sha256_hex(kind.prelude().as_bytes()),
+            sha256_hex(entries_of(kind).as_bytes()),
         );
         assert_eq!(have, (prelude.to_owned(), entries.to_owned()), "{kind:?}");
     }
     // And a whole stage of a pack in the tree, as the game composes it.
-    let dir = root().join("crates/horizon-shader-api/packs/golden_hour_0_2");
+    let dir = root().join("crates/horizon-shader-api/packs/golden_hour");
     let pack = Pack::read(&dir).unwrap();
     let glow = compose(&pack, StageKind::Post, "post/glow.wgsl");
     assert_eq!(
         // As the repository holds the files: a Windows checkout may give them CRLF.
         sha256_hex(glow.text.replace('\r', "").as_bytes()),
-        "ba23f7e523ae846f9122cb2d5b1560adadc02279b344b5b331ba7ed5a0e699d7"
+        "e0de176db0fbae5c564406678c7f0142b1d679e1a8dc443a969f7abf2cd7828f"
     );
 }
 
-/// The `Frame` struct the line's sky prelude declares (for a pack with `[ray_tracing]` or
-/// without), as (name, offset) and its span.
-fn frame_layout(api: Api, ray_tracing: bool) -> (Vec<(String, usize)>, usize) {
-    let tracing = if ray_tracing {
-        Tracing::Stub
-    } else {
-        Tracing::None
-    };
-    let prelude = StageKind::Sky.prelude_traced(api, tracing);
-    let text = format!("{prelude}{}", vanilla(StageKind::Sky));
-    let module = validate(&text);
+/// The `Frame` struct a prelude declares, for a pack with `[ray_tracing]` or without, with
+/// `[[resource]]` or without, and whose files name `moon_phase` or not and `full_lightmap` or
+/// not, as (name, offset) and its span.
+fn frame_layout(
+    ray_tracing: bool,
+    kept: bool,
+    moon_phase: bool,
+    full_lightmap: bool,
+) -> (Vec<(String, usize)>, usize) {
+    let module = validate(&Frame::declared_wgsl(
+        ray_tracing,
+        kept,
+        moon_phase,
+        full_lightmap,
+    ));
     let (_, ty) = module
         .types
         .iter()
@@ -272,19 +243,41 @@ fn the_frame_s_wgsl_layout_is_the_uploaded_struct_s() {
         .zip(Frame::OFFSETS)
         .map(|(f, &o)| (f.name.to_owned(), o))
         .collect();
-    let (wgsl, span) = frame_layout(Api::V0_2, true);
-    assert_eq!(span, std::mem::size_of::<Frame>());
-    assert_eq!(wgsl, rust);
-    // Without `[ray_tracing]` the scene's two fields are a gap: the others stay where they are.
-    let (wgsl, span) = frame_layout(Api::V0_2, false);
-    assert_eq!(span, std::mem::size_of::<Frame>());
-    let mut untraced = rust.clone();
-    untraced.drain(Frame::RAY_FIELDS);
-    assert_eq!(wgsl, untraced);
-    // 0.1 declares the start of the same buffer.
-    let (wgsl, span) = frame_layout(Api::V0_1, false);
-    assert_eq!(wgsl, rust[..Frame::FIELDS_0_1]);
-    assert_eq!(span, rust[Frame::FIELDS_0_1].1);
+    let size = std::mem::size_of::<Frame>();
+    // Every field a pack may declare sits where the uploaded struct has it, whichever of the
+    // keys bringing fields it sets: a field it doesn't declare is a gap, or the end.
+    for ray_tracing in [false, true] {
+        for kept in [false, true] {
+            for moon_phase in [false, true] {
+                for full_lightmap in [false, true] {
+                    let mut want = rust.clone();
+                    let left = |range: std::ops::Range<usize>, on: bool| (!on).then_some(range);
+                    for range in [
+                        left(Frame::FULL_LIGHTMAP_FIELDS, full_lightmap),
+                        left(Frame::MOON_FIELDS, moon_phase),
+                        left(Frame::KEPT_FIELDS, kept),
+                        left(Frame::RAY_FIELDS, ray_tracing),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        want.drain(range);
+                    }
+                    let keys = format!(
+                        "ray tracing {ray_tracing}, kept {kept}, moon phase {moon_phase}, \
+                         full lightmap {full_lightmap}"
+                    );
+                    let (wgsl, span) = frame_layout(ray_tracing, kept, moon_phase, full_lightmap);
+                    assert_eq!(wgsl, want, "{keys}");
+                    // The fog's fields are every pack's, and the moon's phase is in the padding
+                    // of the 16 bytes before the full light's: without that the struct ends
+                    // there, as it did before it, and with it it is the buffer's size.
+                    let end = if full_lightmap { size } else { size - 16 };
+                    assert_eq!(span, end, "{keys}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -314,20 +307,18 @@ fn the_sample_pack_s_stages_compile() {
 }
 
 #[test]
-fn the_references_are_up_to_date() {
-    for api in Api::SERVED {
-        let doc = reference::path(api);
-        let path = root().join(doc);
-        let want = reference::markdown(api);
-        if std::env::var_os("HORIZON_WRITE_DOCS").is_some() {
-            std::fs::write(&path, &want).unwrap();
-        }
-        let have = std::fs::read_to_string(&path)
-            .unwrap_or_default()
-            .replace("\r\n", "\n");
-        assert!(
-            have == want,
-            "{doc} is out of date: HORIZON_WRITE_DOCS=1 cargo test -p horizon-shader-api --test it reference::"
-        );
+fn the_reference_is_up_to_date() {
+    let doc = reference::PATH;
+    let path = root().join(doc);
+    let want = reference::markdown();
+    if std::env::var_os("HORIZON_WRITE_DOCS").is_some() {
+        std::fs::write(&path, &want).unwrap();
     }
+    let have = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    assert!(
+        have == want,
+        "{doc} is out of date: HORIZON_WRITE_DOCS=1 cargo test -p horizon-shader-api --test it reference::"
+    );
 }

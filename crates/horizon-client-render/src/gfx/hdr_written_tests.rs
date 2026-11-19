@@ -1,10 +1,13 @@
 use super::{
     Hdr, Output,
-    tests::{gpu, legacy_light, texel, writers_lift},
+    tests::{gpu, texel},
 };
 use std::{cell::RefCell, collections::HashMap};
 use wgpu::TextureFormat as F;
 use wgpu::util::DeviceExt;
+
+/// The look's gains, low to very bright (hdr_look.wgsl `HDR_GAIN`).
+const GAINS: [f32; 4] = [1.6, 2.4, 2.8, 4.0];
 
 const TERRAIN_VERTEX: &str = r#"
 override TEST_TIER: u32 = 0u;
@@ -52,6 +55,28 @@ override TEST_OVERLAY: u32 = 0u;
 }
 "#;
 
+/// A quad the entity stage lights as an entity (kind 0), unshaded, at full light.
+const ENTITY_STAGE_VERTEX: &str = r#"
+override TEST_TIER: u32 = 0u;
+override TEST_OVERLAY: u32 = 0u;
+override test_layer_alpha: f32 = 1.0;
+@vertex fn test_vertex(@builtin(vertex_index) i: u32) -> horizon_entity_out {
+    let p = vec2(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: horizon_entity_out;
+    o.clip = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = vec2(0.5);
+    o.color = vec4(1.0, 1.0, 1.0, test_layer_alpha);
+    o.back_color = vec4(1.0, 1.0, 0.0, 0.0);
+    o.light_color = vec4(240.0, 240.0, 0.0, 0.0);
+    o.overlay_color = vec4(1.0);
+    o.overlay = TEST_OVERLAY;
+    o.wrap = vec2(0.0, 1.0);
+    o.glint_uv = vec2(0.5);
+    o.flags = (1u << 3u) | (TEST_TIER << 8u);
+    return o;
+}
+"#;
+
 const TERRAIN_EXTRA_VERTICES: &str = r#"
 @vertex fn test_model(@builtin(vertex_index) i: u32) -> NativeModelOut {
     let p = vec2(f32((i << 1u) & 2u), f32(i & 2u));
@@ -88,16 +113,14 @@ struct Draw<'a> {
     material_frame: Option<super::super::native_post::NativeFrame>,
     /// More pipeline constants, for the material wrappers' own.
     constants: Vec<(&'static str, f64)>,
-    uniform: wgpu::Buffer,
     pipelines: RefCell<HashMap<PipelineKey, wgpu::RenderPipeline>>,
 }
-/// Everything that changes a pipeline built by `Draw::render`: the entry point
-/// and its mark pass, the override constants, and the draw's own flags. The
+/// Everything that changes a pipeline built by `Draw::render`: the entry point,
+/// the override constants, and the draw's own flags. The
 /// shader and layout only change in `material`, which empties the cache.
 #[derive(PartialEq, Eq, Hash)]
 struct PipelineKey {
     entry: String,
-    mark: bool,
     written: bool,
     tier: u32,
     overlay: u32,
@@ -368,15 +391,16 @@ impl<'a> Draw<'a> {
         globals: &super::super::Globals,
         alpha: u8,
     ) -> Self {
-        Self::with_lightmap(device, queue, terrain, globals, alpha, 255)
+        Self::with_lightmap(device, queue, terrain, globals, [200, 100, 50], alpha, 255)
     }
-    /// `new` with the terrain's lightmap at `full` in every channel at full light (sky 15,
-    /// block 15), where `new` has white. Every other light level is black.
+    /// `new` with the sprite's `texel`, and the terrain's lightmap at `full` in every channel at
+    /// full light (sky 15, block 15), where `new` has white. Every other light level is black.
     fn with_lightmap(
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
         terrain: bool,
         globals: &super::super::Globals,
+        [r, g, b]: [u8; 3],
         alpha: u8,
         full: u8,
     ) -> Self {
@@ -457,12 +481,12 @@ impl<'a> Draw<'a> {
                 data,
             )
         };
-        let array = texture(2, &[200, 100, 50, alpha, 240, 210, 80, 128]);
+        let array = texture(2, &[r, g, b, alpha, 240, 210, 80, 128]);
         let array = array.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let image = texture(1, &[200, 100, 50, alpha]).create_view(&Default::default());
+        let image = texture(1, &[r, g, b, alpha]).create_view(&Default::default());
         let threshold = texture(1, &[0, 0, 0, 0]).create_view(&Default::default());
         let mut levels = [0u8; 16 * 16 * 4];
         levels[16 * 16 * 4 - 4..].copy_from_slice(&[full, full, full, 255]);
@@ -524,23 +548,27 @@ impl<'a> Draw<'a> {
             hdr_lighting: true,
             material_frame: None,
             constants: Vec::new(),
-            uniform,
             pipelines: RefCell::default(),
         }
     }
 
-    /// Replaces the globals without rebuilding the shader, bindings or pipelines.
-    fn set_globals(&self, globals: &super::super::Globals) {
-        self.queue
-            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(globals));
+    fn material(&mut self) {
+        self.pack_stage(super::super::native_material::coverage_test_shader(false));
     }
-
-    fn material(&mut self, api: horizon_shader_api::Api) {
-        let source = super::super::native_material::coverage_test_shader((api, false));
+    /// The entity stage's wrapper around a pack's `entity` that returns alpha `test_alpha`,
+    /// lighting a quad as an entity with the vertex alpha `test_layer_alpha` (the layer's
+    /// opacity).
+    fn entity_stage(&mut self) {
+        let entity = "override test_alpha: f32 = 0.7;\n\
+            fn entity(input: EntityInput) -> Surface { return Surface(vec4(1.4, 0.3, 0.1, test_alpha)); }\n";
+        self.pack_stage(super::super::native_entity::tests::shader(entity) + ENTITY_STAGE_VERTEX);
+    }
+    /// Draws through the pack wrapper `source` with the pack's frame, as the pack runs.
+    fn pack_stage(&mut self, source: String) {
         self.shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("actual assembled material wrappers"),
+                label: Some("actual assembled pack wrappers"),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
         let frame = super::super::native_post::NativeFrame::new(
@@ -549,7 +577,7 @@ impl<'a> Draw<'a> {
             Vec::new(),
             Default::default(),
             None,
-            (api, false),
+            false,
         );
         self.queue.write_buffer(
             &frame.buffer,
@@ -569,7 +597,6 @@ impl<'a> Draw<'a> {
     }
     fn render(
         &self,
-        hdr: &mut Hdr,
         written: bool,
         entry: &str,
         tier: u32,
@@ -578,10 +605,10 @@ impl<'a> Draw<'a> {
     ) -> [f32; 4] {
         let mut constants = vec![
             (
-                if self.material_frame.is_some() {
-                    "horizon_terrain_HDR_WRITE_LIGHT"
-                } else {
-                    "HDR_WRITE_LIGHT"
+                match (self.material_frame.is_some(), self.terrain) {
+                    (true, true) => "horizon_terrain_HDR_WRITE_LIGHT",
+                    (true, false) => "horizon_vanilla_HDR_WRITE_LIGHT",
+                    (false, _) => "HDR_WRITE_LIGHT",
                 },
                 f64::from(u8::from(written)),
             ),
@@ -599,7 +626,7 @@ impl<'a> Draw<'a> {
                 f64::from(u8::from(self.hdr_lighting)),
             ));
         }
-        if self.material_frame.is_some() {
+        if self.material_frame.is_some() && self.terrain {
             constants.push((
                 "horizon_displace_distance",
                 if entry == "horizon_material_fs_displaced" {
@@ -616,13 +643,26 @@ impl<'a> Draw<'a> {
             "fs_native_fluid" => "test_fluid",
             _ => "test_vertex",
         };
-        let format = if !written && !self.raw {
-            F::Rgba16Unorm
-        } else {
-            F::Rgba16Float
+        let format = F::Rgba16Float;
+        let key = PipelineKey {
+            entry: entry.to_owned(),
+            written,
+            tier,
+            overlay,
+            terrain: self.terrain,
+            raw: self.raw,
+            hdr_lighting: self.hdr_lighting,
+            material: self.material_frame.is_some(),
+            constants: self
+                .constants
+                .iter()
+                .map(|&(name, value)| (name, value.to_bits()))
+                .collect(),
         };
-        let build = |entry: &str, mark: bool| {
-            self.device
+        let cached = self.pipelines.borrow().get(&key).cloned();
+        let pipeline = cached.unwrap_or_else(|| {
+            let built = self
+                .device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: None,
                     layout: Some(&self.layout),
@@ -648,57 +688,20 @@ impl<'a> Draw<'a> {
                         targets: &[Some(wgpu::ColorTargetState {
                             format,
                             blend: Some(
-                                if self.raw || mark || (self.terrain && entry != "fs_translucent") {
+                                if self.raw || (self.terrain && entry != "fs_translucent") {
                                     wgpu::BlendState::REPLACE
                                 } else {
                                     wgpu::BlendState::ALPHA_BLENDING
                                 },
                             ),
-                            write_mask: if mark {
-                                wgpu::ColorWrites::ALPHA
-                            } else {
-                                wgpu::ColorWrites::ALL
-                            },
+                            write_mask: wgpu::ColorWrites::ALL,
                         })],
                     }),
                     multiview_mask: None,
                     cache: None,
-                })
-        };
-        let pipeline = |fragment: &str, mark: bool| {
-            let key = PipelineKey {
-                entry: entry.to_owned(),
-                mark,
-                written,
-                tier,
-                overlay,
-                terrain: self.terrain,
-                raw: self.raw,
-                hdr_lighting: self.hdr_lighting,
-                material: self.material_frame.is_some(),
-                constants: self
-                    .constants
-                    .iter()
-                    .map(|&(name, value)| (name, value.to_bits()))
-                    .collect(),
-            };
-            if let Some(cached) = self.pipelines.borrow().get(&key) {
-                return cached.clone();
-            }
-            let built = build(fragment, mark);
+                });
             self.pipelines.borrow_mut().insert(key, built.clone());
             built
-        };
-        let color = pipeline(entry, false);
-        let mark = (!self.raw && !self.terrain && !written && entry == "fs_entity").then(|| {
-            pipeline(
-                if overlay == 4 {
-                    "fs_hdr_cloud_mark"
-                } else {
-                    "fs_hdr_mark"
-                },
-                true,
-            )
         });
         let frame = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -736,17 +739,8 @@ impl<'a> Draw<'a> {
             if let Some(frame) = &self.material_frame {
                 pass.set_bind_group(3, &frame.group, &[]);
             }
-            pass.set_pipeline(&color);
+            pass.set_pipeline(&pipeline);
             pass.draw(0..3, 0..1);
-            if let Some(mark) = &mark {
-                pass.set_pipeline(mark);
-                pass.draw(0..3, 0..1);
-            }
-        }
-        if !written && !self.raw {
-            let light = hdr.frame(self.device, [1, 1]);
-            legacy_light(self.device, &mut encoder, writers_lift(hdr), &frame, &light);
-            return texel(self.device, self.queue, encoder, &light);
         }
         texel(self.device, self.queue, encoder, &frame)
     }
@@ -754,12 +748,13 @@ impl<'a> Draw<'a> {
 
 #[test]
 fn float_plain_fragments_keep_rgb_and_write_only_coverage() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some((device, queue)) = gpu() else {
         eprintln!("plain float GPU unavailable");
         return;
     };
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    let (settings, gains) = hdr.draw_params(true);
+    let hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+    let settings = hdr.draw_params(true);
     let mut cases = 0;
     for hdr_on in [false, true] {
         let globals = super::super::Globals {
@@ -771,10 +766,8 @@ fn float_plain_fragments_keep_rgb_and_write_only_coverage() {
             fog_ends: [100.0, 100.0, 0.0, 0.0],
             misc: [0.0, 1.0, 0.0, 0.0],
             filtering: [0.0, 1.0, 0.0, 0.0],
-            hdr_windows: hdr.windows(),
             hdr_light: [0.0, 0.0, f32::from(u8::from(hdr_on)), 0.0],
             hdr_settings: settings,
-            hdr_gains: gains,
             ..bytemuck::Zeroable::zeroed()
         };
         for terrain in [true, false] {
@@ -821,8 +814,8 @@ fn float_plain_fragments_keep_rgb_and_write_only_coverage() {
                         } else {
                             vec![0, 6]
                         } {
-                            let old = draw.render(&mut hdr, false, entry, tier, overlay, [0.0; 4]);
-                            let float = draw.render(&mut hdr, true, entry, tier, overlay, [0.0; 4]);
+                            let old = draw.render(false, entry, tier, overlay, [0.0; 4]);
+                            let float = draw.render(true, entry, tier, overlay, [0.0; 4]);
                             assert_eq!(
                                 &float[..3],
                                 &old[..3],
@@ -847,14 +840,47 @@ fn float_plain_fragments_keep_rgb_and_write_only_coverage() {
 }
 
 #[test]
+fn native_model_and_fluid_store_linear_light_and_keep_coverage() {
+    let _gpu = crate::gfx::test_gpu::lock();
+    let Some(adapter) = crate::gfx::test_gpu::adapter() else {
+        return;
+    };
+    let (device, queue) = crate::gfx::test_gpu::device(&adapter);
+    let globals = super::super::Globals {
+        fog_color: [0.2, 0.3, 0.4, 1.0],
+        fog: [0.0, 100.0, 0.0, 100.0],
+        filtering: [0.0, 1.0, 0.0, 0.0],
+        ..bytemuck::Zeroable::zeroed()
+    };
+    let mut draw = Draw::new(&device, &queue, true, &globals, 180);
+    draw.raw = true;
+    for (entry, coverage) in [("fs_native_model", 1.0), ("fs_native_fluid", 180.0 / 255.0)] {
+        draw.constants.clear();
+        let gamma = draw.render(true, entry, 0, 0, [0.0; 4]);
+        draw.constants.push(("FRAME_LINEAR", 1.0));
+        let linear = draw.render(true, entry, 0, 0, [0.0; 4]);
+        for channel in 0..3 {
+            let expected = gamma[channel].powf(2.2);
+            assert!(
+                (linear[channel] - expected).abs() < 0.001,
+                "{entry}: gamma {gamma:?}, linear {linear:?}"
+            );
+        }
+        assert!((gamma[3] - coverage).abs() < 0.001, "{entry}: {gamma:?}");
+        assert!((linear[3] - coverage).abs() < 0.001, "{entry}: {linear:?}");
+    }
+}
+
+#[test]
 fn float_stars_keep_the_original_rgb_with_brightness_as_coverage() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some((device, queue)) = gpu() else {
         return;
     };
     let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    let (settings, gains) = hdr.draw_params(true);
+    let settings = hdr.draw_params(true);
     // Frozen f030d9c80 fragment: the original written branch and its marked fallback.
-    let source = include_str!("../hdr_light.wgsl").to_owned()
+    let source = super::super::wgsl_prefix::HDR_LIGHT.to_owned()
         + include_str!("stars.wgsl")
         + r#"
 @vertex fn fixture(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -863,7 +889,7 @@ fn float_stars_keep_the_original_rgb_with_brightness_as_coverage() {
 @fragment fn reference() -> @location(0) vec4<f32> {
     let b = stars.color.a;
     if HDR_WRITE_LIGHT && stars.hdr_light.w != 0.0 {
-        return vec4(hdr_written(stars.color.rgb * b, 0.175, stars.hdr_settings, stars.hdr_gains), b);
+        return vec4(hdr_written(stars.color.rgb * b, 0.175, stars.hdr_settings), b);
     }
     return vec4(stars.color.rgb * b, 0.175);
 }
@@ -873,11 +899,10 @@ fn float_stars_keep_the_original_rgb_with_brightness_as_coverage() {
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
     for gain in [0.0, 1.0] {
-        let mut data = [0.0_f32; 32];
+        let mut data = [0.0_f32; 28];
         data[16..20].copy_from_slice(&[0.7, 0.8, 0.9, 0.35]);
         data[20..24].copy_from_slice(&settings);
-        data[24..28].copy_from_slice(&gains);
-        data[31] = gain;
+        data[27] = gain;
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&data),
@@ -969,57 +994,47 @@ fn material_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
 
 #[test]
 fn float_material_wrappers_keep_rgb_and_coverage_including_displacement() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some((device, queue)) = material_gpu() else {
         return;
     };
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
     let globals = super::super::Globals {
         filtering: [0.0, 1.0, 0.0, 0.0],
-        hdr_windows: hdr.windows(),
         ..bytemuck::Zeroable::zeroed()
     };
-    for api in [horizon_shader_api::Api::V0_1, horizon_shader_api::Api::V0_2] {
-        let mut draw = Draw::new(&device, &queue, true, &globals, 255);
-        draw.material(api);
-        for entry in [
-            "horizon_material_fs_solid",
-            "horizon_material_fs_displaced",
-            "horizon_material_fs_translucent",
-        ] {
-            let old = draw.render(&mut hdr, false, entry, 3, 0, [0.0; 4]);
-            let float = draw.render(&mut hdr, true, entry, 3, 0, [0.0; 4]);
-            assert_eq!(&float[..3], &old[..3], "{api} {entry}");
-            let alpha = if entry.ends_with("translucent") {
-                0.7
-            } else {
-                1.0
-            };
-            assert!((float[3] - alpha).abs() < 0.001, "{api} {entry}: {float:?}");
-            assert!(
-                float[0] > 1.0,
-                "{api} {entry}: clipping or an empty fixture: {float:?}"
-            );
-            if alpha == 1.0 {
-                assert_ne!(
-                    old[3], float[3],
-                    "the legacy source mark must distinguish the paths"
-                );
-            }
-        }
+    let mut draw = Draw::new(&device, &queue, true, &globals, 255);
+    draw.material();
+    for entry in [
+        "horizon_material_fs_solid",
+        "horizon_material_fs_displaced",
+        "horizon_material_fs_translucent",
+    ] {
+        let old = draw.render(false, entry, 3, 0, [0.0; 4]);
+        let float = draw.render(true, entry, 3, 0, [0.0; 4]);
+        assert_eq!(&float[..3], &old[..3], "{entry}");
+        let alpha = if entry.ends_with("translucent") {
+            0.7
+        } else {
+            1.0
+        };
+        assert!((float[3] - alpha).abs() < 0.001, "{entry}: {float:?}");
+        assert!(
+            float[0] > 1.0,
+            "{entry}: clipping or an empty fixture: {float:?}"
+        );
     }
-    eprintln!("material GPU ran both API lines through solid, displaced and translucent wrappers");
+    eprintln!("material GPU ran the solid, displaced and translucent wrappers");
 }
 
 #[test]
 fn material_coverage_is_the_texture_s_unless_the_pack_declares_its_own() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some((device, queue)) = material_gpu() else {
         eprintln!("material coverage GPU unavailable");
         return;
     };
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
     let globals = super::super::Globals {
         filtering: [0.0, 1.0, 0.0, 0.0],
-        hdr_windows: hdr.windows(),
         ..bytemuck::Zeroable::zeroed()
     };
     let background = [0.0, 0.0, 0.25, 0.5];
@@ -1035,7 +1050,7 @@ fn material_coverage_is_the_texture_s_unless_the_pack_declares_its_own() {
         (true, 255, 0.7, true, true),
     ] {
         let mut draw = Draw::new(&device, &queue, true, &globals, texel);
-        draw.material(horizon_shader_api::Api::V0_2);
+        draw.material();
         draw.constants = vec![
             ("horizon_material_coverage_pack", f64::from(u8::from(pack))),
             ("test_alpha", returned),
@@ -1045,7 +1060,7 @@ fn material_coverage_is_the_texture_s_unless_the_pack_declares_its_own() {
             ("horizon_material_fs_solid", solid),
             ("horizon_material_fs_translucent", translucent),
         ] {
-            let got = draw.render(&mut hdr, true, entry, 0, 0, background);
+            let got = draw.render(true, entry, 0, 0, background);
             if !drawn {
                 assert_eq!(got, background.map(|c| c as f32), "{case} {entry}");
                 continue;
@@ -1063,104 +1078,75 @@ fn material_coverage_is_the_texture_s_unless_the_pack_declares_its_own() {
 }
 
 #[test]
-fn actual_opaque_writers_match_the_legacy_non_float_oracle() {
-    let Some((device, queue)) = gpu() else {
-        eprintln!("HDR draw GPU unavailable");
+fn entity_coverage_is_the_texture_s_and_the_layer_s_unless_the_pack_declares_its_own() {
+    let _gpu = crate::gfx::test_gpu::lock();
+    let Some((device, queue)) = material_gpu() else {
+        eprintln!("entity coverage GPU unavailable");
         return;
     };
-    if !device.features().contains(
-        wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-    ) {
-        eprintln!("opaque oracle GPU skipped: 16-bit UNORM unavailable");
-        return;
-    }
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    (hdr.paper_white, hdr.peak) = (203.0, 1000.0);
-    let (settings, gains) = hdr.draw_params(true);
-    let windows = hdr.windows();
-    let globals = |fog: f32, visibility: f32| super::super::Globals {
-        fog_color: [0.2, 0.3, 0.4, 1.0],
-        fog: [0.0, 1.0, 0.0, 1.0],
-        fog_ends: [100.0, 100.0, 0.0, 0.0],
-        misc: [fog, visibility, 0.0, 0.0],
+    let globals = super::super::Globals {
         filtering: [0.0, 1.0, 0.0, 0.0],
-        hdr_windows: windows,
-        hdr_light: [0.0, 0.0, 1.0, 1.0],
-        hdr_settings: settings,
-        hdr_gains: gains,
         ..bytemuck::Zeroable::zeroed()
     };
-    // Fog and visibility only change the globals uniform, so each draw and its
-    // pipelines are built once and the uniform is rewritten per pair.
-    let draws = [true, false].map(|terrain| {
-        (
-            terrain,
-            Draw::new(&device, &queue, terrain, &globals(0.0, 1.0), 255),
-        )
-    });
-    let mut count = 0;
-    for fog in [0.0, 0.5, 1.0] {
-        for visibility in [1.0, 0.4] {
-            for (terrain, draw) in &draws {
-                let terrain = *terrain;
-                draw.set_globals(&globals(fog, visibility));
-                for tier in 0..=4 {
-                    for overlay in if terrain {
-                        vec![0, 1]
-                    } else {
-                        vec![0, 6, 9, 10, 38]
-                    } {
-                        let entries = if terrain {
-                            vec!["fs_opaque", "fs_solid"]
-                        } else {
-                            vec!["fs_entity"]
-                        };
-                        for entry in entries {
-                            let marked =
-                                draw.render(&mut hdr, false, entry, tier, overlay, [0.0; 4]);
-                            let written =
-                                draw.render(&mut hdr, true, entry, tier, overlay, [0.0; 4]);
-                            // The oracle stores UNORM before conversion; the direct writer
-                            // stores half floats after it. Allow two half-float ULPs in gamma light.
-                            for i in 0..3 {
-                                assert!(
-                                    (marked[i] - written[i]).abs() <= 0.002 * marked[i].max(1.0),
-                                    "{terrain} {entry} tier {tier} overlay {overlay} fog {fog} visibility {visibility}: {marked:?} {written:?}"
-                                );
-                            }
-                            assert_eq!(written[3], 1.0);
-                            count += 1;
-                        }
-                    }
-                }
-            }
-        }
+    let background = [0.0, 0.0, 0.25, 0.5];
+    // (coverage = "pack", overlay, the texel's alpha, the vertex alpha, the alpha `entity`
+    // returns, the alpha drawn or None): under "engine" the texture's alpha times the layer's
+    // opacity is cut below 0.1 and blends, as Horizon's own entities; a dissolve mask (overlay
+    // 38, the texel's alpha here) cuts where the vertex alpha is below it and draws the rest
+    // at the texture's alpha. Under "pack" the returned alpha does both.
+    let half = 128.0 / 255.0;
+    for (pack, overlay, texel, layer, returned, drawn) in [
+        (false, 0, 255, 1.0, 0.0, Some(1.0)),
+        (false, 0, 255, 0.5, 1.0, Some(0.5)),
+        (false, 0, 0, 1.0, 1.0, None),
+        (false, 0, 255, 0.05, 1.0, None),
+        (false, 38, 128, 0.6, 0.0, Some(half)),
+        (false, 38, 128, 0.4, 1.0, None),
+        (true, 0, 255, 1.0, 0.0, None),
+        (true, 0, 0, 1.0, 0.7, Some(0.7)),
+        (true, 0, 255, 0.5, 0.7, Some(0.7)),
+        (true, 38, 128, 0.4, 1.0, None),
+    ] {
+        let mut draw = Draw::new(&device, &queue, false, &globals, texel);
+        draw.entity_stage();
+        draw.constants = vec![
+            ("horizon_entity_coverage_pack", f64::from(u8::from(pack))),
+            ("test_alpha", returned),
+            ("test_layer_alpha", layer),
+        ];
+        let case = format!(
+            "pack {pack}, overlay {overlay}, texel alpha {texel}, layer {layer}, returned {returned}"
+        );
+        let got = draw.render(true, "horizon_entity_fs", 0, overlay, background);
+        let Some(alpha) = drawn else {
+            assert_eq!(got, background.map(|c| c as f32), "{case}");
+            continue;
+        };
+        assert!(got[0] > 1.0, "{case}: not drawn: {got:?}");
+        // The test pipeline replaces: the alpha written is what the blend would weigh by.
+        assert!((got[3] - alpha).abs() < 0.001, "{case}: {got:?}");
     }
-    eprintln!("HDR actual draw GPU ran {count} opaque comparisons");
 }
 
 #[test]
 fn actual_translucent_writers_blend_their_own_light() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some((device, queue)) = gpu() else {
         eprintln!("HDR blend GPU unavailable");
         return;
     };
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    let (settings, gains) = hdr.draw_params(true);
+    let hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+    let settings = hdr.draw_params(true);
     let globals = super::super::Globals {
         fog: [0.0, 100.0, 0.0, 100.0],
         fog_ends: [100.0, 100.0, 0.0, 0.0],
         misc: [0.0, 1.0, 0.0, 0.0],
         filtering: [0.0, 1.0, 0.0, 0.0],
-        hdr_windows: hdr.windows(),
         hdr_light: [0.0, 0.0, 1.0, 1.0],
         hdr_settings: settings,
-        hdr_gains: gains,
         ..bytemuck::Zeroable::zeroed()
     };
-    // Texel alpha 100 is clear glass's kind of texel, below the 0.6 the marked frame's
-    // `fs_translucent_mark` skips: written, it still gets its own light.
+    // Texel alpha 100 is clear glass's kind of texel: it gets its own light too.
     for (terrain, entry, overlay, tier, tint_alpha, texel_alpha) in [
         (true, "fs_translucent", 0, 0, 1.0, 180),
         (true, "fs_translucent", 0, 0, 0.5, 180),
@@ -1171,9 +1157,9 @@ fn actual_translucent_writers_blend_their_own_light() {
         let mut globals = globals;
         globals.misc[2] = if tint_alpha < 1.0 { 1.0 } else { 0.0 };
         let draw = Draw::new(&device, &queue, terrain, &globals, texel_alpha);
-        let src = draw.render(&mut hdr, true, entry, tier, overlay, [0.0; 4]);
+        let src = draw.render(true, entry, tier, overlay, [0.0; 4]);
         let dst = [2.5, 1.8, 0.9, 1.0];
-        let got = draw.render(&mut hdr, true, entry, tier, overlay, dst);
+        let got = draw.render(true, entry, tier, overlay, dst);
         let alpha = f32::from(texel_alpha) / 255.0 * tint_alpha;
         assert!(
             (src[3] - alpha).abs() < 0.001,
@@ -1201,24 +1187,17 @@ fn actual_translucent_writers_blend_their_own_light() {
 }
 
 /// HDR Lighting lifts light sources and the sun, not what they light: under full block and sky
-/// light, the sun straight on the face, a surface writes the light of its colour as drawn, on the
-/// float frame and through the compatibility frame's marks alike; a light source's tier still
-/// gains.
+/// light, the sun straight on the face, a surface writes the light of its colour as drawn; a
+/// light source's tier still gains.
 #[test]
 fn lit_surfaces_stay_at_their_sdr_light() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some((device, queue)) = gpu() else {
         eprintln!("HDR lit surface GPU unavailable");
         return;
     };
-    if !device.features().contains(
-        wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-    ) {
-        eprintln!("lit surface GPU skipped: 16-bit UNORM unavailable");
-        return;
-    }
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    let (settings, gains) = hdr.draw_params(true);
+    let hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+    let settings = hdr.draw_params(true);
     let globals = super::super::Globals {
         fog: [0.0, 100.0, 0.0, 100.0],
         fog_ends: [100.0, 100.0, 0.0, 0.0],
@@ -1227,10 +1206,8 @@ fn lit_surfaces_stay_at_their_sdr_light() {
         // The test face lies flat (`TERRAIN_VERTEX`, at light level 15): a noon sun meets it
         // straight on.
         sun: [0.0, 1.0, 0.0, 0.0],
-        hdr_windows: hdr.windows(),
         hdr_light: [0.0, 0.0, 1.0, 1.0],
         hdr_settings: settings,
-        hdr_gains: gains,
         ..bytemuck::Zeroable::zeroed()
     };
     // The texel (200, 100, 50) times the test vertex's colour, and an entity's light, in gamma.
@@ -1248,21 +1225,19 @@ fn lit_surfaces_stay_at_their_sdr_light() {
         (false, "fs_entity", 0, entity),
     ] {
         let draw = Draw::new(&device, &queue, is_terrain, &globals, 255);
-        for written in [true, false] {
-            let got = draw.render(&mut hdr, written, entry, 0, overlay, [0.0; 4]);
-            for i in 0..3 {
-                assert!(
-                    (got[i] - colour[i]).abs() < 0.002,
-                    "{entry} written {written}: {got:?}, drawn {colour:?}"
-                );
-            }
+        let got = draw.render(true, entry, 0, overlay, [0.0; 4]);
+        for i in 0..3 {
+            assert!(
+                (got[i] - colour[i]).abs() < 0.002,
+                "{entry}: {got:?}, drawn {colour:?}"
+            );
         }
     }
     // The very bright tier all over (emission 8), bright enough to be fully lifted: its gain.
     let draw = Draw::new(&device, &queue, true, &globals, 255);
-    let lifted = draw.render(&mut hdr, true, "fs_opaque", 8, 0, [0.0; 4]);
+    let lifted = draw.render(true, "fs_opaque", 8, 0, [0.0; 4]);
     for i in 0..3 {
-        let want = terrain[i] * gains[3].powf(1.0 / 2.2);
+        let want = terrain[i] * GAINS[3].powf(1.0 / 2.2);
         assert!(
             (lifted[i] - want).abs() < 0.003,
             "{lifted:?}: expected {want}"
@@ -1283,20 +1258,29 @@ fn a_lifted_texel_shines_the_same_on_every_face() {
         eprintln!("HDR face shading GPU unavailable");
         return;
     };
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    let (settings, gains) = hdr.draw_params(true);
-    let tiers = hdr.windows();
-    // The test texel's brightness before lighting (terrain.wgsl `brightness`), 0.40: past every
-    // tier's window. And its lift in a window from 0.3 to 0.5, about half.
-    let light = [200.0f32, 100.0, 50.0].map(|c| (c / 255.0).powf(2.2));
-    let y = 0.5 * (0.2126 * light[0] + 0.7152 * light[1] + 0.0722 * light[2] + light[0]);
-    let t = (y - 0.3) / 0.2;
-    let half_lift = t * t * (3.0 - 2.0 * t);
+    let hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+    let settings = hdr.draw_params(true);
+    // The test texels, by their brightness before lighting (hdr_look.wgsl `brightness`): one
+    // past every tier's window (0.40) and one before them all (0.03).
+    const FULL: [u8; 3] = [200, 100, 50];
+    const DIM: [u8; 3] = [60, 40, 20];
+    // And one about halfway through the tier's window, the low tier's (0.08 to 0.09) or the
+    // others' (0.14 to 0.38), with its lift.
+    let half = |emission: u32| {
+        let (texel, start, full) = if matches!(emission, 1 | 5) {
+            ([96u8, 58, 30], 0.08, 0.09)
+        } else {
+            ([170, 85, 40], 0.14, 0.38)
+        };
+        let light = texel.map(|c| (f32::from(c) / 255.0).powf(2.2));
+        let y = 0.5 * (0.2126 * light[0] + 0.7152 * light[1] + 0.0722 * light[2] + light[0]);
+        let t = (y - start) / (full - start);
+        (texel, t * t * (3.0 - 2.0 * t))
+    };
     // `own`: the vertex colour before `shade`, where a is above 0. `full`: the lightmap at full
     // light.
-    let lit = |hdr: &mut Hdr,
-               settings: [f32; 4],
-               windows: [[f32; 4]; 2],
+    let lit = |settings: [f32; 4],
+               texel: [u8; 3],
                shade: f32,
                emission: u32,
                entry: &str,
@@ -1307,34 +1291,28 @@ fn a_lifted_texel_shines_the_same_on_every_face() {
             fog_ends: [100.0, 100.0, 0.0, 0.0],
             misc: [0.0, 1.0, 0.0, shade],
             filtering: [0.0, 1.0, 0.0, 0.0],
-            hdr_windows: windows,
             hdr_light: [0.0, 0.0, 1.0, 1.0],
             hdr_settings: settings,
-            hdr_gains: gains,
             ..bytemuck::Zeroable::zeroed()
         };
         globals.colored_lights[0][0] = own;
-        let draw = Draw::with_lightmap(&device, &queue, true, &globals, 255, full);
-        draw.render(hdr, true, entry, emission, 0, [0.0; 4])
+        let draw = Draw::with_lightmap(&device, &queue, true, &globals, texel, 255, full);
+        draw.render(true, entry, emission, 0, [0.0; 4])
     };
-    let draw = |hdr: &mut Hdr, settings, windows, shade, emission, entry: &str| {
-        lit(
-            hdr, settings, windows, shade, emission, entry, [0.0; 4], 255,
-        )
+    let draw = |settings, texel, shade, emission, entry: &str| {
+        lit(settings, texel, shade, emission, entry, [0.0; 4], 255)
     };
-    let face = |hdr: &mut Hdr, windows, shade, emission, entry: &str| {
-        draw(hdr, settings, windows, shade, emission, entry)
-    };
+    let face = |texel, shade, emission, entry: &str| draw(settings, texel, shade, emission, entry);
     let texel = [200.0 / 255.0 * 0.8, 100.0 / 255.0, 50.0 / 255.0 * 0.7];
     let near = |a: f32, b: f32| (a - b).abs() < 0.003 * b.max(1.0);
     let shades = [0.8, 0.6, 0.5, 0.2];
     for entry in ["fs_opaque", "fs_solid"] {
         // Each tier, by its bright parts (1 to 4) and all over (5 to 8).
         for emission in 1..=8 {
-            let gain = gains[(emission as usize - 1) % 4].powf(1.0 / 2.2);
-            let top = face(&mut hdr, tiers, 1.0, emission, entry);
+            let gain = GAINS[(emission as usize - 1) % 4].powf(1.0 / 2.2);
+            let top = face(FULL, 1.0, emission, entry);
             for shade in shades {
-                let side = face(&mut hdr, tiers, shade, emission, entry);
+                let side = face(FULL, shade, emission, entry);
                 for i in 0..3 {
                     // The mark's 8 bits take up to 1% of a lift (`hdr_quantized_mark`).
                     assert!(
@@ -1343,20 +1321,18 @@ fn a_lifted_texel_shines_the_same_on_every_face() {
                     );
                 }
             }
-            // The tier's window around the texel's brightness: about half lifted, so it keeps
-            // about half its shading.
-            let half = [[0.3; 4], [0.5; 4]];
-            // And past it: not lifted, so shaded as any surface.
-            let none = [[0.9; 4], [0.95; 4]];
+            // A texel halfway through the tier's window: about half lifted, so it keeps about
+            // half its shading. And one before it: not lifted, so shaded as any surface.
+            let (half, half_lift) = half(emission);
             for shade in shades {
                 let (lit, unlit) = (
-                    face(&mut hdr, half, shade, emission, entry),
-                    face(&mut hdr, half, 1.0, emission, entry),
+                    face(half, shade, emission, entry),
+                    face(half, 1.0, emission, entry),
                 );
                 let want = shade + (1.0 - shade) * half_lift;
                 let (dark, bright) = (
-                    face(&mut hdr, none, shade, emission, entry),
-                    face(&mut hdr, none, 1.0, emission, entry),
+                    face(DIM, shade, emission, entry),
+                    face(DIM, 1.0, emission, entry),
                 );
                 for i in 0..3 {
                     assert!(
@@ -1372,13 +1348,10 @@ fn a_lifted_texel_shines_the_same_on_every_face() {
         // texel is drawn exactly as with any lightmap, since its shade is all it has.
         let dim = 77;
         let dimmed = f32::from(dim) / 255.0;
-        let none = [[0.9; 4], [0.95; 4]];
         for emission in [2, 7] {
-            let top = face(&mut hdr, tiers, 1.0, emission, entry);
+            let top = face(FULL, 1.0, emission, entry);
             for shade in [dimmed, 0.5 * dimmed, 0.2 * dimmed] {
-                let lifted = lit(
-                    &mut hdr, settings, tiers, shade, emission, entry, [0.0; 4], dim,
-                );
+                let lifted = lit(settings, FULL, shade, emission, entry, [0.0; 4], dim);
                 for i in 0..3 {
                     assert!(
                         near(lifted[i], top[i] * dimmed),
@@ -1386,33 +1359,28 @@ fn a_lifted_texel_shines_the_same_on_every_face() {
                     );
                 }
                 assert_eq!(
-                    lit(
-                        &mut hdr, settings, none, shade, emission, entry, [0.0; 4], dim
-                    ),
-                    face(&mut hdr, none, shade, emission, entry),
+                    lit(settings, DIM, shade, emission, entry, [0.0; 4], dim),
+                    face(DIM, shade, emission, entry),
                     "{entry} emission {emission} shade {shade}, dimmed and unlifted"
                 );
             }
             // A shade brighter than the lightmap at full light (a coloured light adds past
             // it): lifting doesn't darken it.
             assert_eq!(
-                lit(
-                    &mut hdr, settings, tiers, 0.5, emission, entry, [0.0; 4], dim
-                ),
-                lit(&mut hdr, settings, tiers, 0.5, emission, entry, [0.0; 4], 0),
+                lit(settings, FULL, 0.5, emission, entry, [0.0; 4], dim),
+                lit(settings, FULL, 0.5, emission, entry, [0.0; 4], 0),
                 "{entry} emission {emission}: a shade above the dimmed lightmap"
             );
         }
         // A coloured shade: its brightest channel goes to 1 and the others keep their ratio to
         // it, at any shade. One without blue stays without it, and all are finite.
-        let gain = gains[2].powf(1.0 / 2.2);
+        let gain = GAINS[2].powf(1.0 / 2.2);
         for own in [[0.9f32, 0.6, 0.3], [0.5, 0.25, 0.0], [0.0, 0.0, 0.0]] {
             let brightest = own[0].max(1e-4);
             for shade in [1.0, 0.5] {
                 let lifted = lit(
-                    &mut hdr,
                     settings,
-                    tiers,
+                    FULL,
                     shade,
                     3,
                     entry,
@@ -1436,14 +1404,14 @@ fn a_lifted_texel_shines_the_same_on_every_face() {
         for shade in shades {
             for emission in [3, 8] {
                 assert_eq!(
-                    draw(&mut hdr, unlit, tiers, shade, emission, entry),
-                    draw(&mut hdr, unlit, tiers, shade, 0, entry),
+                    draw(unlit, FULL, shade, emission, entry),
+                    draw(unlit, FULL, shade, 0, entry),
                     "{entry} emission {emission} shade {shade}, HDR Lighting off"
                 );
             }
         }
         for shade in shades {
-            let surface = face(&mut hdr, tiers, shade, 0, entry);
+            let surface = face(FULL, shade, 0, entry);
             for i in 0..3 {
                 assert!(
                     near(surface[i], texel[i] * shade),
@@ -1456,28 +1424,26 @@ fn a_lifted_texel_shines_the_same_on_every_face() {
 
 #[test]
 fn unmarked_entity_users_keep_their_source_gain() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some((device, queue)) = gpu() else {
         return;
     };
-    if !device.features().contains(
-        wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-    ) {
-        eprintln!("legacy oracle GPU skipped: 16-bit UNORM unavailable");
-        return;
-    }
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    let (settings, gains) = hdr.draw_params(true);
+    let hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+    let settings = hdr.draw_params(true);
     let globals = super::super::Globals {
         fog: [0.0, 100.0, 0.0, 100.0],
         fog_ends: [100.0, 100.0, 0.0, 0.0],
-        hdr_windows: hdr.windows(),
         hdr_light: [0.0, 0.0, 1.0, 1.0],
         hdr_settings: settings,
-        hdr_gains: gains,
         ..bytemuck::Zeroable::zeroed()
     };
+    // HDR Lighting off (the look's lane at 0): nothing is lifted.
+    let unlit = super::super::Globals {
+        hdr_settings: [settings[0], settings[1], 0.0, settings[3]],
+        ..globals
+    };
     let draw = Draw::new(&device, &queue, false, &globals, 255);
+    let plain = Draw::new(&device, &queue, false, &unlit, 255);
     for (entry, overlay) in [
         ("fs_entity_unmarked", 0),
         ("fs_entity_shadow", 0),
@@ -1485,14 +1451,12 @@ fn unmarked_entity_users_keep_their_source_gain() {
         ("fs_entity", 11),
         ("fs_entity", 12),
     ] {
-        let raw = draw.render(&mut hdr, true, entry, 0, overlay, [0.0; 4]);
-        let mut hdr_off = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-        hdr_off.look = false;
-        let legacy = draw.render(&mut hdr_off, false, entry, 0, overlay, [0.0; 4]);
+        let raw = draw.render(true, entry, 0, overlay, [0.0; 4]);
+        let unlifted = plain.render(true, entry, 0, overlay, [0.0; 4]);
         for i in 0..3 {
             assert!(
-                (raw[i] - legacy[i]).abs() < 0.001,
-                "{entry} {overlay}: {raw:?} {legacy:?}"
+                (raw[i] - unlifted[i]).abs() < 0.001,
+                "{entry} {overlay}: {raw:?} {unlifted:?}"
             );
         }
     }
@@ -1500,42 +1464,27 @@ fn unmarked_entity_users_keep_their_source_gain() {
 
 #[test]
 fn additive_texels_below_the_mark_cutoff_keep_their_gain() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some((device, queue)) = gpu() else {
         return;
     };
-    if !device.features().contains(
-        wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-    ) {
-        eprintln!("legacy oracle GPU skipped: 16-bit UNORM unavailable");
-        return;
-    }
-    let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    let (settings, gains) = hdr.draw_params(true);
+    let hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
+    let settings = hdr.draw_params(true);
     let globals = super::super::Globals {
         fog: [0.0, 100.0, 0.0, 100.0],
-        hdr_windows: hdr.windows(),
         hdr_light: [0.0, 0.0, 1.0, 1.0],
         hdr_settings: settings,
-        hdr_gains: gains,
         ..bytemuck::Zeroable::zeroed()
     };
     let draw = Draw::new(&device, &queue, false, &globals, 16);
     let background = [0.0, 0.0, 0.0, 1.0];
-    let marked = draw.render(&mut hdr, false, "fs_celestial", 4, 0, background);
-    let written = draw.render(&mut hdr, true, "fs_celestial", 4, 0, background);
-    // The old mark draw discards this texel; source alpha still contributes its colour.
+    let written = draw.render(true, "fs_celestial", 4, 0, background);
+    // A texel this faint is not lifted (`hdr_entity_mark`); its alpha still adds its colour.
     let red = (200.0 / 255.0) * 0.8 * 0.7 * (16.0 / 255.0);
     assert!(
         (written[0] - red).abs() < 0.0001,
         "{written:?}: expected {red}"
     );
-    for i in 0..3 {
-        assert!(
-            (written[i] - marked[i]).abs() < 0.0001,
-            "{written:?} {marked:?}"
-        );
-    }
 }
 
 fn check_oit_writer(terrain: bool, kind: &str, overlay: u32, tier: u32, alphas: &[u8]) {
@@ -1561,16 +1510,14 @@ fn check_oit_writer(terrain: bool, kind: &str, overlay: u32, tier: u32, alphas: 
     }))
     .unwrap();
     let mut hdr = Hdr::with_debug(&device, &queue, F::Rgba16Float, Output::Pq, true, None);
-    let (settings, gains) = hdr.draw_params(true);
+    let settings = hdr.draw_params(true);
     let globals = super::super::Globals {
         fog: [0.0, 100.0, 0.0, 100.0],
         fog_ends: [100.0, 100.0, 0.0, 0.0],
         misc: [0.0, 1.0, 0.0, 0.0],
         filtering: [0.0, 1.0, 0.0, 0.0],
-        hdr_windows: hdr.windows(),
         hdr_light: [0.0, 0.0, 1.0, 1.0],
         hdr_settings: settings,
-        hdr_gains: gains,
         ..bytemuck::Zeroable::zeroed()
     };
     for &alpha in alphas {
@@ -1585,7 +1532,6 @@ fn check_oit_writer(terrain: bool, kind: &str, overlay: u32, tier: u32, alphas: 
             "fs_entity"
         };
         let mut expected = draw.render(
-            &mut hdr,
             true,
             entry,
             tier,
@@ -1620,17 +1566,21 @@ fn check_oit_writer(terrain: bool, kind: &str, overlay: u32, tier: u32, alphas: 
 
 #[test]
 fn actual_oit_terrain_writes_its_own_light_including_clear_glass() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check_oit_writer(true, "terrain", 0, 0, &[180, 100]);
 }
 #[test]
 fn actual_oit_particle_writes_its_own_light() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check_oit_writer(false, "entity", 0, 3, &[180]);
 }
 #[test]
 fn actual_oit_cloud_writes_its_own_light() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check_oit_writer(false, "cloud", 4, 0, &[180]);
 }
 #[test]
 fn actual_oit_additive_adds_converted_light_without_coverage() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check_oit_writer(false, "lightning", 0, 4, &[180]);
 }

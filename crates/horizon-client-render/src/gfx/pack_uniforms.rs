@@ -59,21 +59,6 @@ pub struct PackInputs {
     /// `heldItemId`, `heldItemId2` (item.properties, 5.3) and `heldBlockLightValue(2)`.
     pub held_items: [i32; 2],
     pub held_light: [i32; 2],
-    /// Interpolated player head position, before the third-person camera offset.
-    pub eye_position: DVec3,
-    /// World-space head direction, independent of front/rear camera perspective.
-    pub player_look: Vec3,
-    pub elytra_flying: bool,
-    pub player_mood: f32,
-    /// Height of the dimension's cloud plane; NaN when the dimension has none.
-    pub cloud_height: f32,
-    /// `BossOverlay::should_create_world_fog`: a boss event asks for world fog (`heavyFog`).
-    pub heavy_fog: bool,
-    /// The End flash's centre in the sky's world axes (camera-centred, before the view), as
-    /// the sky draws it; zero outside the End. `endFlashPosition` turns it into view space.
-    pub end_flash_position: Vec3,
-    /// The End flash's interpolated intensity, 0 outside the End.
-    pub end_flash_intensity: f32,
     /// `isRightHanded` (the Main Hand option) and `is_on_ground`.
     pub right_handed: bool,
     pub on_ground: bool,
@@ -84,12 +69,27 @@ pub struct PackInputs {
     pub logical_height: i32,
     pub has_skylight: bool,
     pub has_ceiling: bool,
+    /// `isElytraFlying`: the player is fall flying.
+    pub elytra_flying: bool,
+    /// `cloudHeight`, see [`cloud_height`].
+    pub cloud_height: f32,
+    /// `cloudTime`: how far the game's clouds have moved along X, in blocks (`clouds::drift`
+    /// times vanilla's 0.03 blocks a tick). Iris 1.11.7 gives it, though ShaderDoc doesn't list
+    /// it: observed with a probe pack, three game times 0.03 apart per tick.
     pub cloud_time: f32,
     /// The values native mods hand their packs (`frame.mods`, `native_shader_params`).
     pub mod_params: [[f32; 4]; 8],
     /// The player's state, for Iris's status uniforms.
     pub status: PlayerStatus,
+    /// The End flash: its intensity, 0..1 (0 outside the End), and its direction from the
+    /// camera in world space, of length 100 (`endFlashIntensity`, `endFlashPosition`).
+    pub end_flash: f32,
+    pub end_flash_direction: Vec3,
+    /// The dimension type's `ambient_light` (`ambientLight`).
     pub ambient_light: f32,
+    /// The player's cave mood, 0..1 (`BiomeAmbientSoundsHandler`'s moodiness):
+    /// `playerMood` and `constantMood`.
+    pub mood: f32,
     /// Under `HORIZON_STILL`, the world's ticks: the pack's clock (`frameTimeCounter`,
     /// `frameCounter`) instead of the wall clock and the frames drawn, and smoothed values
     /// (`wetness`, `eyeBrightnessSmooth`, `centerDepthSmooth`) at their targets.
@@ -185,11 +185,10 @@ impl Value {
     /// declared `bool` or `int` was kept. A float declared `bool` is left as it was: Iris warned,
     /// but our probe read true.
     pub fn read_as(&self, name: &str, ty: &str) -> bool {
-        let name = name.strip_prefix("gbuffers.").unwrap_or(name);
         let int = matches!(self, Value::I(_));
         let (declared_int, size) = match ty {
             "float" => (false, 1),
-            "bool" if !int => return components(name) == 1,
+            "bool" if !int => return true,
             "int" | "bool" => (true, 1),
             "mat2" => (false, 4),
             "mat3" => (false, 9),
@@ -199,21 +198,12 @@ impl Value {
             t if let Some(n) = t.strip_prefix("vec") => (false, n.parse().unwrap_or(0)),
             _ => return true,
         };
+        let name = name.strip_prefix("gbuffers.").unwrap_or(name);
         declared_int == int && size == components(name)
     }
 
     /// Writes the value as the type the pack declared, at `offset` of a std140 block.
     pub fn write(&self, ty: &str, out: &mut [u8], offset: usize) {
-        if ty == "bool" {
-            // OpenGL converts any nonzero scalar to true; integer truncation
-            // would turn fractional float uniforms such as the near plane off.
-            let value = match self {
-                Value::F(values) => values[0] != 0.0,
-                Value::I(values) => values[0] != 0,
-            };
-            put(out, offset, bytemuck::bytes_of(&i32::from(value)));
-            return;
-        }
         let ints = matches!(ty, "int" | "bool" | "uint") || ty.starts_with(['i', 'u']);
         let (floats, integers): ([f32; 16], [i32; 16]) = match *self {
             Value::F(f) => (f, f.map(|v| v as i32)),
@@ -260,20 +250,6 @@ fn put(out: &mut [u8], offset: usize, bytes: &[u8]) {
 pub const NAMES: &[&str] = &[
     "cameraPosition",
     "previousCameraPosition",
-    "cameraPositionInt",
-    "cameraPositionFract",
-    "previousCameraPositionInt",
-    "previousCameraPositionFract",
-    "eyePosition",
-    "relativeEyePosition",
-    "playerLookVector",
-    "isElytraFlying",
-    "playerMood",
-    "cloudHeight",
-    "lightningBoltPosition",
-    "heavyFog",
-    "endFlashPosition",
-    "endFlashIntensity",
     "eyeAltitude",
     "upPosition",
     "sunPosition",
@@ -290,6 +266,9 @@ pub const NAMES: &[&str] = &[
     "viewWidth",
     "viewHeight",
     "aspectRatio",
+    "screenSize",
+    "fsrScreenSize",
+    "fsrRenderScale",
     "near",
     "far",
     "rainStrength",
@@ -332,6 +311,13 @@ pub const NAMES: &[&str] = &[
     "shadowModelViewInverse",
     "shadowProjection",
     "shadowProjectionInverse",
+    "cameraPositionInt",
+    "cameraPositionFract",
+    "previousCameraPositionInt",
+    "previousCameraPositionFract",
+    "eyePosition",
+    "relativeEyePosition",
+    "playerLookVector",
     "playerBodyVector",
     "firstPersonCamera",
     "currentPlayerHealth",
@@ -351,7 +337,10 @@ pub const NAMES: &[&str] = &[
     "is_invisible",
     "is_sneaking",
     "is_sprinting",
+    "endFlashIntensity",
+    "endFlashPosition",
     "ambientLight",
+    "playerMood",
     "constantMood",
     "centerDepthSmooth",
     "alphaTestRef",
@@ -442,9 +431,11 @@ pub struct FrameUniforms {
     start: std::time::Instant,
     last: Option<std::time::Instant>,
     frame: u32,
-    previous: Option<(DVec3, Mat4, Mat4)>,
-    camera_origin: DVec3,
+    /// The tick `eval_custom` restarts the custom uniforms at: every frame's under STILL; on a
+    /// scripted clock's frame 1 only 0 (where a freshly parsed pack starts), so its later frames
+    /// carry their smoothing and randoms.
     custom_restart: Option<u64>,
+    previous: Option<(glam::DVec3, Mat4, Mat4)>,
     wetness: f32,
     eye_smooth: [f32; 2],
     /// `depthtex0` at the screen's centre as last read back, and `centerDepthSmooth`.
@@ -466,7 +457,6 @@ impl Default for FrameUniforms {
             frame: 0,
             custom_restart: None,
             previous: None,
-            camera_origin: DVec3::ZERO,
             wetness: 0.0,
             eye_smooth: [0.0; 2],
             center_depth_raw: None,
@@ -513,13 +503,18 @@ pub fn tilt_matrix(tilt: f32) -> Mat4 {
 
 /// The world direction of the shadow light (7.1): the sun by day, the moon by night.
 pub fn shadow_light(frame: &Frame, shadow: &Shadow) -> Vec3 {
+    body(light_angle(frame), shadow.sun_path_rotation).normalize()
+}
+
+/// The sky angle in degrees of the body that lights the frame: the sun by day, the moon by
+/// night.
+pub fn light_angle(frame: &Frame) -> f32 {
     let sun_angle = (frame.sky.sun_angle / 360.0 + 0.25).rem_euclid(1.0);
-    let angle = if sun_angle < 0.5 {
+    if sun_angle < 0.5 {
         frame.sky.sun_angle
     } else {
         frame.sky.moon_angle
-    };
-    body(angle, shadow.sun_path_rotation).normalize()
+    }
 }
 
 /// A sky angle in degrees as the fraction of a day Iris 1.11.7 gives packs (`sunAngle`,
@@ -769,47 +764,6 @@ pub fn shadow_camera(light: Vec3, camera: DVec3, shadow: &Shadow) -> (Mat4, Mat4
     (view, projection)
 }
 
-/// Extended camera uniform contract: public written API documentation only, not Iris code.
-/// https://shaders.properties/current/reference/uniforms/camera/
-/// Split BEFORE converting to f32, including negative positions (fraction stays in [0,1)).
-fn split_position(position: DVec3) -> ([i32; 3], Vec3) {
-    let integer = position.floor();
-    // A fraction just below 1 can round up during the f64 -> f32 conversion.
-    let fraction = (position - integer)
-        .as_vec3()
-        .min(Vec3::splat(f32::from_bits(1.0f32.to_bits() - 1)));
-    (integer.as_ivec3().to_array(), fraction)
-}
-
-/// Keep horizontal float coordinates near the origin. The public camera contract permits
-/// renderer-specific wrapping. Preserve the absolute coordinates for the split uniforms,
-/// and subtract the new origin from BOTH frames, including after a teleport.
-fn update_camera_origin(origin: &mut DVec3, camera: DVec3, previous: DVec3) {
-    for axis in [0, 2] {
-        if (camera[axis] - origin[axis]).abs() > 30_000.0
-            || (camera[axis] - previous[axis]).abs() > 1_000.0
-        {
-            origin[axis] = camera[axis].floor();
-        }
-    }
-}
-
-/// `lightningBoltPosition`: the player-space (camera-relative, world axes) position of a bolt
-/// the frame draws, with w = 1; all zero when none is drawn. Several bolts: the nearest to the
-/// camera. The subtraction runs in f64 so far-from-origin bolts keep their sub-block offset.
-fn lightning_bolt_position(bolts: &[super::lightning::Bolt], camera: DVec3) -> Vec4 {
-    bolts
-        .iter()
-        .map(|bolt| DVec3::from_array(bolt.at) - camera)
-        .min_by(|a, b| a.length_squared().total_cmp(&b.length_squared()))
-        .map_or(Vec4::ZERO, |d| d.as_vec3().extend(1.0))
-}
-
-/// `endFlashPosition`: the flash's sky-axis centre in view space, rotated by the same view
-/// matrix the sky is drawn with (the sun and moon above go through `to_view` the same way).
-fn end_flash_view_position(view: &Mat4, sky_position: Vec3) -> Vec3 {
-    view.transform_vector3(sky_position)
-}
 /// The seconds a tick of a smoothing half-life (`wetnessHalflife`, `eyeBrightnessHalflife`,
 /// `centerDepthHalflife`) lasts in Iris 1.11.7: measured, twice a game tick.
 const SECONDS_A_TICK: f32 = 0.1;
@@ -819,42 +773,7 @@ fn smooth(value: f32, target: f32, half_life: f32, dt: f32) -> f32 {
     target + (value - target) * 0.5f32.powf(dt / half_life)
 }
 
-/// Keep the pack projection sparse: packs reconstruct depth from its diagonal and final
-/// column. Camera bob belongs in model-view, preserving the world's P * bob * rotation.
-fn camera_matrices(
-    yaw: f32,
-    pitch: f32,
-    bob: Mat4,
-    spin: Mat4,
-    fov_degrees: f32,
-    aspect: f32,
-    far: f32,
-) -> (Mat4, Mat4, Mat4, Mat4) {
-    // Vanilla's view rotation to the last bit (Iris 1.11.7's gbufferModelView and
-    // its inverse match it bit for bit in the upstream probes). Keep the bob and
-    // nausea spin in model-view, so depth reconstruction sees a pure perspective.
-    let (rotation, rotation_inverse) = crate::camera::view_rotation_matrix(yaw, pitch);
-    let (view, view_inverse) = if bob == Mat4::IDENTITY && spin == Mat4::IDENTITY {
-        (rotation, rotation_inverse)
-    } else {
-        let view = bob * spin * rotation;
-        (view, view.inverse())
-    };
-    let (projection, projection_inverse) = pack_projection(fov_degrees, aspect, far);
-    (view, view_inverse, projection, projection_inverse)
-}
-
 impl FrameUniforms {
-    fn camera_history(
-        &mut self,
-        camera: DVec3,
-        view: Mat4,
-        projection: Mat4,
-    ) -> (DVec3, Mat4, Mat4) {
-        let previous = self.previous.unwrap_or((camera, view, projection));
-        self.previous = Some((camera, view, projection));
-        previous
-    }
     /// Forgets the frames before (the previous camera, smoothed values, the clock and the
     /// centre depth), keeping the pack's atlas size and shadow settings.
     pub(super) fn reset_history(&mut self) {
@@ -882,26 +801,41 @@ impl FrameUniforms {
             (None, None) => measured,
         };
         let aspect = size[0] as f32 / size[1].max(1) as f32;
-        let (view, view_inverse, projection, projection_inverse) = camera_matrices(
-            frame.yaw,
-            frame.pitch,
-            frame.bob,
-            frame.spin,
-            frame.fov_degrees,
-            aspect,
-            frame.depth_far,
-        );
+        // Packs take gbufferProjection for a plain perspective (they invert only its perspective
+        // terms): the view bob and the nausea spin belong to the model-view, as GL drew them.
+        // Vanilla's view rotation to the last bit (Iris 1.11.7's gbufferModelView and its inverse
+        // match it bit for bit in our probes): fragments on a texel boundary of the shadow map
+        // then read the same texel as in Iris (#8464).
+        let (rotation, rotation_inverse) =
+            crate::camera::view_rotation_matrix(frame.yaw, frame.pitch);
+        let (view, view_inverse) = if frame.bob == Mat4::IDENTITY && frame.spin == Mat4::IDENTITY {
+            (rotation, rotation_inverse)
+        } else {
+            let view = frame.bob * frame.spin * rotation;
+            (view, view.inverse())
+        };
+        let (projection, projection_inverse) =
+            pack_projection(frame.fov_degrees, aspect, frame.depth_far);
+        let camera = frame.camera.as_vec3();
         let first_frame = self.previous.is_none();
-        let (previous_absolute, previous_view, previous_projection) =
-            self.camera_history(frame.camera, view, projection);
-        update_camera_origin(&mut self.camera_origin, frame.camera, previous_absolute);
-        // Both frames use the SAME origin: changing origins must not create camera motion
-        // in temporal reprojection. Geometry and gbuffer matrices are camera-relative.
-        let camera = (frame.camera - self.camera_origin).as_vec3();
-        let previous_camera = (previous_absolute - self.camera_origin).as_vec3();
-        let (camera_int, camera_fract) = split_position(frame.camera);
-        let (previous_int, previous_fract) = split_position(previous_absolute);
+        let (previous_exact, previous_view, previous_projection) =
+            self.previous.unwrap_or((frame.camera, view, projection));
+        let previous_camera = previous_exact.as_vec3();
+        self.previous = Some((frame.camera, view, projection));
+        // The camera's whole blocks and the rest, exact however far from the origin.
+        let whole = |p: glam::DVec3| p.floor();
+        let int = |p: glam::DVec3| Value::i(&whole(p).as_ivec3().to_array());
+        let fract = |p: glam::DVec3| Value::f(&(p - whole(p)).as_vec3().to_array());
+        // The player's, not the camera's: in a third-person view the camera is behind (or in
+        // front of, turned around) the eye the pack lights from.
+        let [yaw, pitch] = frame.eye_rotation.map(f32::to_radians);
+        let look = Vec3::new(
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        );
 
+        let to_view = |v: Vec3| view.transform_vector3(v);
         let sun_angle = day_fraction(frame.sky.sun_angle);
         let day = sun_angle < 0.5;
         let tilt = self.shadow.sun_path_rotation;
@@ -979,9 +913,6 @@ impl FrameUniforms {
             ),
         };
 
-        let lightning = lightning_bolt_position(frame.lightning.bolts, frame.camera);
-        let end_flash = end_flash_view_position(&view, inputs.end_flash_position);
-
         let patches = water_patches(frame.entities);
         let value = |name: &str| -> Value {
             let v3 = |v: Vec3| Value::f(&v.to_array());
@@ -989,19 +920,14 @@ impl FrameUniforms {
             match name {
                 "cameraPosition" => v3(camera),
                 "previousCameraPosition" => v3(previous_camera),
-                "cameraPositionInt" => Value::i(&camera_int),
-                "cameraPositionFract" => v3(camera_fract),
-                "previousCameraPositionInt" => Value::i(&previous_int),
-                "previousCameraPositionFract" => v3(previous_fract),
-                "eyePosition" => v3((inputs.eye_position - self.camera_origin).as_vec3()),
-                "relativeEyePosition" => v3((frame.camera - inputs.eye_position).as_vec3()),
-                "playerLookVector" | "playerBodyVector" => v3(inputs.player_look),
-                "isElytraFlying" => Value::i(&[inputs.elytra_flying as i32]),
-                "cloudHeight" => Value::f(&[inputs.cloud_height]),
-                "lightningBoltPosition" => Value::f(&lightning.to_array()),
-                "heavyFog" => Value::i(&[inputs.heavy_fog as i32]),
-                "endFlashPosition" => v3(end_flash),
-                "endFlashIntensity" => Value::f(&[inputs.end_flash_intensity]),
+                "cameraPositionInt" => int(frame.camera),
+                "cameraPositionFract" => fract(frame.camera),
+                "previousCameraPositionInt" => int(previous_exact),
+                "previousCameraPositionFract" => fract(previous_exact),
+                // The camera is the eye in first person.
+                "eyePosition" => v3(frame.eye.as_vec3()),
+                "relativeEyePosition" => v3((frame.camera - frame.eye).as_vec3()),
+                "playerLookVector" | "playerBodyVector" => v3(look),
                 "firstPersonCamera" => Value::i(&[i32::from(frame.first_person)]),
                 "isRightHanded" => Value::i(&[i32::from(inputs.right_handed)]),
                 "is_on_ground" => Value::i(&[i32::from(inputs.on_ground)]),
@@ -1013,6 +939,7 @@ impl FrameUniforms {
                 "eyeAltitude" => Value::f(&[frame.camera.y as f32]),
                 "upPosition" => v3(celestial(view, tilt, None)),
                 "sunPosition" => v3(sun),
+                "endFlashPosition" => v3(to_view(inputs.end_flash_direction)),
                 "centerDepthSmooth" => Value::f(&[center_depth]),
                 "moonPosition" => v3(moon),
                 "shadowLightPosition" => v3(if day { sun } else { moon }),
@@ -1032,6 +959,14 @@ impl FrameUniforms {
                 "viewWidth" => Value::f(&[size[0] as f32]),
                 "viewHeight" => Value::f(&[size[1] as f32]),
                 "aspectRatio" => Value::f(&[aspect]),
+                // The upscaler a pack runs needs its own view of the frame (#16757): the size
+                // it draws at (`screenSize`, `fsrScreenSize`) is the pack's render size, and
+                // the scale it renders at is 1 — Horizon already divides the world by the
+                // Upscaling ratio, so a pack's FSR pass needs to scale nothing itself. Like
+                // every other name in `NAMES`, these are built-ins: a `uniform.*` of the same
+                // name that a pack declares reads ours (`pack_post::index_in`).
+                "screenSize" | "fsrScreenSize" => Value::f(&[size[0] as f32, size[1] as f32]),
+                "fsrRenderScale" => Value::f(&[1.0]),
                 "near" => Value::f(&[0.05]),
                 // The chunk render distance, not the distant terrain's reach.
                 "far" => Value::f(&[frame.detail_distance]),
@@ -1092,10 +1027,12 @@ impl FrameUniforms {
                 "heldItemId2" => Value::i(&[inputs.held_items[1]]),
                 "heldBlockLightValue" => Value::i(&[inputs.held_light[0]]),
                 "heldBlockLightValue2" => Value::i(&[inputs.held_light[1]]),
+                "isElytraFlying" => Value::i(&[inputs.elytra_flying as i32]),
+                "cloudHeight" => Value::f(&[inputs.cloud_height]),
                 "cloudTime" => Value::f(&[inputs.cloud_time]),
                 "ambientLight" => Value::f(&[inputs.ambient_light]),
                 // Iris 1.11.7 gave both the same value in every scene measured.
-                "playerMood" | "constantMood" => Value::f(&[inputs.player_mood]),
+                "playerMood" | "constantMood" => Value::f(&[inputs.mood]),
                 // renderStage is NONE outside gbuffers draws.
                 _ => status_value(name, inputs).unwrap_or(Value::i(&[0])),
             }
@@ -1189,7 +1126,7 @@ fn status_value(name: &str, inputs: &PackInputs) -> Option<Value> {
         "is_invisible" => flag(status.invisible || status.spectator),
         "is_sneaking" => flag(status.sneaking),
         "is_sprinting" => flag(status.sprinting),
-        "endFlashIntensity" => Value::f(&[inputs.end_flash_intensity]),
+        "endFlashIntensity" => Value::f(&[inputs.end_flash]),
         _ => return None,
     })
 }
@@ -1211,11 +1148,10 @@ fn components(name: &str) -> usize {
         | "sunPosition"
         | "moonPosition"
         | "shadowLightPosition"
-        | "endFlashPosition"
         | "fogColor"
-        | "skyColor" => 3,
-        "lightningBoltPosition" => 4,
-        "eyeBrightness" | "eyeBrightnessSmooth" | "atlasSize" => 2,
+        | "skyColor"
+        | "endFlashPosition" => 3,
+        "eyeBrightness" | "eyeBrightnessSmooth" | "atlasSize" | "screenSize" | "fsrScreenSize" => 2,
         "entityColor" => 4,
         // Horizon's own vec4s, a dynamic light and half a boat's water patch box; their counts
         // are ints.
@@ -1253,201 +1189,6 @@ pub fn index_in(name: &str, geometry: bool) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn walking_bob(phase: f32) -> Mat4 {
-        Mat4::from_translation(Vec3::new(
-            phase.sin() * 0.08,
-            -phase.cos().abs() * 0.07,
-            0.0,
-        )) * Mat4::from_rotation_z(phase.sin() * 0.035)
-            * Mat4::from_rotation_x(phase.cos() * 0.025)
-    }
-
-    // The sparse inverse-projection calculation used by Solas ToNDC and Complementary
-    // ScreenToView: off-diagonal matrix elements are deliberately not read by those packs.
-    fn pack_screen_to_view(projection: Mat4, ndc: Vec3) -> Vec3 {
-        let inverse = projection.inverse();
-        let diagonal = Vec4::new(
-            inverse.x_axis.x,
-            inverse.y_axis.y,
-            inverse.z_axis.z,
-            inverse.z_axis.w,
-        );
-        let homogeneous = diagonal * Vec4::new(ndc.x, ndc.y, ndc.z, ndc.z) + inverse.w_axis;
-        homogeneous.truncate() / homogeneous.w
-    }
-
-    #[test]
-    fn bobbed_pack_matrices_preserve_native_geometry_and_pure_projection() {
-        let (yaw, pitch, fov, aspect, far) = (28.0, 17.0, 73.0_f32, 1.7, 512.0);
-        let native_projection = Mat4::perspective_rh_gl(fov.to_radians(), aspect, 0.05, far);
-        let rotation = crate::camera::view_matrix(yaw, pitch);
-        for bob in [
-            Mat4::IDENTITY,
-            walking_bob(0.4),
-            walking_bob(1.8),
-            walking_bob(3.2),
-        ] {
-            for spin in [Mat4::IDENTITY, Mat4::from_rotation_z(0.07)] {
-                let (view, view_inverse, projection, projection_inverse) =
-                    camera_matrices(yaw, pitch, bob, spin, fov, aspect, far);
-                assert!(projection.abs_diff_eq(native_projection, 1e-6));
-                assert!(
-                    (projection * view)
-                        .abs_diff_eq(native_projection * bob * spin * rotation, 1e-5)
-                );
-                assert!((view * view_inverse).abs_diff_eq(Mat4::IDENTITY, 1e-5));
-                assert!((projection * projection_inverse).abs_diff_eq(Mat4::IDENTITY, 1e-5));
-            }
-        }
-    }
-
-    #[test]
-    fn walking_bob_keeps_pack_depth_reconstruction_correct() {
-        let rotation = crate::camera::view_matrix(31.0, 12.0);
-        let points = [
-            Vec3::new(-1.0, 0.4, -4.0),
-            Vec3::new(4.0, -2.0, -40.0),
-            Vec3::new(-30.0, 10.0, -120.0),
-        ];
-        let mut old_split_error = 0.0_f32;
-        for bob in [
-            Mat4::IDENTITY,
-            walking_bob(0.4),
-            walking_bob(1.8),
-            walking_bob(3.2),
-        ] {
-            let (view, _, projection, _) =
-                camera_matrices(31.0, 12.0, bob, Mat4::IDENTITY, 73.0, 1.7, 512.0);
-            for point in points {
-                let world = rotation.inverse().transform_point3(point);
-                let expected = view.transform_point3(world);
-                let clip = projection * expected.extend(1.0);
-                let ndc = clip.truncate() / clip.w;
-                let reconstructed = pack_screen_to_view(projection, ndc);
-                assert!(
-                    reconstructed.abs_diff_eq(expected, 0.03),
-                    "{reconstructed:?} != {expected:?}"
-                );
-                // Demonstrate that moving bob into projection, as before the repair, makes
-                // the packs' sparse formula disagree with the rotation-only view position.
-                let old_projection = projection * bob;
-                old_split_error =
-                    old_split_error.max(pack_screen_to_view(old_projection, ndc).distance(point));
-            }
-        }
-        assert!(
-            old_split_error > 0.5,
-            "regression fixture did not exercise the old split: {old_split_error}"
-        );
-    }
-
-    #[test]
-    fn previous_camera_matrices_reproject_successive_bobbed_frames() {
-        let mut uniforms = FrameUniforms::default();
-        let world_point = Vec3::new(2.0, 1.0, 20.0);
-        let mut expected_previous: Option<(DVec3, Mat4, Mat4)> = None;
-        for (index, phase) in [0.4, 0.8, 1.3].into_iter().enumerate() {
-            let camera = DVec3::new(index as f64 * 0.1, 0.0, index as f64 * 0.15);
-            let (view, _, projection, _) = camera_matrices(
-                3.0 + index as f32,
-                4.0,
-                walking_bob(phase),
-                Mat4::IDENTITY,
-                73.0,
-                1.7,
-                512.0,
-            );
-            let previous = uniforms.camera_history(camera, view, projection);
-            let expected = expected_previous.unwrap_or((camera, view, projection));
-            assert_eq!(previous, expected);
-            let current_position = world_point - camera.as_vec3();
-            let clip = projection * view * current_position.extend(1.0);
-            let ndc = clip.truncate() / clip.w;
-            let current_view = pack_screen_to_view(projection, ndc);
-            let current_player = view.inverse().transform_point3(current_view);
-            let previous_player = current_player + (camera - previous.0).as_vec3();
-            let reprojected = previous.2 * previous.1 * previous_player.extend(1.0);
-            let reference =
-                previous.2 * previous.1 * (world_point - previous.0.as_vec3()).extend(1.0);
-            assert!(
-                (reprojected.truncate() / reprojected.w)
-                    .abs_diff_eq(reference.truncate() / reference.w, 0.002)
-            );
-            expected_previous = Some((camera, view, projection));
-        }
-    }
-
-    #[test]
-    fn camera_split_preserves_negative_and_distant_sub_block_positions() {
-        // f32 conversion before splitting loses these fractional blocks at world borders.
-        for position in [
-            DVec3::new(-0.25, -64.125, -30_000_000.75),
-            DVec3::new(30_000_000.125, 320.5, 0.0),
-        ] {
-            let (integer, fraction) = split_position(position);
-            assert!(fraction.cmpge(Vec3::ZERO).all());
-            assert!(fraction.cmplt(Vec3::ONE).all());
-            let reconstructed = DVec3::from_array(integer.map(f64::from)) + fraction.as_dvec3();
-            assert_eq!(position, reconstructed);
-        }
-        assert_eq!(split_position(DVec3::splat(-0.25)).0, [-1; 3]);
-        // Negative positions arbitrarily close to a block boundary must not round to 1.
-        let (integer, fraction) = split_position(DVec3::splat(-1e-12));
-        assert_eq!(integer, [-1; 3]);
-        assert!(fraction.cmplt(Vec3::ONE).all());
-    }
-
-    #[test]
-    fn rebasing_keeps_both_frames_in_the_same_coordinate_system() {
-        let mut origin = DVec3::ZERO;
-        let positions = [
-            DVec3::new(29_999.875, 70.25, -29_999.875),
-            DVec3::new(30_000.125, 70.5, -30_000.125),
-            // A teleport also rebases even when still inside the walking threshold.
-            DVec3::new(28_000.25, 64.0, -28_000.5),
-        ];
-        let mut previous = positions[0];
-        for camera in positions {
-            update_camera_origin(&mut origin, camera, previous);
-            let current_relative = (camera - origin).as_vec3();
-            let previous_relative = (previous - origin).as_vec3();
-            assert!(current_relative.abs().max_element() <= 30_000.0);
-            assert!(
-                (current_relative - previous_relative)
-                    .abs_diff_eq((camera - previous).as_vec3(), 1e-5)
-            );
-            // Absolute split history is unaffected by origin shifts.
-            let (integer, fraction) = split_position(previous);
-            assert_eq!(
-                DVec3::from_array(integer.map(f64::from)) + fraction.as_dvec3(),
-                previous
-            );
-            previous = camera;
-        }
-        assert_eq!(origin, DVec3::new(28_000.0, 0.0, -28_001.0));
-    }
-
-    #[test]
-    fn new_vector_uniforms_are_available_to_custom_expressions() {
-        for name in [
-            "cameraPositionInt",
-            "cameraPositionFract",
-            "previousCameraPositionInt",
-            "previousCameraPositionFract",
-            "eyePosition",
-            "relativeEyePosition",
-            "playerLookVector",
-        ] {
-            assert!(index(name).is_some(), "missing {name}");
-            assert_eq!(
-                components(name),
-                3,
-                "custom expression would truncate {name}"
-            );
-        }
-        assert_eq!(components("isElytraFlying"), 1);
-    }
 
     #[test]
     fn values_follow_the_declared_type() {
@@ -1511,20 +1252,6 @@ mod tests {
             (&Value::i(&[1]), "horizonWaterPatchCount", "int", true),
         ] {
             assert_eq!(value.read_as(name, ty), kept, "{ty} {name}");
-        }
-    }
-
-    /// Native OpenGL accepts scalar float-to-bool conversion, but rejects
-    /// vector/matrix component counts for a scalar boolean uniform.
-    #[test]
-    fn boolean_uniforms_keep_scalar_shape_and_nonzero_float_values() {
-        assert!(Value::f(&[0.25]).read_as("sunAngle", "bool"));
-        assert!(!Value::f(&[1.0, 2.0, 3.0]).read_as("cameraPosition", "bool"));
-        assert!(!Value::f(&[1.0; 16]).read_as("gbufferProjection", "bool"));
-        for (value, expected) in [(0.0, 0), (-0.0, 0), (0.25, 1), (-0.25, 1)] {
-            let mut bytes = [0_u8; 4];
-            Value::f(&[value]).write("bool", &mut bytes, 0);
-            assert_eq!(i32::from_ne_bytes(bytes), expected, "float {value} as bool");
         }
     }
 
@@ -1628,98 +1355,16 @@ mod tests {
             format!(r#"{{"attributes": {attributes}}}"#),
         )
         .unwrap();
-        let environment = crate::environment::Environment::load_dimension(&root, name).unwrap();
+        let environment = crate::environment::Environment::load_dimension(
+            &horizon_assets::resource_source::ResourceSource::directory(root.clone()),
+            name,
+        )
+        .unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         environment.sample(&crate::environment::Sample {
             day_time: 6000,
             ..Default::default()
         })
-    }
-
-    #[test]
-    fn lightning_position_is_zero_without_a_bolt_and_camera_relative_with_one() {
-        use crate::gfx::lightning::Bolt;
-        let camera = DVec3::new(8.5, 70.0, -5.5);
-        assert_eq!(lightning_bolt_position(&[], camera), Vec4::ZERO);
-        let bolt = |at: [f64; 3]| Bolt { at, seed: 1 };
-        // World axes (not view axes), relative to the camera, with w = 1.
-        assert_eq!(
-            lightning_bolt_position(&[bolt([10.0, 64.0, -5.0])], camera),
-            Vec4::new(1.5, -6.0, 0.5, 1.0)
-        );
-        // The nearest of several bolts, wherever it is in the list.
-        let near = bolt([8.5, 70.0, 4.5]);
-        let far = bolt([100.0, 70.0, 100.0]);
-        for bolts in [[near, far], [far, near]] {
-            assert_eq!(
-                lightning_bolt_position(&bolts, camera),
-                Vec4::new(0.0, 0.0, 10.0, 1.0)
-            );
-        }
-        // A bolt on the camera still reports itself: w, not xyz, says it exists.
-        assert_eq!(
-            lightning_bolt_position(&[bolt(camera.to_array())], camera),
-            Vec4::new(0.0, 0.0, 0.0, 1.0)
-        );
-        // Subtracting in f64 keeps a quarter block that f32 positions would lose.
-        let far_camera = DVec3::new(30_000_000.25, 70.0, 0.0);
-        assert_eq!(
-            lightning_bolt_position(&[bolt([30_000_000.5, 70.0, 0.0])], far_camera),
-            Vec4::new(0.25, 0.0, 0.0, 1.0)
-        );
-    }
-
-    #[test]
-    fn end_flash_position_is_in_view_space_and_the_new_uniforms_have_their_types() {
-        // Facing south (yaw 0, vanilla's +Z): a flash straight south is dead ahead (-Z in
-        // view space), one to the east is on the left, one overhead stays up.
-        let south = crate::camera::view_matrix(0.0, 0.0);
-        let at = |view: &Mat4, sky: Vec3| end_flash_view_position(view, sky);
-        let close = |a: Vec3, b: Vec3| assert!(a.abs_diff_eq(b, 1e-3), "{a} != {b}");
-        close(
-            at(&south, Vec3::new(0.0, 0.0, 100.0)),
-            Vec3::new(0.0, 0.0, -100.0),
-        );
-        close(
-            at(&south, Vec3::new(100.0, 0.0, 0.0)),
-            Vec3::new(-100.0, 0.0, 0.0),
-        );
-        close(
-            at(&south, Vec3::new(0.0, 100.0, 0.0)),
-            Vec3::new(0.0, 100.0, 0.0),
-        );
-        // Turning to face west puts a flash in the west ahead of the player.
-        let west = crate::camera::view_matrix(90.0, 0.0);
-        close(
-            at(&west, Vec3::new(-100.0, 0.0, 0.0)),
-            Vec3::new(0.0, 0.0, -100.0),
-        );
-        // Same rotation the sun's view-space position takes (`to_view`), nothing else.
-        let sky = Vec3::new(30.0, 60.0, -70.0);
-        assert_eq!(at(&west, sky), west.transform_vector3(sky));
-        // The default (no pack, or outside the End) is a zero flash.
-        let none = PackInputs::default();
-        assert_eq!(at(&west, none.end_flash_position), Vec3::ZERO);
-        assert_eq!(none.end_flash_intensity, 0.0);
-
-        for (name, count) in [
-            ("lightningBoltPosition", 4),
-            ("heavyFog", 1),
-            ("endFlashPosition", 3),
-            ("endFlashIntensity", 1),
-        ] {
-            assert!(index(name).is_some(), "missing {name}");
-            assert_eq!(components(name), count, "custom expressions see {name}");
-        }
-        // heavyFog is an int that also reads as a declared float or bool; the vec4 is whole.
-        let mut out = vec![0u8; 32];
-        Value::i(&[1]).write("float", &mut out, 0);
-        assert_eq!(f32::from_ne_bytes(out[0..4].try_into().unwrap()), 1.0);
-        Value::i(&[1]).write("bool", &mut out, 4);
-        assert_eq!(i32::from_ne_bytes(out[4..8].try_into().unwrap()), 1);
-        Value::f(&[1.5, -6.0, 0.5, 1.0]).write("vec4", &mut out, 16);
-        let w = f32::from_ne_bytes(out[28..32].try_into().unwrap());
-        assert_eq!(w, 1.0);
     }
 
     #[test]
@@ -1741,7 +1386,7 @@ mod tests {
 
     #[test]
     fn elytra_and_cloud_height_uniforms_are_written() {
-        assert!(NAMES.contains(&"isElytraFlying") && NAMES.contains(&"cloudHeight"));
+        assert!(NAMES.ends_with(&["isElytraFlying", "cloudHeight"]));
         let mut out = vec![0u8; 16];
         Value::i(&[1]).write("bool", &mut out, 0);
         assert_eq!(i32::from_ne_bytes(out[0..4].try_into().unwrap()), 1);
@@ -1844,7 +1489,7 @@ pub(super) mod initial_history_tests {
     /// 100-block offset; one it doesn't set is -100.05 (near) or 156 (far).
     #[test]
     fn the_shadow_projection_is_iris_s_for_the_pack_s_planes() {
-        let hud = HudBatch::new([1280, 720]);
+        let hud = HudBatch::scratch([1280, 720]);
         let f = frame(&hud);
         let (o, z, one) = (0, 0x80000000, 0x3f800000);
         type Case = (f32, Option<f32>, Option<f32>, [u32; 4], [u32; 4]);
@@ -1918,7 +1563,7 @@ pub(super) mod initial_history_tests {
     /// flying field of view (76.99999°) at 1280×720, the camera at (13.5, 69.62, -13.5).
     #[test]
     fn the_matrices_are_iris_to_the_last_bit() {
-        let hud = HudBatch::new([1280, 720]);
+        let hud = HudBatch::scratch([1280, 720]);
         let mut f = frame(&hud);
         f.camera = DVec3::new(13.5, 68.0 + f64::from(1.62f32), -13.5);
         f.yaw = 90.0;
@@ -2002,7 +1647,7 @@ pub(super) mod initial_history_tests {
     /// angles are vanilla's timeline at those ticks.
     #[test]
     fn the_sun_moon_and_up_are_iris_s_to_the_last_bit() {
-        let hud = HudBatch::new([1280, 720]);
+        let hud = HudBatch::scratch([1280, 720]);
         let mut f = frame(&hud);
         let o = 0;
         type Case = (f32, f32, f32, u32, u32, [[u32; 3]; 3], bool);
@@ -2099,7 +1744,7 @@ pub(super) mod initial_history_tests {
     /// negative x keeps its sign in the remainder.
     #[test]
     fn the_moon_s_shadow_matrices_are_iris_to_the_last_bit() {
-        let hud = HudBatch::new([1280, 720]);
+        let hud = HudBatch::scratch([1280, 720]);
         let mut f = frame(&hud);
         f.camera = DVec3::new(-556.5, 75.0 + f64::from(1.62f32), 212.5);
         f.sky.sun_angle = f32::from_bits(0x43107d5b);
@@ -2137,7 +1782,7 @@ pub(super) mod initial_history_tests {
     /// (13.5, 69.62, -13.5). The sky angles are vanilla's timeline at those ticks.
     #[test]
     fn the_shadow_matrices_turn_by_iris_s_angle_between_ticks() {
-        let hud = HudBatch::new([1280, 720]);
+        let hud = HudBatch::scratch([1280, 720]);
         let mut f = frame(&hud);
         f.camera = DVec3::new(13.5, 68.0 + f64::from(1.62f32), -13.5);
         let (o, z, one, minus) = (0, 0x80000000, 0x3f800000, 0xbf800000);
@@ -2213,7 +1858,7 @@ pub(super) mod initial_history_tests {
 
     #[test]
     fn first_history_is_current_then_tracks_the_actual_previous_frame() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let mut f = frame(&hud);
         let mut u = FrameUniforms::default();
         f.camera = DVec3::new(1024.25, -3.5, 11.75);
@@ -2231,7 +1876,7 @@ pub(super) mod initial_history_tests {
             assert_eq!(float(&u, prior), float(&u, current));
             assert!(float(&u, prior).iter().any(|v| *v != 0.0));
         }
-        let previous_absolute = f.camera;
+        let camera = float(&u, "cameraPosition");
         let view = float(&u, "gbufferModelView");
         let projection = float(&u, "gbufferProjection");
         f.camera = DVec3::new(-100.0, 20.0, 40.0);
@@ -2239,18 +1884,7 @@ pub(super) mod initial_history_tests {
         f.pitch = 50.0;
         f.fov_degrees = 100.0;
         u.update(&f, &PackInputs::default(), [1000, 500]);
-        // A camera-origin rebase shifts both positions equally; it must not
-        // invent motion or lose the actual previous frame's camera.
-        let previous = float(&u, "previousCameraPosition");
-        let current = float(&u, "cameraPosition");
-        assert_eq!(
-            &previous[..3],
-            &(previous_absolute - u.camera_origin).as_vec3().to_array()
-        );
-        assert_eq!(
-            [0, 1, 2].map(|i| previous[i] - current[i]),
-            (previous_absolute - f.camera).as_vec3().to_array()
-        );
+        assert_eq!(float(&u, "previousCameraPosition"), camera);
         assert_eq!(float(&u, "gbufferPreviousModelView"), view);
         assert_eq!(float(&u, "gbufferPreviousProjection"), projection);
         assert_ne!(
@@ -2263,7 +1897,7 @@ pub(super) mod initial_history_tests {
     /// clouds' drift at 0.03 blocks a tick, 5266 ticks in.
     #[test]
     fn cloud_time_is_how_far_the_clouds_drifted() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let f = frame(&hud);
         let mut u = FrameUniforms::default();
         let drift = crate::clouds::drift(5266, 0.0, 256);
@@ -2279,7 +1913,13 @@ pub(super) mod initial_history_tests {
 
     #[test]
     fn the_dynamic_lights_reach_the_pack_nearest_first() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::new(
+            [800, 450],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let mut f = frame(&hud);
         let lights = [[1.0, 2.0, 3.0, 14.0], [-4.0, 0.5, 6.0, 7.0]];
         f.dynamic_lights = &lights;
@@ -2333,7 +1973,7 @@ pub(super) mod initial_history_tests {
 
     #[test]
     fn environmental_smoothing_starts_at_the_first_inputs_without_resetting_each_frame() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let f = frame(&hud);
         let mut u = FrameUniforms::default();
         let mut input = PackInputs {
@@ -2358,12 +1998,13 @@ pub(super) mod initial_history_tests {
     #[test]
     #[ignore = "requires a host GPU; run with --ignored --nocapture"]
     fn core_matrix_inputs_render_provider_values() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let _gpu = crate::gfx::test_gpu::lock();
+        let instance = crate::gfx::test_gpu::instance();
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
         eprintln!("Core matrix GPU: {:?}", adapter.get_info());
         let (device, queue) =
             pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-        let hud = HudBatch::new([800, 400]);
+        let hud = HudBatch::scratch([800, 400]);
         let mut f = frame(&hud);
         f.camera = DVec3::new(1024.25, 100.5, -2048.75);
         f.yaw = 180.0;
@@ -2433,14 +2074,15 @@ pub(super) mod initial_history_tests {
     /// `normalMatrix` in a core-profile gbuffers program is the view's rotation; in the
     /// compatibility profile it stays zero (the issue's Iris 1.11.7 probes, #9136).
     #[test]
-    #[ignore = "requires a host GPU; run with --ignored --nocapture"]
+    #[ignore = "daily"]
     fn core_normal_matrix_renders_the_view_rotation() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let _gpu = crate::gfx::test_gpu::lock();
+        let instance = crate::gfx::test_gpu::instance();
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
         eprintln!("Normal matrix GPU: {:?}", adapter.get_info());
         let (device, queue) =
             pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-        let hud = HudBatch::new([800, 400]);
+        let hud = HudBatch::scratch([800, 400]);
         let mut f = frame(&hud);
         // Facing west (-X), level: view space looks down -Z with +X to the right (north).
         f.yaw = 90.0;
@@ -2634,13 +2276,32 @@ pub(super) mod initial_history_tests {
         }
     }
 
+    /// The upscaler's uniforms (#16757): a window 1280×720 at Performance upscaling (ratio 2)
+    /// leaves the world 640×360, and a pack that reads it is given that size to draw at
+    /// (`screenSize`, `fsrScreenSize`), with `fsrRenderScale` 1 — the world is already
+    /// scaled, so the pack's own FSR pass scales nothing.
+    #[test]
+    fn the_upscaler_s_uniforms_tell_the_pack_the_size_it_draws_at() {
+        let hud = HudBatch::scratch([1280, 720]);
+        let mut u = FrameUniforms::default();
+        u.update(&frame(&hud), &PackInputs::default(), [640, 360]);
+        assert_eq!(float(&u, "screenSize")[..2], [640.0, 360.0]);
+        assert_eq!(float(&u, "fsrScreenSize")[..2], [640.0, 360.0]);
+        assert_eq!(float(&u, "fsrRenderScale")[0], 1.0);
+        // A custom uniform checks their shapes before the first frame, at their sizes (#9086).
+        let shape = |name| zero(name).map(|v| v.n);
+        assert_eq!(shape("screenSize"), Some(2));
+        assert_eq!(shape("fsrScreenSize"), Some(2));
+        assert_eq!(shape("fsrRenderScale"), Some(1));
+    }
+
     /// Iris 1.11.7, read back exactly with a probe pack on a clear day (render distance 12,
     /// cloud range 64): fogStart 0 and fogEnd 1024 (the environmental fog, not the render
     /// distance's 172.8 to 192), fogDensity 0; composite and final programs read alphaTestRef
     /// 0.1, blockEntityId -1, fogMode 0 and fogShape -1.
     #[test]
     fn fog_and_draw_uniforms_outside_a_draw_follow_iris() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let mut f = frame(&hud);
         f.fog = Some(crate::fog::FogData {
             color: [0.7, 0.8, 1.0, 1.0],
@@ -2668,7 +2329,7 @@ pub(super) mod initial_history_tests {
     /// and end, a scale of 1 / (end - start), and a density of 0, not 1.
     #[test]
     fn the_compatibility_gl_fog_has_no_density() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let mut f = frame(&hud);
         f.fog = Some(crate::fog::FogData {
             color: [0.09, 0.24, 0.23, 1.0],
@@ -2690,7 +2351,7 @@ pub(super) mod initial_history_tests {
     /// (cylinder) where composite and final programs read 0 and -1.
     #[test]
     fn programs_that_draw_geometry_read_their_own_fog_and_centre_depth() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let mut u = FrameUniforms::default();
         u.update(&frame(&hud), &PackInputs::default(), [800, 450]);
         let at = |name, geometry| index_in(name, geometry).unwrap();
@@ -2713,7 +2374,7 @@ pub(super) mod initial_history_tests {
     /// centre depth 0.1 s.
     #[test]
     fn smoothed_uniforms_take_iris_half_lives() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let f = frame(&hud);
         let mut u = FrameUniforms::default();
         // A scripted clock: the next frame comes exactly `seconds` after the last, however long
@@ -2763,7 +2424,13 @@ pub(super) mod initial_history_tests {
     /// wetness reaches half the rain in 3 s instead of 60 s.
     #[test]
     fn a_pack_s_half_lives_replace_the_defaults() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::new(
+            [800, 450],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let f = frame(&hud);
         let mut u = FrameUniforms {
             half_lives: [Some(30.0), Some(10.0), None, None],
@@ -2798,7 +2465,7 @@ pub(super) mod initial_history_tests {
     /// the frame is drawn, and smoothed values are at their targets.
     #[test]
     fn a_still_frame_takes_the_world_ticks_as_its_clock() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let f = frame(&hud);
         let mut u = FrameUniforms::default();
         let mut input = PackInputs {
@@ -2833,7 +2500,7 @@ pub(super) mod initial_history_tests {
     /// A scripted clock's values reach the pack as they are, before STILL's ticks.
     #[test]
     fn a_scripted_clock_comes_before_the_still_ticks() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let f = frame(&hud);
         for still_ticks in [None, Some(47_811)] {
             let mut u = FrameUniforms::default();
@@ -2867,7 +2534,7 @@ pub(super) mod initial_history_tests {
     /// otherwise put them at their targets.
     #[test]
     fn a_scripted_clock_moves_smoothed_values_by_its_delta() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let f = frame(&hud);
         let mut u = FrameUniforms::default();
         let mut input = PackInputs {
@@ -2910,7 +2577,7 @@ pub(super) mod initial_history_tests {
             &horizon_shaders::Macros::standard(),
         );
         let mut custom = horizon_shaders::Custom::parse(&properties);
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let f = frame(&hud);
         let mut u = FrameUniforms::default();
         let mut run = |u: &mut FrameUniforms| -> Vec<[u32; 2]> {
@@ -2973,7 +2640,13 @@ pub(super) mod initial_history_tests {
     /// at their targets, the clock from 0; the atlas size it was given stays.
     #[test]
     fn a_reset_forgets_the_uniforms_history_and_keeps_the_pack_s_settings() {
-        let hud = HudBatch::new([16, 16]);
+        let hud = HudBatch::new(
+            [16, 16],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let mut f = frame(&hud);
         let mut uniforms = FrameUniforms {
             atlas: [256, 128],
@@ -3028,11 +2701,11 @@ pub(super) mod initial_history_tests {
     /// 0.25 in the End), and `playerMood` and `constantMood` both the cave mood.
     #[test]
     fn ambient_light_and_mood_come_from_the_inputs() {
-        let hud = HudBatch::new([800, 450]);
+        let hud = HudBatch::scratch([800, 450]);
         let mut u = FrameUniforms::default();
         let input = PackInputs {
             ambient_light: 0.25,
-            player_mood: 0.0235,
+            mood: 0.0235,
             ..Default::default()
         };
         u.update(&frame(&hud), &input, [800, 450]);

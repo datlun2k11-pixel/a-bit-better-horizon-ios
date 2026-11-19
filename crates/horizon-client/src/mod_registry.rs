@@ -9,16 +9,10 @@
 //!
 //! The launcher is a separate workspace, so this is the small part of it the
 //! game needs. Everything here blocks: the game runs it on a worker
-//! (`game/mod_browser.rs`).
+//! (`game/interface/mod_browser.rs`).
 use crate::mod_browser::Listing;
-use horizon_mods::index::{self, Index, Kind, Project, Trust, Version};
+use horizon_mod_package::index::{self, Index, Kind, Project, Trust, Version};
 use std::fs;
-use std::sync::Arc;
-use std::time::Duration;
-// The existing managed service transport owns close-only socket leases.
-pub use horizon_cosmetics::transport::Cancellation;
-use horizon_cosmetics::transport::Connector;
-mod storage;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -60,133 +54,46 @@ fn is_local(at: &str) -> bool {
 /// The index from `at`, kept in `home`'s [`CACHE`]; the kept copy when the
 /// registry can't be reached.
 pub fn load_index(home: &Path, at: &str) -> Result<Index, String> {
-    load_index_managed(home, at, &Arc::new(Cancellation::default()))
-}
-
-pub fn load_index_managed(
-    home: &Path,
-    at: &str,
-    cancel: &Arc<Cancellation>,
-) -> Result<Index, String> {
-    check_cancel(cancel)?;
     let local = is_local(at);
-    let parse = |text: &str| {
-        if local {
-            Index::parse_local(text)
-        } else {
-            Index::parse(text)
-        }
+    let parse = |text: &str| match local {
+        true => Index::parse_local(text),
+        false => Index::parse(text),
     };
-    let fetched = fetch_text(at, cancel).and_then(|text| parse(&text).map(|index| (index, text)));
-    check_cancel(cancel)?;
+    let fetched = fetch_text(at).and_then(|text| parse(&text).map(|index| (index, text)));
     let cache = home.join(CACHE);
     match fetched {
         Ok((index, text)) => {
-            let _ = storage::atomic_write(&cache, text.as_bytes());
+            if let Some(dir) = cache.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            let _ = fs::write(&cache, text);
             Ok(index)
         }
-        Err(error) => {
-            let kept = read_text_file(&cache, MAX_INDEX, cancel).map_err(|_| error.clone())?;
-            parse(&kept).map_err(|_| error)
+        Err(e) => {
+            let kept = fs::read_to_string(&cache).map_err(|_| e.clone())?;
+            parse(&kept).map_err(|_| e)
         }
     }
 }
 
-/// Finish rollback of an interrupted install before startup reads content mods.
-/// Blocking filesystem work: call on a loader worker, never the window thread.
-pub fn recover_home(home: &Path) -> Result<(), String> {
-    with_content_snapshot(home, || ())
-}
-
-/// Read one complete content generation under the same gate as publication.
-/// The callback is finite read/snapshot work on a loader worker or headless
-/// path, never on the window thread and never recursively installing a mod.
-pub fn with_content_snapshot<T>(home: &Path, read: impl FnOnce() -> T) -> Result<T, String> {
-    with_content_snapshot_managed(home, &Cancellation::default(), read)
-}
-
-/// An owned worker's snapshot uses the same cancellation token while waiting
-/// for publication, recovering, reading, and returning its candidate generation.
-pub fn with_content_snapshot_managed<T>(
-    home: &Path,
-    cancel: &Cancellation,
-    read: impl FnOnce() -> T,
-) -> Result<T, String> {
-    check_cancel(cancel)?;
-    let _lock = storage::lock_home(home, cancel)?;
-    check_cancel(cancel)?;
-    storage::recover(home)?;
-    check_cancel(cancel)?;
-    let snapshot = read();
-    check_cancel(cancel)?;
-    Ok(snapshot)
-}
-
-pub(crate) fn check_cancel(cancel: &Cancellation) -> Result<(), String> {
-    if cancel.cancelled() {
-        Err("mod browser operation cancelled".into())
-    } else {
-        Ok(())
-    }
-}
-
-fn read_bounded(reader: impl Read, max: u64, cancel: &Cancellation) -> Result<Vec<u8>, String> {
-    let count = max.checked_add(1).ok_or("invalid download limit")?;
-    let mut reader = reader.take(count);
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 16 * 1024];
-    loop {
-        check_cancel(cancel)?;
-        let n = reader.read(&mut buffer).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..n]);
-        if bytes.len() as u64 > max {
-            return Err("mod browser file exceeds its size limit".into());
-        }
-    }
-    check_cancel(cancel)?;
-    Ok(bytes)
-}
-fn read_text_file(path: &Path, max: u64, cancel: &Cancellation) -> Result<String, String> {
-    String::from_utf8(read_bounded(
-        fs::File::open(path).map_err(|e| e.to_string())?,
-        max,
-        cancel,
-    )?)
-    .map_err(|e| e.to_string())
-}
-fn agent(cancel: &Arc<Cancellation>) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(30))
-        .timeout_write(Duration::from_secs(30))
-        .timeout(Duration::from_secs(120))
-        .tls_connector(Arc::new(Connector::new(cancel.clone())))
-        .build()
-}
-fn fetch_text(at: &str, cancel: &Arc<Cancellation>) -> Result<String, String> {
-    check_cancel(cancel)?;
+fn fetch_text(at: &str) -> Result<String, String> {
     if !at.starts_with("https://") {
-        return read_text_file(Path::new(at), MAX_INDEX, cancel);
+        return fs::read_to_string(at).map_err(|e| format!("{at}: {e}"));
     }
-    let response = agent(cancel)
-        .get(at)
+    let response = ureq::get(at)
         .set("User-Agent", AGENT)
         .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(code, _) => format!("the mod registry answered {code}"),
+            ureq::Error::Transport(t) => format!("the mod registry can't be reached: {t}"),
+        })?;
+    let mut text = String::new();
+    response
+        .into_reader()
+        .take(MAX_INDEX)
+        .read_to_string(&mut text)
         .map_err(|e| e.to_string())?;
-    String::from_utf8(read_bounded(response.into_reader(), MAX_INDEX, cancel)?)
-        .map_err(|e| e.to_string())
-}
-
-/// Whether version `v` is a `.hmod` with code: the game doesn't run those any
-/// more, and the launcher neither lists nor installs them (`needs_port`).
-fn needs_port(v: &Version) -> bool {
-    v.file.name.ends_with(".hmod")
-        && v.capabilities
-            .iter()
-            .any(|c| *c != horizon_mods::Capability::Registries)
+    Ok(text)
 }
 
 /// The version of content mod `p` this game installs: the newest for this
@@ -196,15 +103,15 @@ pub fn installable<'a>(index: &Index, p: &'a Project) -> Option<&'a Version> {
         return None;
     }
     index
-        .installable(p, GAME, horizon_mods::api_level::LEVEL)
-        .filter(|v| !needs_port(v))
+        .installable(p, GAME)
+        .filter(|v| v.capabilities.known() == [horizon_mod_package::Capability::Registries])
 }
 
 /// The registry's projects the browser offers, most downloaded first: content
 /// mods this game installs, with the version installed in `home` when there is
 /// one.
 pub fn listings(index: &Index, home: &Path) -> Vec<Listing> {
-    let installed = Installed::load(home);
+    let installed = Installed::load(home).unwrap_or_default();
     let mut out: Vec<Listing> = index
         .projects
         .iter()
@@ -253,20 +160,6 @@ pub fn install(
     id: &str,
     get: &dyn Fn(&str, u64) -> Result<Vec<u8>, String>,
 ) -> Result<Done, String> {
-    install_managed(index, home, id, get, &Cancellation::default())
-}
-
-pub fn install_managed(
-    index: &Index,
-    home: &Path,
-    id: &str,
-    get: &dyn Fn(&str, u64) -> Result<Vec<u8>, String>,
-    cancel: &Cancellation,
-) -> Result<Done, String> {
-    check_cancel(cancel)?;
-    if !index::valid_id(id) {
-        return Err("invalid registry project id".into());
-    }
     let p = index
         .project(id)
         .ok_or_else(|| format!("{id} isn't in Horizon's registry"))?;
@@ -274,27 +167,68 @@ pub fn install_managed(
         .ok_or_else(|| format!("{} has no version this game can install", p.name))?;
     let relative = format!("{}/{id}.hmod", crate::mod_list::DIR);
     let target = home.join(&relative);
+    // Share the entire read/modify/write transaction with the launcher's installers.
+    let _lock = horizon_mod_package::install_lock::lock_home(home)
+        .map_err(|e| format!("cannot lock mod browser in {}: {e}", home.display()))?;
+    let mut list = Installed::load(home)?;
+    let ours = list.position(id);
+    let old_file = ours.and_then(|i| list.entries[i]["file"].as_str().map(str::to_owned));
+    // A missing file does not relinquish the launcher's native pin or change its kind.
+    if (ours.is_some() && old_file.as_deref() != Some(relative.as_str()))
+        || home
+            .join(crate::mod_list::NATIVE_DIR)
+            .join(format!("{id}.hmod"))
+            .exists()
     {
-        let _lock = storage::lock_home(home, cancel)?;
-        storage::recover(home)?;
-        if let Err(done) = prepare_install(home, id, &relative, &target, v)? {
-            return Ok(done);
+        return Err("code mods are installed and updated in the launcher".into());
+    }
+    if target.exists() && old_file.as_deref() == Some(relative.as_str()) {
+        let package = horizon_mod_package::Package::read(&target)?;
+        if package.manifest.native.is_some() || package.manifest.wasm.is_some() {
+            return Err("code mods are installed and updated in the launcher".into());
         }
     }
-    let bytes = get(&v.file.url, v.file.size)?;
-    check_cancel(cancel)?;
-    if bytes.len() as u64 > v.file.size || v.file.size > index::MAX_FILE {
-        return Err("mod download exceeds the registry size limit".into());
+    if let Some(i) = ours
+        && list.entries[i]["version"].as_str() == Some(v.version.as_str())
+        && target.exists()
+    {
+        return Ok(Done {
+            id: id.to_owned(),
+            version: v.version.clone(),
+            verified: list.entries[i]["verdict"].as_str() == Some("Verified"),
+        });
     }
-    let download = storage::stage(&home.join(DOWNLOADS), &bytes)?;
-    let trust = index::check_file(index, p, v, &download.0)?;
-    check_cancel(cancel)?;
-    let _lock = storage::lock_home(home, cancel)?;
-    storage::recover(home)?;
-    let mut list = match prepare_install(home, id, &relative, &target, v)? {
-        Ok(list) => list,
-        Err(done) => return Ok(done),
+    // Never over a mod the player put there themselves.
+    let theirs = target.exists() && old_file.as_deref() != Some(relative.as_str());
+    if theirs || home.join(crate::mod_list::DIR).join(id).is_dir() {
+        return Err(format!(
+            "a mod with the id {id} is already in {}: move it away first",
+            crate::mod_list::DIR
+        ));
+    }
+    if let Some(other) = list.taken_by(&relative, id) {
+        return Err(format!("{relative} belongs to {other}: remove it first"));
+    }
+    let bytes = get(&v.file.url, v.file.size)?;
+    let staging = home.join(DOWNLOADS);
+    fs::create_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    let download = staging.join(format!("{id}.hmod.part"));
+    fs::write(&download, &bytes).map_err(|e| format!("{}: {e}", download.display()))?;
+    let checked = || -> Result<_, String> {
+        let trust = index::check_file(index, p, v, &download)?;
+        let package = horizon_mod_package::Package::read(&download)?;
+        if package.manifest.native.is_some() || package.manifest.wasm.is_some() {
+            return Err("code mods are installed and updated in the launcher".into());
+        }
+        Ok(trust)
     };
+    let trust = checked().inspect_err(|_| {
+        let _ = fs::remove_file(&download);
+    })?;
+    if let Some(dir) = target.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    fs::rename(&download, &target).map_err(|e| format!("{}: {e}", target.display()))?;
     let verified = trust == Trust::Verified;
     list.record(serde_json::json!({
         "source": "horizon",
@@ -310,9 +244,7 @@ pub fn install_managed(
         "dependency": false,
         "verdict": if verified { "Verified" } else { "Unsigned" },
     }));
-    let manifest = list.bytes()?;
-    check_cancel(cancel)?;
-    storage::commit(home, id, &download.0, &manifest)?;
+    list.save(home)?;
     Ok(Done {
         id: id.to_owned(),
         version: v.version.clone(),
@@ -320,72 +252,32 @@ pub fn install_managed(
     })
 }
 
-fn prepare_install(
-    home: &Path,
-    id: &str,
-    relative: &str,
-    target: &Path,
-    v: &Version,
-) -> Result<Result<Installed, Done>, String> {
-    let list = Installed::load_checked(home)?;
-    let ours = list.position(id);
-    let old_file = ours.and_then(|i| list.entries[i]["file"].as_str().map(str::to_owned));
-    if let Some(i) = ours
-        && list.entries[i]["version"].as_str() == Some(v.version.as_str())
-        && target.exists()
-    {
-        return Ok(Err(Done {
-            id: id.to_owned(),
-            version: v.version.clone(),
-            verified: list.entries[i]["verdict"].as_str() == Some("Verified"),
-        }));
-    }
-    // Never over a mod the player put there themselves.
-    let theirs = target.exists() && old_file.as_deref() != Some(relative);
-    if theirs || home.join(crate::mod_list::DIR).join(id).is_dir() {
-        return Err(format!(
-            "a mod with the id {id} is already in {}: move it away first",
-            crate::mod_list::DIR
-        ));
-    }
-    if let Some(other) = list.taken_by(relative, id) {
-        return Err(format!("{relative} belongs to {other}: remove it first"));
-    }
-    Ok(Ok(list))
-}
-
 /// Downloads `url` (at most `max` bytes): `https://` only, or a `file://` path
 /// when the index itself is a local test registry.
 pub fn download(url: &str, max: u64) -> Result<Vec<u8>, String> {
-    download_managed(url, max, &Arc::new(Cancellation::default()))
-}
-
-pub fn download_managed(
-    url: &str,
-    max: u64,
-    cancel: &Arc<Cancellation>,
-) -> Result<Vec<u8>, String> {
-    check_cancel(cancel)?;
-    let max = max.min(index::MAX_FILE);
     if let Some(path) = url.strip_prefix("file://") {
         if !is_local(&location()) {
             return Err(format!("{url} is not an https address"));
         }
-        return read_bounded(
-            fs::File::open(path).map_err(|e| e.to_string())?,
-            max,
-            cancel,
-        );
+        return fs::read(path).map_err(|e| format!("{path}: {e}"));
     }
     if !url.starts_with("https://") {
         return Err(format!("{url} is not an https address"));
     }
-    let response = agent(cancel)
-        .get(url)
+    let response = ureq::get(url)
         .set("User-Agent", AGENT)
         .call()
         .map_err(|e| e.to_string())?;
-    read_bounded(response.into_reader(), max, cancel)
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(max + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| e.to_string())?;
+    if body.len() as u64 > max {
+        return Err(format!("{url} is larger than the index says"));
+    }
+    Ok(body)
 }
 
 /// `mod-browser.json`, kept as JSON values so the launcher's entries this
@@ -397,33 +289,31 @@ struct Installed {
 }
 
 impl Installed {
-    fn load(home: &Path) -> Self {
-        Self::load_checked(home).unwrap_or_default()
-    }
-
-    fn load_checked(home: &Path) -> Result<Self, String> {
+    fn load(home: &Path) -> Result<Self, String> {
         let path = home.join(MANIFEST);
-        let file = match fs::File::open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e.to_string()),
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(format!("{}: {error}", path.display())),
         };
-        let bytes = read_bounded(file, MAX_INDEX, &Cancellation::default())?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        let entries = value
-            .get("entries")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .ok_or("invalid installed-mod manifest")?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+        let entries = value["entries"]
+            .as_array()
+            .ok_or_else(|| format!("{}: entries must be an array", path.display()))?
+            .clone();
         Ok(Self { entries })
     }
-    fn bytes(&self) -> Result<Vec<u8>, String> {
-        let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "entries": self.entries }))
+
+    fn save(&self, home: &Path) -> Result<(), String> {
+        let path = home.join(MANIFEST);
+        let part = home.join(format!(".{MANIFEST}.part"));
+        let text = serde_json::to_string_pretty(&serde_json::json!({ "entries": self.entries }))
             .map_err(|e| e.to_string())?;
-        if bytes.len() as u64 > MAX_INDEX {
-            return Err("installed-mod manifest exceeds its size limit".into());
-        }
-        Ok(bytes)
+        fs::write(&part, text).map_err(|e| format!("{}: {e}", part.display()))?;
+        fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// The registry's entry for project `id`.
@@ -459,7 +349,7 @@ impl Installed {
             return Some(version.to_owned());
         }
         let path: PathBuf = home.join(crate::mod_list::DIR).join(format!("{id}.hmod"));
-        horizon_mods::Package::read(&path)
+        horizon_mod_package::Package::read(&path)
             .ok()
             .filter(|p| p.manifest.id == id)
             .map(|p| p.manifest.version)

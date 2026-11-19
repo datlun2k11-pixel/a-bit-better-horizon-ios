@@ -10,7 +10,8 @@ static ALLOCATOR: horizon_threads::Allocator = horizon_threads::ALLOCATOR;
 #[global_allocator]
 static ALLOCATOR: horizon_threads::CensusAllocator = horizon_threads::CensusAllocator;
 
-static MOD_API_LEVEL: [u8; 27] = horizon_mods::api_level::MARK;
+static MOD_API_LEVEL: [u8; horizon_mod_package::game_identity::MARK.len()] =
+    horizon_mod_package::game_identity::MARK;
 
 /// The activity, for `game::event_loop`.
 pub(crate) static APP: OnceLock<AndroidApp> = OnceLock::new();

@@ -65,8 +65,7 @@ impl Celestial {
         };
         use wgpu::{BlendFactor as F, BlendOperation as Op};
         // RenderPipelines.CELESTIAL: additive (src alpha, one), with the colour premultiplied
-        // in fs_sky_celestial. Its alpha is how much a texel adds: HDR output (hdr.wgsl) lets
-        // the sun's and moon's discs shine; nothing else reads the frame's alpha.
+        // in fs_sky_celestial. The frame's alpha is left alone: nothing reads it here.
         let added = pipeline(
             "Celestial bodies",
             "fs_sky_celestial",
@@ -77,7 +76,7 @@ impl Celestial {
             wgpu::ColorWrites::ALL,
         );
         // The float frame clamps neither the fragment's alpha nor the factor, so the sky's
-        // weight may pass 1. The frame's alpha is left alone: nothing reads it here.
+        // weight may pass 1. The frame's alpha is left alone here too.
         let sun = (format == super::LINEAR_FRAME).then(|| {
             let affine = component(F::One, F::SrcAlpha, Op::Add);
             let min = component(F::One, F::One, Op::Min);
@@ -127,6 +126,32 @@ impl Celestial {
             pass.draw_indexed(range, 0, 0..1);
         }
     }
+}
+
+/// The indices of `celestial`, `Game::celestial_geometry`'s quads, the celestial pass draws: all
+/// of them, but the sun's where a pack's sky draws its own sun (`own_sun`) and the moon's where
+/// it draws its own moon. The sun's quad comes first and the moon's last, each only where its
+/// sprite loaded; the moon's is the one at the low tier (`mesher::LOW`), the sun's isn't.
+pub(super) fn bodies(
+    celestial: &[crate::mesher::Vertex],
+    own_sun: bool,
+    own_moon: bool,
+) -> std::ops::Range<u32> {
+    let quads = celestial.len() as u32 / 4;
+    let moon = |quad: u32| {
+        (celestial[quad as usize * 4].layer >> 16) & 0xff == u32::from(crate::mesher::LOW)
+    };
+    let start = if own_sun && quads > 0 && !moon(0) {
+        6
+    } else {
+        0
+    };
+    let end = if own_moon && quads > 0 && moon(quads - 1) {
+        (quads - 1) * 6
+    } else {
+        quads * 6
+    };
+    start..end.max(start)
 }
 
 #[cfg(test)]

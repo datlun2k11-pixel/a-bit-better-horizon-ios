@@ -224,6 +224,9 @@ pub struct Settings {
     pub shader_packs: Vec<crate::shader_pack_list::Entry>,
     /// The picked pack's options while its Shader Options page is open.
     pub shader_options: Option<crate::shader_options::ShaderOptions>,
+    /// The name of the Horizon shader pack the renderer has loaded, from its manifest (set by
+    /// the game, not saved): `shader_packs` holds no titles until its page was opened.
+    pub running_pack: Option<String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -312,6 +315,7 @@ impl Default for Settings {
             mods: Default::default(),
             shader_packs: Vec::new(),
             shader_options: None,
+            running_pack: None,
         }
     }
 }
@@ -357,6 +361,8 @@ impl Settings {
     pub fn load_stores(path: &Path) {
         let dir = path.parent();
         horizon_hooks::settings::engine::load(&mut |file| fs::read_to_string(dir?.join(file)).ok());
+        // The controller's lines end their load: the settings made from P1's already hold them.
+        crate::gamepad::store::loaded();
     }
     pub fn load(path: &Path) -> Self {
         let mut horizon = path
@@ -374,10 +380,6 @@ impl Settings {
                 horizon.save(dir);
             }
         }
-        let controller = path
-            .parent()
-            .map(crate::gamepad::PadSettings::load)
-            .unwrap_or_default();
         let touch = path
             .parent()
             .map(crate::touch::TouchSettings::load)
@@ -402,6 +404,8 @@ impl Settings {
             Some(dir) => fs::read_to_string(dir.join(file)).ok(),
             None => None,
         });
+        // `horizon-controller.txt`, through its store, as the seat whose turn it is.
+        let controller = crate::gamepad::store::loaded();
         // The enabled mods are the game folder's, shared by its players (`--player-dir`).
         let mods = path
             .parent()
@@ -411,6 +415,10 @@ impl Settings {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
                 extras.read_old_options(&extras_text, &text);
+                let parsed = Self::parse(&text);
+                if horizon.api == crate::graphics::GraphicsApi::Auto {
+                    horizon.api = parsed.horizon.api;
+                }
                 Self {
                     horizon,
                     controller,
@@ -419,7 +427,7 @@ impl Settings {
                     touch_menu,
                     extras,
                     mods,
-                    ..Self::parse(&text)
+                    ..parsed
                 }
             }
             Err(_) => Self {
@@ -436,6 +444,8 @@ impl Settings {
         // Horizon's own key bindings live in horizon-extras.txt, not in options.txt.
         let emote = settings.extras.emote_key.clone();
         settings.keys.set("key.emote", &emote);
+        // The loaded set is the active one: `keybind` text components show its keys.
+        settings.keys.sync_action_bindings();
         // `Options.load`: `sharePresence` decides what the friends service posts.
         crate::social::set_share_presence(crate::social::SharePresence::of(
             settings.file.int("sharePresence").clamp(0, 2) as u8,
@@ -543,8 +553,19 @@ impl Settings {
             operator_items_tab: f.bool("operatorItemsTab"),
             quit_shortcuts: f.bool("quitShortcuts"),
             ctrl_click_emulates_right_click: f.bool("ctrlClickEmulatesRightClick"),
-            horizon: Default::default(),
-            startup_api: Default::default(),
+            horizon: crate::graphics::Graphics {
+                api: match f.name("preferredGraphicsBackend").as_str() {
+                    "opengl" => crate::graphics::GraphicsApi::OpenGl,
+                    "vulkan" => crate::graphics::GraphicsApi::Vulkan,
+                    _ => crate::graphics::GraphicsApi::Auto,
+                },
+                ..Default::default()
+            },
+            startup_api: match f.name("preferredGraphicsBackend").as_str() {
+                "opengl" => crate::graphics::GraphicsApi::OpenGl,
+                "vulkan" => crate::graphics::GraphicsApi::Vulkan,
+                _ => crate::graphics::GraphicsApi::Auto,
+            },
             video_modes: Vec::new(),
             fullbright_held: false,
             controller: Default::default(),
@@ -555,6 +576,7 @@ impl Settings {
             mods: Default::default(),
             shader_packs: Vec::new(),
             shader_options: None,
+            running_pack: None,
             auto_jump: f.bool("autoJump"),
             language: f.string("lang"),
             force_unicode: f.bool("forceUnicodeFont"),
@@ -626,6 +648,15 @@ impl Settings {
         put_b(&mut f, "entityShadows", self.entity_shadows);
         put_i(&mut f, "biomeBlendRadius", self.biome_blend);
         put_name(&mut f, "graphicsPreset", &self.graphics_preset);
+        put_name(
+            &mut f,
+            "preferredGraphicsBackend",
+            match self.horizon.api {
+                crate::graphics::GraphicsApi::OpenGl => "opengl",
+                crate::graphics::GraphicsApi::Vulkan => "vulkan",
+                _ => "default",
+            },
+        );
         put_i(&mut f, "mipmapLevels", self.mipmap_levels);
         put_i(&mut f, "weatherRadius", self.weather_radius);
         put_f(&mut f, "chunkSectionFadeInTime", self.chunk_fade);
@@ -713,8 +744,13 @@ impl Settings {
     pub fn with_option(&self, key: &str, value: &str) -> Result<Self, String> {
         let mut file = self.to_file();
         file.set_text(key, value)?;
+        let parsed = Self::from_file(file);
+        let mut horizon = self.horizon.clone();
+        if key == "preferredGraphicsBackend" {
+            horizon.api = parsed.horizon.api;
+        }
         let mut next = Self {
-            horizon: self.horizon.clone(),
+            horizon,
             controller: self.controller.clone(),
             touch: self.touch.clone(),
             touch_profiles: self.touch_profiles.clone(),
@@ -722,7 +758,7 @@ impl Settings {
             extras: self.extras.clone(),
             mods: self.mods.clone(),
             video_modes: self.video_modes.clone(),
-            ..Self::from_file(file)
+            ..parsed
         };
         // Options.applyGraphicsPreset: a new preset's own options are applied
         // at once, as the options screen's slider does (options_ui::set_slider).
@@ -746,7 +782,8 @@ impl Settings {
         }
         if let Some(dir) = path.parent() {
             self.horizon.save(dir);
-            self.controller.save(dir);
+            // Written by its store below, with the other stores' own files.
+            crate::gamepad::store::keep(&self.controller);
             self.touch.save(dir);
             self.touch_profiles.save(dir, &self.touch);
             self.touch_menu.save_menu(dir);
@@ -916,6 +953,8 @@ pub enum Opt {
     InvertY,
     AllowCursorChanges,
     Volume(usize),
+    /// Setting `.1` of the native mod in row `.0` of Options > Mods, a range on a slider.
+    ModSetting(u16, u16),
     SoundDevice,
     GuiScale,
     ViewBobbing,
@@ -1055,6 +1094,16 @@ pub enum Opt {
     MaxAnisotropy,
 }
 
+impl Settings {
+    /// GUI scaling inputs for this settings owner.
+    pub fn gui_scale_inputs(&self) -> crate::hud::GuiScale {
+        crate::hud::GuiScale {
+            requested: self.gui_scale,
+            unicode: self.force_unicode,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,7 +1137,11 @@ mod tests {
             assert_eq!(sound_source(event), source, "{event}");
         }
         // Explicit sources still take precedence, including H331's arrow route.
-        let mut audio = crate::audio::Audio::silent(Path::new("/nonexistent/h068-audio"));
+        let mut audio = crate::audio::Audio::silent(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                Path::new("/nonexistent/h068-audio").to_path_buf(),
+            ),
+        );
         audio.capture = Some(Vec::new());
         audio.play_on(6, "minecraft:entity.arrow.hit", Some([1.0; 3]), 1.0, 1.0);
         audio.play_on(4, "minecraft:entity.warden.hurt", Some([1.0; 3]), 1.0, 1.0);
@@ -1370,5 +1423,73 @@ mod tests {
         assert_eq!(again.sound_device, "Headphones");
         let empty = Settings::parse("");
         assert_eq!(empty.sound_device, "");
+    }
+    #[test]
+    fn options_txt_carries_the_graphics_api_and_the_launchers_graphics_file_wins_at_startup() {
+        use crate::graphics::GraphicsApi;
+        let version = horizon_world::DATA_VERSION;
+
+        // `Options.preferredGraphicsBackend`: written and read back through options.txt.
+        for (stored, expected_api) in [
+            ("opengl", GraphicsApi::OpenGl),
+            ("vulkan", GraphicsApi::Vulkan),
+            ("default", GraphicsApi::Auto),
+        ] {
+            let text = format!("version:{version}\npreferredGraphicsBackend:{stored}\n");
+            let s = Settings::parse(&text);
+            assert_eq!(s.horizon.api, expected_api, "{stored} is read back");
+            assert_eq!(
+                s.startup_api, expected_api,
+                "{stored} is what it started with"
+            );
+
+            let written = Settings::parse(&s.serialize());
+            assert_eq!(
+                written.file.name("preferredGraphicsBackend"),
+                stored,
+                "options.txt stores vanilla's name for {stored}"
+            );
+            assert_eq!(written.horizon.api, expected_api);
+        }
+
+        // Horizon's own page can also pick DirectX 12, which vanilla's option has no name for.
+        let mut s = Settings::default();
+        s.horizon.api = GraphicsApi::Dx12;
+        assert_eq!(
+            Settings::parse(&s.serialize())
+                .file
+                .name("preferredGraphicsBackend"),
+            "default"
+        );
+
+        // A change made through the option keeps the typed field with the file.
+        s.horizon.api = GraphicsApi::OpenGl;
+        s.file.set_name("preferredGraphicsBackend", "opengl");
+        assert_eq!(
+            Settings::parse(&s.serialize()).horizon.api,
+            GraphicsApi::OpenGl
+        );
+        let updated = s.with_option("preferredGraphicsBackend", "vulkan").unwrap();
+        assert_eq!(updated.horizon.api, GraphicsApi::Vulkan);
+
+        // At startup the launcher's `graphicsApi` picks the API; `auto` leaves it to options.txt.
+        let dir = std::env::temp_dir().join(format!("horizon-graphics-api-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let options = dir.join("options.txt");
+        fs::write(
+            &options,
+            format!("version:{version}\npreferredGraphicsBackend:opengl\n"),
+        )
+        .unwrap();
+        fs::write(dir.join(crate::graphics::FILE), "graphicsApi:auto\n").unwrap();
+        let loaded = Settings::load(&options);
+        assert_eq!(loaded.horizon.api, GraphicsApi::OpenGl);
+        assert_eq!(loaded.startup_api, GraphicsApi::OpenGl);
+        fs::write(dir.join(crate::graphics::FILE), "graphicsApi:vulkan\n").unwrap();
+        let loaded = Settings::load(&options);
+        assert_eq!(loaded.horizon.api, GraphicsApi::Vulkan);
+        assert_eq!(loaded.startup_api, GraphicsApi::Vulkan);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

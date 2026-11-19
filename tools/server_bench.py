@@ -25,7 +25,7 @@ than 10 % apart isn't a fair comparison of its tick times.
 
 The vanilla side runs the pinned server jar from tools/lab.py prepare (your own copy). It needs Java 25. The
 Horizon side runs target/release/horizon-server with the engine beside it; build both first:
-    cargo build --release -p horizon-client --bin horizon-client -p horizon-server -p horizon-bots
+    cargo build --release -p horizon-game --bin horizon-client -p horizon-server -p horizon-bots
 
 Two more Java servers, both dev-only downloads into .local/server-bench/jars (never committed or shipped):
 - `paper`: Paper's newest build for the pinned version, from PaperMC's download API, checked against the
@@ -130,14 +130,14 @@ def tree_usage(root):
 class Server:
     """A server with its console on stdin and its output collected."""
 
-    def __init__(self, command, directory, log_path):
+    def __init__(self, command, directory, log_path, env=None):
         self.lines = []
         self.lock = threading.Lock()
         self.log = log_path.open('w', encoding='utf-8')
         self.process = subprocess.Popen([str(c) for c in command], cwd=directory, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                         encoding='utf-8', errors='replace',
-                                        env=lab.game_env())
+                                        env=lab.game_env(env))
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -276,7 +276,12 @@ def pumpkin_defaults(exe, out):
 
 def pumpkin_config(text, port, args):
     """Pumpkin's default configuration with the benchmark's settings (PROPERTIES), listening on 127.0.0.1 only,
-    with no Bedrock or LAN listener, query, plugins or telemetry."""
+    with no Bedrock or LAN listener, query, plugins or telemetry.
+
+    Every declared key is written with its declared value: a key the template already has is replaced in place,
+    a missing one is inserted, and a missing section is added. Keeping an absent key out of the output would
+    silently leave Pumpkin's upstream default in place instead of applying the benchmark's setting.
+    """
     top = {'seed': f'"{args.seed}"', 'default_difficulty': '"Easy"', 'default_gamemode': '"Creative"',
            'force_gamemode': 'true', 'spawn_protection': '0', 'white_list': 'false', 'use_tty': 'false'}
     sections = {
@@ -295,14 +300,25 @@ def pumpkin_config(text, port, args):
         'telemetry': {'enabled': 'false', 'endpoint': '""'},
     }
     def setting(body, key, value):
-        return re.sub(r'(?m)^' + re.escape(key) + r' = .*$', f'{key} = {value}', body)
-    head, _, _ = text.partition('\n[')
+        """Replace key in a TOML body; insert it (preserving trailing whitespace) when it is absent."""
+        pattern = r'(?m)^[ \t]*' + re.escape(key) + r'[ \t]*=[ \t]*.*$'
+        line = f'{key} = {value}'
+        if re.search(pattern, body):
+            return re.sub(pattern, line, body)
+        stripped = body.rstrip('\n')
+        trailing = body[len(stripped):] or '\n'
+        return stripped + ('\n' if stripped else '') + line + trailing
+    first_table = re.search(r'(?m)^[ \t]*\[', text)
+    head = text[:first_table.start()] if first_table else text
     rest = text[len(head):]
     for key, value in top.items():
         head = setting(head, key, value)
     for name, settings in sections.items():
-        m = re.search(r'(?ms)^\[' + re.escape(name) + r'\]\n(.*?)(?=^\[|\Z)', rest)
+        m = re.search(r'(?ms)^[ \t]*\[' + re.escape(name) + r'\][ \t]*(?:#[^\n]*)?(?:\n|\Z)'
+                      r'(.*?)(?=^[ \t]*\[|\Z)', rest)
         if not m:
+            # The template does not declare this section at all: add it with every declared key.
+            rest = rest.rstrip('\n') + '\n[' + name + ']\n' + ''.join(f'{k} = {v}\n' for k, v in settings.items())
             continue
         body = m.group(1)
         for key, value in settings.items():
@@ -346,9 +362,11 @@ def server_command(kind, directory, args):
         mojang = cache / f'mojang_{lock["minecraft"]["version"]}.jar'
         if not mojang.exists():
             shutil.copyfile(jars['server'].parent / 'server.jar', mojang)
-        for name in ('cache', 'libraries', 'versions'):
+        for name in ('libraries', 'versions'):
             (shared / name).mkdir(exist_ok=True)
-            (directory / name).symlink_to(shared / name, target_is_directory=True)
+        # Paperclip keeps cache/, libraries/ and versions/ under bundlerRepoDir: no folder links, which some
+        # network shares refuse.
+        java.append(f'-DbundlerRepoDir={shared}')
         # Paper refuses a second login from one address within 4 s (bukkit.yml's connection-throttle), and
         # every bot comes from the same one. Off, as on vanilla; Paper fills in the rest of the file.
         (directory / 'bukkit.yml').write_text('settings:\n  connection-throttle: -1\n')
