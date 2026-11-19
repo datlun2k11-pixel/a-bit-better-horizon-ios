@@ -1801,6 +1801,9 @@ pub struct OptionsUi {
     profile_name: ui::EditBox,
     /// The layout whose Delete was pressed once (the second press forgets it).
     touch_layout_delete: Option<String>,
+    /// The editor's Reset was pressed once (the second press resets the layout). The button sits in the
+    /// canvas's corner, where a thumb lands by accident, so one touch must not throw an arrangement away.
+    touch_reset_armed: bool,
     /// The Touch Controls editor is arranging the menus' system layout rather than the one in use.
     touch_editing_menus: bool,
     /// The shader pack option whose slider is held, and the handle's own position: it follows
@@ -1941,6 +1944,7 @@ impl Default for OptionsUi {
             touch_name_id: None,
             profile_name,
             touch_layout_delete: None,
+            touch_reset_armed: false,
             touch_editing_menus: false,
             shift: false,
 
@@ -2456,6 +2460,7 @@ impl OptionsUi {
         self.touch_name_id = None;
         self.profile_name.focused = false;
         self.touch_layout_delete = None;
+        self.touch_reset_armed = false;
         self.touch_editing_menus = false;
     }
     fn push(&mut self, page: Page) {
@@ -2470,6 +2475,7 @@ impl OptionsUi {
         self.touch_name_id = None;
         self.profile_name.focused = false;
         self.touch_layout_delete = None;
+        self.touch_reset_armed = false;
         // "Edit Layout..." arranges the layout in use: the menus' one is opened by its own entry.
         if page == Page::TouchLayout {
             self.touch_editing_menus = false;
@@ -4187,13 +4193,13 @@ impl OptionsUi {
                 // The overlay at the positions the game draws it; dragging a button moves it. The
                 // hotbar follows the HUD, so it is not part of the editor.
                 let menus = self.touch_editing_menus;
-                out.push(button(
-                    4.0,
-                    4.0,
-                    60.0,
-                    tr("controls.reset"),
-                    Act::TouchReset,
-                ));
+                // Armed by the first press, the button asks again: it sits where a thumb lands.
+                let reset = if self.touch_reset_armed {
+                    Text::literal("Reset?")
+                } else {
+                    tr("controls.reset")
+                };
+                out.push(button(4.0, 4.0, 60.0, reset, Act::TouchReset));
                 out.push(button(68.0, 4.0, 60.0, Text::literal("Add"), Act::TouchAdd));
                 // The menus' layout is a system layout, not a profile: it has none to switch to.
                 if !menus {
@@ -5421,6 +5427,10 @@ impl OptionsUi {
                 } => {
                     self.can_change_value = false;
                     events.push(Event::ButtonClick);
+                    // Any other press on the page withdraws the editor's armed Reset.
+                    if self.touch_reset_armed && !matches!(&act, Act::TouchReset) {
+                        self.touch_reset_armed = false;
+                    }
                     match act {
                         Act::Push(p) => {
                             if matches!(self.page(), Page::TouchOptions(_))
@@ -5514,8 +5524,15 @@ impl OptionsUi {
                         Act::Credits => events.push(Event::Credits),
                         Act::CopyAgentDetails => events.push(Event::CopyAgentDetails),
                         Act::TouchReset => {
-                            s.edited_touch_mut(self.touch_editing_menus).reset_layout();
-                            events.push(Event::Changed);
+                            if self.touch_reset_armed {
+                                self.touch_reset_armed = false;
+                                s.edited_touch_mut(self.touch_editing_menus).reset_layout();
+                                events.push(Event::Changed);
+                            } else {
+                                // One press only arms: the button is in the canvas's corner, and a
+                                // thumb there must not lose an arrangement. The next press resets.
+                                self.touch_reset_armed = true;
+                            }
                         }
                         Act::TouchProfileSwitch(name) => {
                             if s.switch_touch_layout(&name) {
@@ -5974,6 +5991,7 @@ impl OptionsUi {
         self.language_search.focused = false;
         self.profile_name.focused = false;
         self.touch_layout_delete = None;
+        self.touch_reset_armed = false;
         self.can_change_value = false;
         if page == Page::TouchLayout {
             // Out of the editor: the layout in use is the one the touch pages show again.
@@ -6501,6 +6519,10 @@ impl OptionsUi {
                 Some(FocusId::Act(act)) => {
                     let mut events = vec![Event::ButtonClick];
                     let act = act.clone();
+                    // Any other press on the page withdraws the editor's armed Reset.
+                    if self.touch_reset_armed && !matches!(&act, Act::TouchReset) {
+                        self.touch_reset_armed = false;
+                    }
                     match act {
                         Act::Push(p) => {
                             self.focus = None;
@@ -6599,8 +6621,15 @@ impl OptionsUi {
                         Act::Credits => events.push(Event::Credits),
                         Act::CopyAgentDetails => events.push(Event::CopyAgentDetails),
                         Act::TouchReset => {
-                            s.edited_touch_mut(self.touch_editing_menus).reset_layout();
-                            events.push(Event::Changed);
+                            if self.touch_reset_armed {
+                                self.touch_reset_armed = false;
+                                s.edited_touch_mut(self.touch_editing_menus).reset_layout();
+                                events.push(Event::Changed);
+                            } else {
+                                // One press only arms: the button is in the canvas's corner, and a
+                                // thumb there must not lose an arrangement. The next press resets.
+                                self.touch_reset_armed = true;
+                            }
                         }
                         Act::TouchProfileSwitch(name) => {
                             if s.switch_touch_layout(&name) {
