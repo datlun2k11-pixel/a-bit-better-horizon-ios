@@ -538,9 +538,17 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     private func emit(_ kind: Double, phase: Int, location: CGPoint = .zero, slot: Int = -1,
                       modifiers: UIKeyModifierFlags = [], touch: UInt64 = 0) {
         guard active else { return }
-        // If an event storm exhausts the bounded queue, cancel the old gesture
-        // state rather than lose an up edge and leave a button held forever.
-        if pending.count >= 128 { pending = [(ProcessInfo.processInfo.systemUptime, [0, 4, 0, 0, -1], inputContext, 0, 0)] }
+        // If an event storm exhausts the bounded queue, cancel the old gesture state rather than lose an
+        // up edge and leave a button held forever. `kind` 0 is cancel (`phase` 4 is UIKit's cancelled);
+        // the queued releases stay, in order, after it so their buttons let go too.
+        if pending.count >= 128 {
+            let cancel: (Double, [Double], UInt64, UInt32, UInt64) =
+                (ProcessInfo.processInfo.systemUptime, [0, 4, 0, 0, -1], inputContext, 0, 0)
+            let releases = pending.filter { event in
+                event.1.count > 1 && (3...5).contains(Int(event.1[1]))
+            }
+            pending = [cancel] + releases
+        }
         let bits: UInt32 = (modifiers.contains(.shift) ? 1 : 0) | (modifiers.contains(.control) ? 2 : 0)
             | (modifiers.contains(.alternate) ? 4 : 0) | (modifiers.contains(.command) ? 8 : 0)
         pending.append((ProcessInfo.processInfo.systemUptime, [kind, Double(phase), location.x, location.y, Double(slot)], inputContext, bits, touch))
