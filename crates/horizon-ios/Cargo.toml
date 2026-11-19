@@ -1,6 +1,6 @@
 [package]
 name = "horizon-ios"
-version = "0.2.96"
+version = "0.2.97"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
