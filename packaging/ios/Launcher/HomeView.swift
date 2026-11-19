@@ -84,12 +84,15 @@ struct HomeView: View {
         // at launch is still being installed, so neither door touches that zip a second time.
         .task(id: link.phase) { await beginGameFilesSetup() }
         .task(id: link.bootImporting) { await beginGameFilesSetup() }
+        // The game's doors are wired before anything waits, so a Play tapped while the update check is
+        // still running reaches the game instead of the placeholder that refuses with "Account setup is
+        // not ready". The check itself is a task of its own and never holds the launcher back.
         .task {
-            await updates.check()
             link.uncover = onPlay
             link.prepareSession = { try await handOver() }
             await link.watch()
         }
+        .task { await updates.check() }
     }
 
     /// The iPad layout: a navigation rail beside the pages. NavigationSplitView is iOS 16; on iOS 15 a

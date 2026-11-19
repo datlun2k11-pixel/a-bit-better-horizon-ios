@@ -505,6 +505,15 @@ impl ApplicationHandler for Game<'_> {
             self.poll_splitscreen(event_loop);
         }
     }
+    /// The app is being put aside (iOS suspending it): the settings screen can hold a change no file has
+    /// yet (a layout dragged into place, whose own page never saw a Done), and the process may not come
+    /// back, so they go to `options.txt` now. Before a window exists nothing has been arranged by hand,
+    /// so the files are left as they are.
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            self.settings.save(&Game::options_path());
+        }
+    }
     /// The application is ending. On macOS, Quit (Cmd+Q) ends it through
     /// applicationWillTerminate without a CloseRequested; vanilla's GLFW
     /// window turns it into a window close, so Minecraft.stop saves the world.

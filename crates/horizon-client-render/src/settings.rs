@@ -739,7 +739,9 @@ impl Settings {
     }
     pub fn save(&self, path: &Path) {
         self.describe_for_crashes();
-        if let Err(e) = fs::write(path, self.serialize()) {
+        // Through the touch module's atomic write: a kill halfway through must leave the old options, not
+        // a truncated file that the next launch reads as defaults.
+        if let Err(e) = crate::touch::write_atomically(path, &self.serialize()) {
             log::warn!("Horizon: options.txt is not saved: {e}");
         }
         if let Some(dir) = path.parent() {

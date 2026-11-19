@@ -954,6 +954,18 @@ impl ApplicationHandler for Split<'_> {
         }
     }
 
+    /// Every player's settings, each on its own path (`split::options_path` follows the turn), then the
+    /// turn goes back to where it was: a suspension must not seat anyone else.
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        let seat = self.turn;
+        for i in 0..self.players() {
+            if let Some((player, _)) = self.player(i) {
+                player.suspended(event_loop);
+            }
+        }
+        self.turn(seat);
+    }
+
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         for i in (0..self.players()).rev() {
             if let Some((player, _)) = self.player(i) {

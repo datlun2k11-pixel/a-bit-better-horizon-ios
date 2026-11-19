@@ -91,7 +91,14 @@ final class PackStore: ObservableObject {
         guard downloading[project.id] == nil else { return .failure(PackError("This pack is already downloading.")) }
         downloading[project.id] = 0
         defer { downloading[project.id] = nil }
-        let versions = await fetch(URL(string: "\(Self.api)/project/\(project.id)/version")!) as? [[String: Any]] ?? []
+        // The id is Modrinth's own JSON, not ours: escape it (the launcher's other API paths do the same),
+        // and an id no URL can carry is an answer, not a crash.
+        guard let projectID = project.id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let versionsURL = URL(string: "\(Self.api)/project/\(projectID)/version")
+        else {
+            return .failure(PackError("\(project.title) has no readable Modrinth id."))
+        }
+        let versions = await fetch(versionsURL) as? [[String: Any]] ?? []
         // Newest first, as Modrinth lists them: one made for this Minecraft, else the newest of all.
         let fitting = versions.first { ($0["game_versions"] as? [String] ?? []).contains(version) }
         guard let chosen = fitting ?? versions.first,

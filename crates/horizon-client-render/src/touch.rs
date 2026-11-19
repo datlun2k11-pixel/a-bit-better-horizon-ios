@@ -162,10 +162,12 @@ fn contains(r: Rect, (x, y): (f32, f32)) -> bool {
     x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]
 }
 
-/// The button under a point.
+/// The button under a point: the last one painted, which is drawn over the others, so a button moved onto
+/// another (or onto the hotbar) owns the touch it covers.
 pub fn hit(layout: &[(Control, Rect)], at: (f32, f32)) -> Option<Control> {
     layout
         .iter()
+        .rev()
         .find(|(_, r)| contains(*r, at))
         .map(|(c, _)| *c)
 }
@@ -526,6 +528,28 @@ fn unescape_name(name: &str) -> String {
     name.replace("%3A", ":").replace("%25", "%")
 }
 
+/// Write `text` to `path` so a kill leaves either the old file or the new one, never a truncated one: the
+/// text lands in `<name>.tmp` first and is renamed over the path, which is a single step on one filesystem.
+pub(crate) fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, text)?;
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        // A Windows rename will not replace a file that is there: take the old one away and try again.
+        Err(error)
+            if path.exists()
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+        {
+            fs::remove_file(path)?;
+            fs::rename(&temporary, path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// `button:`'s value: the id and the button, in either the old five-field format or the current one.
 fn parse_button(value: &str) -> Option<(u16, CustomButton)> {
     let parts: Vec<&str> = value.split(':').collect();
@@ -585,13 +609,21 @@ fn parse_button(value: &str) -> Option<(u16, CustomButton)> {
 
 impl TouchSettings {
     pub fn load(dir: &Path) -> Self {
-        match fs::read_to_string(dir.join(FILE)) {
+        let path = dir.join(FILE);
+        match fs::read_to_string(&path) {
             Ok(text) => {
                 let mut s = Self::parse(&text);
                 s.spread_stacked_buttons();
                 s
             }
-            Err(_) => Self::default(),
+            Err(error) => {
+                // A layout that is there but cannot be read is not a new player: say so, because the next
+                // save would overwrite what could not be read with this default.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("Horizon: {} is not read: {error}", path.display());
+                }
+                Self::default()
+            }
         }
     }
     /// The menu pad's own layout: the default D-pad arrangement under [`MENU_PROFILE`].
@@ -614,7 +646,9 @@ impl TouchSettings {
     pub fn save_menu(&self, dir: &Path) {
         let path = dir.join(MENU_FILE);
         if *self != Self::menu_default() || path.exists() {
-            let _ = fs::write(path, self.serialize());
+            if let Err(e) = write_atomically(&path, &self.serialize()) {
+                log::warn!("Horizon: {} is not saved: {e}", path.display());
+            }
         }
     }
     /// Written once something differs from the defaults, so players who never touch the overlay get no new
@@ -622,7 +656,9 @@ impl TouchSettings {
     pub fn save(&self, dir: &Path) {
         let path = dir.join(FILE);
         if *self != Self::default() || path.exists() {
-            let _ = fs::write(path, self.serialize());
+            if let Err(e) = write_atomically(&path, &self.serialize()) {
+                log::warn!("Horizon: {} is not saved: {e}", path.display());
+            }
         }
     }
     pub fn parse(text: &str) -> Self {
@@ -1204,7 +1240,10 @@ impl TouchProfiles {
             return;
         }
         for (name, layout) in &self.layouts {
-            let _ = fs::write(folder.join(format!("{name}.txt")), layout.serialize());
+            let path = folder.join(format!("{name}.txt"));
+            if let Err(e) = write_atomically(&path, &layout.serialize()) {
+                log::warn!("Horizon: {} is not saved: {e}", path.display());
+            }
         }
     }
 }
@@ -1540,6 +1579,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_button_drawn_on_top_owns_a_shared_touch() {
+        let layout = vec![
+            (Control::Jump, [0.0, 0.0, 10.0, 10.0]),
+            (Control::Custom(1), [5.0, 5.0, 10.0, 10.0]),
+        ];
+        // The point both cover goes to the one painted last, over the other.
+        assert_eq!(hit(&layout, (6.0, 6.0)), Some(Control::Custom(1)));
+        // A point only the lower one covers still reaches it.
+        assert_eq!(hit(&layout, (1.0, 1.0)), Some(Control::Jump));
     }
 
     #[test]
