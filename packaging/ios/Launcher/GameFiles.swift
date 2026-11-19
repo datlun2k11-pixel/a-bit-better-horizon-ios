@@ -94,10 +94,12 @@ final class GameFilesDownload: NSObject, ObservableObject {
         resolvingAutomatic = true
         attempt = UUID()
         let generation = attempt
+        // Every way out clears the flag, so a generation retired under the request (a cancel, a manual
+        // import) cannot leave the panel busy forever. A newer attempt owns the flag and keeps it.
+        defer { if generation == attempt { resolvingAutomatic = false } }
         state = .downloading(received: 0, total: 0)
         let answer = await automaticSource()
         guard generation == attempt else { return }
-        resolvingAutomatic = false
         guard !Task.isCancelled else { state = .idle; return }
         // A cable/manual import can finish while the source request is pending.
         guard !GameFolder.hasGameFiles else { state = .done("Game files are already installed."); return }
@@ -154,7 +156,10 @@ final class GameFilesDownload: NSObject, ObservableObject {
         // A prepared tree is ~600 MB: ask for the time to finish if the player looks away.
         background = UIApplication.shared.beginBackgroundTask(withName: "Horizon game files") { [weak self] in
             let download = self
-            Task { @MainActor in download?.endBackground() }
+            // The time is up: the app is about to be suspended, and a URLSession left running would
+            // keep the transfer and answer on resume. Take the same way out as a cancel, which
+            // invalidates the session (no late answer is taken) and lets the time go.
+            Task { @MainActor in download?.cancel() }
         }
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         self.session = session
