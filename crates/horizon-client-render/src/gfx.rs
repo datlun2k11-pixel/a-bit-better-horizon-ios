@@ -6998,6 +6998,9 @@ impl Renderer {
         boss_darken: f32,
     ) {
         // lightmap.fsh: per (block, sky) level.
+        // Fullbright is held to the night vision effect's full strength, not a white
+        // lightmap: a cave reads exactly as it does under the effect.
+        let night_vision = if self.fullbright { 1.0 } else { night_vision };
         let brightness = |level: f32| level / (4.0 - 3.0 * level);
         let mut pixels = [0u8; 16 * 16 * 4];
         for s in 0..16 {
@@ -7028,9 +7031,6 @@ impl Renderer {
                 pixels[i + 2] = (color.z * 255.0) as u8;
                 pixels[i + 3] = 255;
             }
-        }
-        if self.fullbright {
-            pixels.fill(255);
         }
         // The lightmap changes with the time of day, flicker and effects,
         // not every frame: upload only what differs from the texture.

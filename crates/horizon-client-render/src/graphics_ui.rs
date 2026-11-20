@@ -222,6 +222,7 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "How far mobs, crops and machines keep working. CPU time.",
                         ),
                         v(Opt::Gamma, None, "Brightens dark places."),
+                        e(crate::extras::Item::Fullbright, None),
                     ],
                 ),
                 (
@@ -320,7 +321,6 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         v(Opt::Vignette, None, "Darkens the screen's edges."),
                         v(Opt::ChunkFade, None, "Fades newly loaded chunks in."),
                         e(crate::extras::Item::DynamicLights, Low),
-                        e(crate::extras::Item::Fullbright, None),
                     ],
                 ),
                 (

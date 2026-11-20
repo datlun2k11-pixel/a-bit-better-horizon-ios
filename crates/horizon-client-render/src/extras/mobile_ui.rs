@@ -238,7 +238,7 @@ impl Item {
             | Item::ChatAnimation
             | Item::ChatIndicator
             | Item::Splitscreen => self.shared().unwrap().caption(),
-            Item::Fullbright => "Fullbright",
+            Item::Fullbright => "Fully bright",
             Item::DynamicLights => "Dynamic lights",
             Item::OwnNameTag => "Own name tag",
             Item::Zoom => "Zoom",
@@ -308,7 +308,7 @@ impl Item {
             | Item::ChatAnimation
             | Item::ChatIndicator
             | Item::Splitscreen => self.shared().unwrap().description(),
-            Item::Fullbright => "Show blocks and entities at full light, even in dark areas.",
+            Item::Fullbright => "Sees in the dark as the night vision effect does, even where no light reaches. Held off on another's server.",
             Item::DynamicLights => {
                 "Torches and other light sources held, dropped or on fire light the blocks around them."
             }

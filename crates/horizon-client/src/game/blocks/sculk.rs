@@ -1601,6 +1601,15 @@ impl Game<'_> {
         (modifier, pulse.max(0.0) * scale)
     }
 
+    /// The frame's night vision scale: the effect's intensity, or the Fully bright
+    /// extra's (the effect at full strength), which another's server holds back.
+    pub(super) fn frame_night_vision(&self, partial: f32) -> f32 {
+        if self.settings.extras.fullbright && !self.settings.fullbright_held {
+            1.0
+        } else {
+            self.night_vision_intensity(partial)
+        }
+    }
     /// `LightmapRenderStateExtractor`: the night vision effect's intensity
     /// (`GameRenderer.nightVisionScale`), or conduit power's water vision.
     pub(super) fn night_vision_intensity(&self, partial: f32) -> f32 {

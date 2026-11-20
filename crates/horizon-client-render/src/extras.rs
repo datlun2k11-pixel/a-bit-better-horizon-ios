@@ -633,7 +633,7 @@ impl Item {
     /// `horizon.extras.*` in en_us.json.
     pub fn caption(self) -> &'static str {
         match self {
-            Item::Fullbright => "Fullbright",
+            Item::Fullbright => "Fully bright",
             Item::DynamicLights => "Dynamic lights",
             Item::OwnNameTag => "Own name tag",
             Item::HideBlockParticles => "Hide block-break particles",
@@ -678,7 +678,7 @@ impl Item {
             Item::Pregen => {
                 "Enables /pregen in your single-player and LAN worlds. With cheats enabled, use /pregen start to generate an area before exploring it. Does not enable the command on servers you join."
             }
-            Item::Fullbright => "Show blocks and entities at full light, even in dark areas.",
+            Item::Fullbright => "Sees in the dark as the night vision effect does, even where no light reaches. Held off on another's server.",
             Item::DynamicLights => {
                 "Torches and other light sources held, dropped or on fire light the blocks around them."
             }

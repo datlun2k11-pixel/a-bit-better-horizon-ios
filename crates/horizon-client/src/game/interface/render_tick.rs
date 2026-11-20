@@ -276,6 +276,13 @@ impl Game<'_> {
     /// `FogRenderer.computeFogColor`'s night vision brightenFactor:
     /// `GameRenderer.nightVisionScale`, but not while Darkness is on.
     fn fog_night_vision(&self) -> f32 {
+        // The Fully bright extra brightens the fog as the effect at full strength does.
+        if self.settings.extras.fullbright
+            && !self.settings.fullbright_held
+            && self.potions.effects.get("darkness").is_none()
+        {
+            return 1.0;
+        }
         let partial = self.clock.fraction() as f32;
         match self.potions.effects.get("night_vision") {
             Some(e) if self.potions.effects.get("darkness").is_none() => {
