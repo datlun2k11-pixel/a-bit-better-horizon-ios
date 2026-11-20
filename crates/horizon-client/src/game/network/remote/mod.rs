@@ -9,6 +9,8 @@
 mod selector_metadata;
 use selector_metadata::hurt_sound_for;
 mod attack_target;
+// The iOS fork's mannequin pose and animation state, which its mob code ticks.
+pub(super) mod avatar_animation;
 mod break_prediction;
 mod fall_sound;
 mod interaction_actions;

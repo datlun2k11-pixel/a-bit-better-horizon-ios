@@ -1,5 +1,5 @@
 //! Motion through the same avatar-state helper the real remote entity tick calls.
-#[path = "../../src/game/remote/avatar_animation.rs"]
+#[path = "../../src/game/network/remote/avatar_animation.rs"]
 mod avatar_animation;
 
 use horizon_client::mobs::{Mob, MobTypes};
