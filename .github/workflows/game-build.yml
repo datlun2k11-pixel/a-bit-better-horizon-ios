@@ -347,7 +347,7 @@ jobs:
           set -euo pipefail
           # After the client is packaged: target/release/horizon-client is rebuilt without the audio and
           # controllers features, so it needs neither libasound nor libudev (minimal server images lack them).
-          cargo build --release --locked -p horizon-client --no-default-features --bin horizon-client
+          cargo build --release --locked -p horizon-game --no-default-features --bin horizon-client
           cargo run --locked -p xtask -- package-server target/release/horizon-client "dist/${{ matrix.server_dir }}"
           folder="dist/${{ matrix.server_dir }}"
           python3 tools/check_imports.py --server "$folder/horizon-engine" "$folder/horizon-server" "$folder/horizon-prepare"
