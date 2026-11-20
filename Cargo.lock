@@ -156,7 +156,7 @@ version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "523e5e187fff36fcb8d1d19ccf0ca4ca43ec3d158316057f66dc6f72716bc5ec"
 dependencies = [
- "object",
+ "object 0.39.1",
 ]
 
 [[package]]
@@ -164,7 +164,6 @@ name = "arbitrary"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
-
 
 [[package]]
 name = "arboard"
@@ -1862,11 +1861,10 @@ dependencies = [
  "horizon-dualsense",
  "horizon-engine-slots",
  "horizon-friends",
- "horizon-gamecontroller",
  "horizon-game-discovery",
+ "horizon-gamecontroller",
  "horizon-gameplay",
  "horizon-guest-stack",
-
  "horizon-hdr",
  "horizon-hooks",
  "horizon-ios-launcher",
@@ -1908,7 +1906,6 @@ dependencies = [
  "sha2",
  "stacker",
  "tempfile",
-
  "toml",
  "unicode-bidi",
  "unicode_names2",
@@ -1948,11 +1945,10 @@ version = "0.2.97"
 dependencies = [
  "arboard",
  "horizon-client-core",
- "horizon-gamecontroller",
  "horizon-engine-slots",
+ "horizon-gamecontroller",
  "horizon-hooks",
  "horizon-mod-api-macros",
-
  "horizon-theme",
  "log",
  "png",
@@ -1982,11 +1978,10 @@ dependencies = [
  "horizon-command",
  "horizon-core",
  "horizon-cosmetics",
- "horizon-friends",
  "horizon-engine-slots",
+ "horizon-friends",
  "horizon-game-discovery",
  "horizon-guest-stack",
-
  "horizon-hdr",
  "horizon-hooks",
  "horizon-ios-launcher",
@@ -2059,7 +2054,6 @@ dependencies = [
  "horizon-cosmetics",
  "horizon-engine-slots",
  "horizon-guest-stack",
-
  "horizon-hdr",
  "horizon-hooks",
  "horizon-items",
@@ -2217,6 +2211,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-gamecontroller"
+version = "0.2.97"
+dependencies = [
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "objc2-game-controller",
+ "objc2-ui-kit 0.3.2",
+]
+
+[[package]]
 name = "horizon-gameplay"
 version = "0.1.0"
 dependencies = [
@@ -2245,16 +2249,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "horizon-gamecontroller"
-version = "0.2.97"
-dependencies = [
- "objc2 0.6.5",
- "objc2-foundation 0.3.2",
- "objc2-game-controller",
- "objc2-ui-kit 0.3.2",
-]
-
-[[package]]
 name = "horizon-hdr"
 version = "0.2.97"
 dependencies = [
@@ -2279,6 +2273,21 @@ name = "horizon-hooks"
 version = "0.1.0"
 
 [[package]]
+name = "horizon-hot-paths-game"
+version = "0.1.0"
+dependencies = [
+ "horizon-client",
+ "horizon-guest-stack",
+ "horizon-mod-api",
+ "horizon-mod-host",
+ "horizon-mod-package",
+]
+
+[[package]]
+name = "horizon-internals"
+version = "0.1.0"
+
+[[package]]
 name = "horizon-ios"
 version = "0.2.97"
 dependencies = [
@@ -2293,21 +2302,6 @@ dependencies = [
  "libc",
  "log",
 ]
-
-[[package]]
-name = "horizon-hot-paths-game"
-version = "0.1.0"
-dependencies = [
- "horizon-client",
- "horizon-guest-stack",
- "horizon-mod-api",
- "horizon-mod-host",
- "horizon-mod-package",
-]
-
-[[package]]
-name = "horizon-internals"
-version = "0.1.0"
 
 [[package]]
 name = "horizon-items"
@@ -2410,24 +2404,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "horizon-mods"
-version = "0.2.97"
-dependencies = [
- "horizon-shader-api",
- "log",
- "minisign-verify",
- "serde",
- "serde_json",
- "sha2",
- "toml",
- "wasmparser",
- "zip",
-]
-
-[[package]]
 name = "horizon-mod-dimension-game"
 version = "0.1.0"
-
 dependencies = [
  "horizon-client",
  "horizon-mod-api",
@@ -2806,7 +2784,6 @@ dependencies = [
  "horizon-dnssd",
  "horizon-mod-runtime",
  "horizon-threads",
-
  "horizon-world",
  "idna",
  "idna_adapter",
@@ -4855,7 +4832,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
-
 ]
 
 [[package]]
