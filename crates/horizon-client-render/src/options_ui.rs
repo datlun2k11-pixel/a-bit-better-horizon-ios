@@ -6175,11 +6175,11 @@ impl OptionsUi {
             let Some(m) = s.mods.installed.get(i) else {
                 return Vec::new();
             };
-            let Some([key, ..]) = m.native.as_ref().and_then(|p| p.keys.get(k)) else {
+            let Some(mapping) = m.native.as_ref().and_then(|p| p.mappings.get(k)) else {
                 return Vec::new();
             };
             let keys = s.mods.keys.entry(m.id.clone()).or_default();
-            keys.insert(key.clone(), value);
+            keys.insert(mapping.id.clone(), value);
             return vec![Event::Changed];
         }
         if !s.extras.set_key(name, value.clone()) && !s.horizon.set_key(name, value.clone()) {

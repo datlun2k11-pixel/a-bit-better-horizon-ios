@@ -1257,8 +1257,10 @@ fn add_sprite_renames(
     };
     let atlases: Vec<_> = ["blocks", "items"]
         .into_iter()
-        .filter_map(|atlas| merged.get(&format!("assets/minecraft/atlases/{atlas}.json")))
-        .filter_map(|bytes| decode(std::str::from_utf8(bytes).ok()?))
+        .filter_map(|atlas| {
+            let (_, (_, text)) = merged.get(&format!("assets/minecraft/atlases/{atlas}.json"))?;
+            decode(text)
+        })
         .collect();
     let renamed = |source: &SpriteSource| matches!(source, SpriteSource::Single { resource, sprite: Some(sprite) } if sprite != resource);
     if !atlases.iter().flatten().any(renamed) {

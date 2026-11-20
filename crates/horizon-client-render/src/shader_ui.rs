@@ -691,7 +691,7 @@ impl ShaderUi {
             style::WHITE,
             true,
         );
-        shell::dock_note(batch, atlas, &cols, text, style::GREY, None);
+        shell::dock_note(batch, atlas, &cols, text, None, style::GREY);
 
         let mut foot = vec![(cols.button(0), "gui.done", Target::Done, Declared::Done)];
         if Self::pending(s) {

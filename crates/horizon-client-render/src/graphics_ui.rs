@@ -1760,7 +1760,7 @@ impl GraphicsUi {
                 (lang::get(page.about()), style::GREY)
             }
         };
-        shell::dock_note(batch, atlas, cols, text, color, None);
+        shell::dock_note(batch, atlas, cols, text, None, color);
     }
 
     /// A press (or a drag with `drag`) at `(x, y)`.

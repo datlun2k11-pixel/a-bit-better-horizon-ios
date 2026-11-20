@@ -815,7 +815,7 @@ impl ControllerUi {
         };
         let name = Text::literal(name);
         batch.text_styled(atlas, &name, x + 12.0, y + 8.0, style::WHITE, true);
-        shell::dock_note(batch, atlas, cols, text, style::GREY, None);
+        shell::dock_note(batch, atlas, cols, text, None, style::GREY);
     }
     /// What a row does. A binding names the controller's own buttons, and what else its button
     /// does when it shares it.
