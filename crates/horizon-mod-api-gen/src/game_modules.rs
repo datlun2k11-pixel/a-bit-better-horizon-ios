@@ -5,7 +5,30 @@ use std::{fs, path::Path};
 pub(crate) const INCLUDE: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/game_modules.rs\"));";
 
 pub(crate) fn declarations(game: &Path) -> Result<String, String> {
-    horizon_game_discovery::declarations(game, &["native_hooks", "host", "creatures"])
+    // The iOS fork's flat modules beside `game.rs` are declared by the file itself
+    // (horizon-client's build.rs lists the same names) and must be skipped here too.
+    horizon_game_discovery::declarations(
+        game,
+        &[
+            "native_hooks",
+            "host",
+            "creatures",
+            "airplay",
+            "avatar_equipment_fixture",
+            "chat_input",
+            "extras_ios",
+            "import_screen",
+            "input_mode",
+            "lan_idle_backend_tests",
+            "launcher",
+            "memory_warning",
+            "mods_control",
+            "presentation",
+            "process_retirement_tests",
+            "splitscreen",
+            "touch",
+        ],
+    )
 }
 
 const NATIVE: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/native_hook_modules.rs\"));";
