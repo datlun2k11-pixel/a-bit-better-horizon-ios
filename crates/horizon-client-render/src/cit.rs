@@ -235,7 +235,7 @@ impl CitRules {
             return false;
         }
         // ItemStack.getDamageValue clamps reads and honors an explicitly removed component.
-        let damage = stack.damage_value(max_damage);
+        let damage = (stack.damage.min(i32::MAX as u32) as i32).clamp(0, max_damage.min(i32::MAX as u32) as i32);
         if rule
             .damage
             .as_ref()

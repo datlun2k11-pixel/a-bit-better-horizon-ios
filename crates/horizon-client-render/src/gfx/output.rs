@@ -151,6 +151,8 @@ pub struct EffectiveOutput {
     pub(crate) reported: Option<Reported>,
     /// The device draws HDR's frame (`OutputCapabilities::hdr_frame`).
     pub(crate) hdr_frame_supported: bool,
+    /// The device draws, blends and filters the 16-bit frame (Smooth Gradients).
+    pub(crate) wide_frame_supported: bool,
     /// HDR output is held back on this window's graphics driver (`OutputCapabilities::held`).
     pub(crate) held: bool,
     /// The HDR output presented; `None` is SDR.
@@ -203,6 +205,7 @@ impl EffectiveOutput {
         system_hdr: None,
         reported: None,
         hdr_frame_supported: true,
+        wide_frame_supported: false,
         held: false,
         encoding: None,
         frame: FrameConfiguration {
@@ -345,6 +348,7 @@ pub(crate) fn resolve_output(
         system_hdr: reading.hdr,
         reported: reading.luminance,
         hdr_frame_supported: caps.hdr_frame(),
+        wide_frame_supported: caps.float_frame,
         held: caps.held,
         encoding: caps
             .hdr

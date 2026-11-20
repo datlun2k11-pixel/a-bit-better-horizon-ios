@@ -626,7 +626,7 @@ impl Game<'_> {
             r.set_frame_generation(
                 s.horizon.frame_generation != horizon_client::graphics::FrameGeneration::Off,
             );
-            r.set_hdr_lighting(s.horizon.hdr_look == horizon_client::graphics::HdrLook::Horizon);
+            r.set_hdr_lighting(s.horizon.hdr_lighting);
             // Where it is offered (`Renderer::gpu_culling_offer`); unchanged, it does nothing.
             // Auto has it on while its measurements say so (`GpuCullingAuto`), and starts over
             // when the choice is another one.

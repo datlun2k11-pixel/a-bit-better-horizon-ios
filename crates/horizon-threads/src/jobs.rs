@@ -311,6 +311,14 @@ impl Pool {
     pub fn notify_all(&self) {
         self.inner.notify(true);
     }
+
+    /// A memory warning: every idle source gives back what it keeps between
+    /// jobs now, without waiting out the idle delay, and then the allocator's
+    /// free pages.
+    pub fn trim(&self) {
+        release_quiet_sources(&self.inner, true);
+        crate::release_free_memory();
+    }
 }
 
 impl Inner {
@@ -408,7 +416,7 @@ fn choose(inner: &Inner) -> Option<(Arc<Entry>, bool)> {
 /// pool's own release needs every worker idle at once, which a client that
 /// keeps meshing after its world loaded never is, while its server's
 /// generator holds buffers and caches nothing reads until the player moves on.
-fn release_quiet_sources(inner: &Inner) {
+fn release_quiet_sources(inner: &Inner, force: bool) {
     let quiet: Vec<Arc<Entry>> = inner
         .sources
         .read()
@@ -417,7 +425,7 @@ fn release_quiet_sources(inner: &Inner) {
         .filter(|e| {
             !e.quiet.load(Ordering::SeqCst)
                 && e.running.load(Ordering::SeqCst) == 0
-                && lock(&e.last_job).elapsed() >= inner.idle_release
+                && (force || lock(&e.last_job).elapsed() >= inner.idle_release)
                 && e.source.next().is_none()
         })
         .cloned()
@@ -486,7 +494,7 @@ fn work(inner: &Inner, worker: usize) {
                 inner.finished.notify_all();
             }
             idle_since = Instant::now();
-            release_quiet_sources(inner);
+            release_quiet_sources(inner, false);
             // Asked to give memory back while jobs keep this worker busy (no
             // gap for the timed checks below): do it between two jobs.
             if crate::release_asked(&mut release_seen) {

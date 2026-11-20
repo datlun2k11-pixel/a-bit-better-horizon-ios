@@ -68,6 +68,22 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 fn on_off(v: bool) -> Text {
     tr(if v { "options.on" } else { "options.off" })
 }
+/// A native mod's setting as its row says it: the label, then the value.
+fn mod_setting_label(setting: &crate::mod_list::NativeSetting) -> Text {
+    use crate::mod_list::NativeSettingValue as V;
+    let value = match &setting.value {
+        V::Toggle(on) => on_off(*on),
+        V::Choice { options, index } => options
+            .get(*index)
+            .map_or_else(|| Text::literal(""), |o| tr(o)),
+        V::Range { value, .. } => {
+            let shown = format!("{value:.2}");
+            Text::literal(shown.trim_end_matches('0').trim_end_matches('.'))
+        }
+        V::Color(rgb) => Text::literal(format!("#{rgb:06X}")).with_color(*rgb),
+    };
+    Text::option_name_value(tr(&setting.label), value)
+}
 /// A touch button's slider position (0..1) as its setting, stepped as the overlay's are. `t` is the
 /// layout the touch screens edit: the one in use, or the menus' own.
 fn set_touch_slider(
@@ -1503,9 +1519,9 @@ enum Act {
     HudEditor,
     /// The installed native mod's settings page.
     ModSettings(usize),
-    /// A native mod's key (mod, key) waits for a key; a button of its page.
+    /// A native mod's key (mod, key) waits for a key; a setting of its page.
     NativeKey(usize, usize),
-    NativeButton(usize, usize),
+    NativeSetting(usize, usize),
     OpenModFolder,
     /// Browse mods: the page of listing `.0` of `mod_browser`.
     ModProject(usize),
@@ -1721,9 +1737,9 @@ pub enum Event {
     /// Native mod `.0`'s page opened: the game asks the mod for its labels
     /// again (they were made with the list, maybe in another language).
     NativeSettings(usize),
-    /// Button `.1` of native mod `.0`'s page was pressed: the game tells the
+    /// A setting of native mod `.0`'s page was changed: the game tells the
     /// mod and refreshes the page.
-    NativeButton(usize, usize),
+    NativeSetting(usize, usize),
     /// Roll the credits (`CreditsAndAttributionScreen.openCreditsScreen`).
     Credits,
     /// PvP & HUD's Edit HUD: open the HUD editor over the game.
@@ -2943,7 +2959,7 @@ impl OptionsUi {
         let settings = s.mods.installed[i]
             .native
             .as_ref()
-            .is_some_and(|page| !page.keys.is_empty() || !page.buttons.is_empty());
+            .is_some_and(|page| !page.mappings.is_empty() || !page.settings.is_empty());
         if settings {
             Row::Buttons(
                 toggle(150.0),
@@ -2960,7 +2976,7 @@ impl OptionsUi {
         }
     }
     /// A native mod's page: its name, its keys as Key Binds rows (the
-    /// player's choice, else the default), then its buttons.
+    /// player's choice, else the default), then its settings.
     fn native_rows(&self, s: &Settings, i: usize) -> Vec<Row> {
         let Some(m) = s.mods.installed.get(i) else {
             return Vec::new();
@@ -2970,8 +2986,10 @@ impl OptionsUi {
             return rows;
         };
         let chosen = s.mods.keys.get(&m.id);
-        for (k, [name, label, default]) in page.keys.iter().enumerate() {
-            let key = chosen.and_then(|c| c.get(name)).unwrap_or(default);
+        for (k, mapping) in page.mappings.iter().enumerate() {
+            let key = chosen
+                .and_then(|c| c.get(&mapping.id))
+                .unwrap_or(&mapping.key);
             let mut message = keybinds::display_name(key);
             if self.selected_native_key == Some((i, k)) {
                 message = Text::literal("> ")
@@ -2979,17 +2997,23 @@ impl OptionsUi {
                     .append(" <")
                     .with_color(text::YELLOW);
             }
-            let caption = button(0.0, 0.0, 150.0, Text::literal(label.clone()), Act::None);
+            let caption = button(
+                0.0,
+                0.0,
+                150.0,
+                Text::literal(mapping.label.clone()),
+                Act::None,
+            );
             let change = button(0.0, 0.0, 150.0, message, Act::NativeKey(i, k));
             rows.push(Row::Buttons(inactive(caption), Some(change)));
         }
-        for (b, label) in page.buttons.iter().enumerate() {
+        for (j, setting) in page.settings.iter().enumerate() {
             let widget = button(
                 0.0,
                 0.0,
                 310.0,
-                Text::literal(label.clone()),
-                Act::NativeButton(i, b),
+                mod_setting_label(setting),
+                Act::NativeSetting(i, j),
             );
             rows.push(Row::Buttons(widget, None));
         }
@@ -3866,7 +3890,9 @@ impl OptionsUi {
                     if installed
                         .native
                         .as_ref()
-                        .is_some_and(|page| !page.keys.is_empty() || !page.buttons.is_empty())
+                        .is_some_and(|page| {
+                            !page.mappings.is_empty() || !page.settings.is_empty()
+                        })
                     {
                         let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
                         let settings = button(
@@ -4614,7 +4640,8 @@ impl OptionsUi {
         if self.page() == Page::HdrCalibration
             && let Some(c) = &self.calibration
         {
-            c.draw(batch, atlas, cursor);
+            let l = c.draw_background(batch, atlas);
+            c.draw_contents(batch, atlas, cursor, l);
             return;
         }
         if Self::graphics_page(self.page()).is_some() {
@@ -4635,22 +4662,22 @@ impl OptionsUi {
             self.split_setup.on = s.extras.splitscreen;
             // The controller picks a tile up between presses: the screen's size from the draw.
             self.split_setup.size = (batch.width, batch.height);
-            self.split_setup.draw(batch, atlas, cursor, self.in_world);
+            self.split_setup.draw_contents(batch, atlas, cursor);
             return;
         }
         if self.page() == Page::SplitProfiles {
-            self.split_profiles
-                .draw(
-                    batch,
-                    atlas,
-                    cursor,
-                    self.in_world,
-                    crate::pad_glyph::Glyphs::of(&s.controller, self.pad_style),
-                );
+            self.split_profiles.draw_contents(
+                batch,
+                atlas,
+                cursor,
+                crate::pad_glyph::Glyphs::of(&s.controller, self.pad_style),
+            );
             return;
         }
         if self.page() == Page::Studio {
-            self.studio.draw(batch, atlas, cursor, self.in_world);
+            let panel = self.studio.draw_background(batch, atlas, self.in_world);
+            self.studio
+                .draw_contents(batch, atlas, cursor, panel);
             return;
         }
         if self.page() == Page::Packs {
@@ -5498,7 +5525,18 @@ impl OptionsUi {
                             self.selected_key = Some(NATIVE_KEY);
                             self.selected_native_key = Some((i, k));
                         }
-                        Act::NativeButton(i, b) => events.push(Event::NativeButton(i, b)),
+                        Act::NativeSetting(i, j) => {
+                            let setting = s
+                                .mods
+                                .installed
+                                .get_mut(i)
+                                .and_then(|m| m.native.as_mut())
+                                .and_then(|page| page.settings.get_mut(j));
+                            if let Some(setting) = setting {
+                                setting.value.click();
+                                events.push(Event::NativeSetting(i, j));
+                            }
+                        }
                         Act::OpenModFolder => events.push(Event::OpenModFolder),
                         Act::ModProject(i) => {
                             if let Some(listing) = self.mod_browser.listings.get(i) {
@@ -6595,7 +6633,18 @@ impl OptionsUi {
                             self.selected_key = Some(NATIVE_KEY);
                             self.selected_native_key = Some((i, k));
                         }
-                        Act::NativeButton(i, b) => events.push(Event::NativeButton(i, b)),
+                        Act::NativeSetting(i, j) => {
+                            let setting = s
+                                .mods
+                                .installed
+                                .get_mut(i)
+                                .and_then(|m| m.native.as_mut())
+                                .and_then(|page| page.settings.get_mut(j));
+                            if let Some(setting) = setting {
+                                setting.value.click();
+                                events.push(Event::NativeSetting(i, j));
+                            }
+                        }
                         Act::OpenModFolder => events.push(Event::OpenModFolder),
                         Act::ModProject(i) => {
                             if let Some(listing) = self.mod_browser.listings.get(i) {

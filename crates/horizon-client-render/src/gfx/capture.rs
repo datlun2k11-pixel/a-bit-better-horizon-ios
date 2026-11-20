@@ -69,8 +69,6 @@ impl Copies {
 fn copy(mesh: &SectionMesh) -> SectionMesh {
     SectionMesh {
         solid: mesh.solid.clone(),
-        solid_states: mesh.solid_states.clone(),
-        translucent_states: mesh.translucent_states.clone(),
         solid_sources: mesh.solid_sources.clone(),
         sides: mesh.sides,
         translucent: mesh.translucent.clone(),

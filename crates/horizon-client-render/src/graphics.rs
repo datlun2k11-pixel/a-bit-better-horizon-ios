@@ -940,6 +940,8 @@ pub struct Graphics {
     pub fxaa: bool,
     /// TAA over the world (FXAA is off while it is on).
     pub taa: bool,
+    /// 4x MSAA on opaque and cutout terrain (FXAA and TAA are off while it is on).
+    pub msaa4x: bool,
     /// TAA upscaling; anything but `Native` comes with `taa` on.
     pub upscaling: Upscaling,
     /// How much the upscaled picture is sharpened, 0..=100 (percent of the most).
@@ -962,6 +964,9 @@ pub struct Graphics {
     /// HDR brightness of the HUD and menus, in nits; 0 is Auto: at paper white
     /// ([`Graphics::ui_nits`]). The first-person hand stays at the world's.
     pub hdr_ui_nits: u32,
+    /// HDR Color Boost, 0..=100 percent: how far HDR output stretches the picture's BT.709
+    /// colours toward the display's own primaries. 0, the default, shows the colours exactly.
+    pub hdr_color_boost: u32,
     /// HDR Lighting: Horizon's lift of light sources and the sun above paper white; lit surfaces
     /// stay at it. Off, HDR output shows the same picture as SDR, for shader packs or the vanilla
     /// look.
@@ -1042,6 +1047,7 @@ impl Default for Graphics {
             target_fps: 60,
             fxaa: false,
             taa: false,
+            msaa4x: false,
             upscaling: Upscaling::Native,
             upscaling_sharpness: 85,
             screenshot_quality: 1,
@@ -1051,6 +1057,7 @@ impl Default for Graphics {
             hdr_peak: 0,
             hdr_black_level: 0,
             hdr_ui_nits: 0,
+            hdr_color_boost: 0,
             hdr_lighting: true,
             hdr_key: "key.keyboard.unknown".into(),
             hdr_failed_start: None,
@@ -1216,6 +1223,7 @@ impl Graphics {
                 "targetFps" => g.target_fps = number(g.target_fps).clamp(30, 240),
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "taa" => g.taa = flag(g.taa),
+                "msaa4x" => g.msaa4x = flag(g.msaa4x),
                 "upscaling" => g.upscaling = Upscaling::parse(value),
                 "upscalingSharpness" => {
                     g.upscaling_sharpness = number(g.upscaling_sharpness).min(100)
@@ -1239,6 +1247,7 @@ impl Graphics {
                     }
                 }
                 "hdrBlackLevel" => g.hdr_black_level = number(g.hdr_black_level).min(100),
+                "hdrColorBoost" => g.hdr_color_boost = number(g.hdr_color_boost).min(100),
                 "hdrFailedStart" => g.hdr_failed_start = Some(value.to_owned()),
                 "batteryMode" => g.battery = flag(g.battery),
                 "shadowCache" => g.shadow_cache = flag(g.shadow_cache),
@@ -1269,7 +1278,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nopaqueIce:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\ndynamicResolution:{}\ntargetFps:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscalingSharpness:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiNits:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\nparallelTick:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nopaqueIce:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\ndynamicResolution:{}\ntargetFps:{}\nfxaa:{}\ntaa:{}\nmsaa4x:{}\nupscaling:{}\nupscalingSharpness:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiNits:{}\nhdrColorBoost:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\nparallelTick:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -1310,6 +1319,7 @@ impl Graphics {
             self.target_fps,
             bool_text(self.fxaa),
             bool_text(self.taa),
+            bool_text(self.msaa4x),
             self.upscaling.name(),
             self.upscaling_sharpness,
             self.screenshot_quality,
@@ -1319,6 +1329,7 @@ impl Graphics {
             self.hdr_peak,
             self.hdr_black_level,
             self.hdr_ui_nits,
+            self.hdr_color_boost,
             bool_text(self.hdr_lighting),
             self.hdr_key,
             bool_text(self.battery),

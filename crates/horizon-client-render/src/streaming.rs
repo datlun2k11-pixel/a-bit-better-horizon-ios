@@ -235,6 +235,7 @@ struct MeshSettings {
     shader_pack_lighting: bool,
     separate_ao: bool,
     shader_pack: bool,
+    looks: bool,
     zoom: BiomeZoom,
     blend_radius: i32,
     smooth_lighting: bool,
@@ -554,6 +555,12 @@ pub struct Streaming {
     /// A `shaders/` pack draws the terrain: fluid tops split as Iris splits them
     /// (`Mesher::shader_pack`).
     pub shader_pack: bool,
+    /// A shader API 0.2 pack reads the terrain's own inputs: quads carry their looks
+    /// (`Mesher::looks`, `Renderer::terrain_looks`).
+    pub looks: bool,
+    /// The ray scene keeps them (`Renderer::ray_looks`): with `looks`, what meshes the world
+    /// again when it changes.
+    pub ray_looks: bool,
     /// `BiomeManager`'s zoom seed (the hashed world seed) and `biomeBlendRadius`.
     pub biome_zoom: BiomeZoom,
     pub biome_blend: i32,
@@ -1024,6 +1031,7 @@ impl<G: ChunkGenerator> Jobs<G> {
                     shader_pack_lighting: settings.shader_pack_lighting,
                     separate_ao: settings.separate_ao,
                     shader_pack: settings.shader_pack,
+                    looks: settings.looks,
                     zoom: settings.zoom,
                     blend_radius: settings.blend_radius,
                     smooth_lighting: settings.smooth_lighting,
@@ -1036,6 +1044,8 @@ impl<G: ChunkGenerator> Jobs<G> {
                     tables: &context.tables,
                     biomes: &context.biomes,
                     visibility,
+                    hidden_states: &context.hidden_states,
+                    part_tables: &context.part_tables,
                 };
                 let recycled = shared.meshes.lock().unwrap().take();
                 let mut mesh = mesher.mesh_reusing(&borrow(&region), sy, recycled, mesh_scratch);
@@ -1053,6 +1063,11 @@ pub struct WorkerContext {
     pub tables: Arc<MeshTables>,
     pub biomes: Arc<crate::biome::Biomes>,
     pub light: Arc<LightTables>,
+    /// The block states a mod hides from the mesher, by state id (`Mesher::hidden_states`);
+    /// empty for none.
+    pub hidden_states: Arc<[bool]>,
+    /// The client `BlockPart` answers the mesher reads (`Mesher::part_tables`); empty for none.
+    pub part_tables: Arc<crate::mesher::part_tables::PartTables>,
 }
 mod bounded;
 mod queue_census;
@@ -1153,6 +1168,8 @@ impl Streaming {
             shader_pack_lighting: false,
             separate_ao: false,
             shader_pack: false,
+            looks: false,
+            ray_looks: false,
             biome_zoom: BiomeZoom::new(0),
             biome_blend: 2,
             smooth_lighting: true,
@@ -1732,7 +1749,18 @@ impl Streaming {
         let mut columns = std::mem::take(&mut self.mesh_columns_scratch);
         columns.clear();
         ExtraCover::refresh(&mut self.cover, &self.extra);
-        ForcedCover::refresh(&mut self.forced_cover, &self.forced, &self.mod_forced);
+        // Native mods' tickets keep their chunks as `/forceload` ones.
+        if self.mod_forced.is_empty() {
+            ForcedCover::refresh(&mut self.forced_cover, &self.forced);
+        } else {
+            let all: HashSet<(i32, i32)> = self
+                .forced
+                .iter()
+                .chain(&self.mod_forced)
+                .copied()
+                .collect();
+            ForcedCover::refresh(&mut self.forced_cover, &all);
+        }
         self.cover_current = true;
         // The sweeps below walk every loaded column and proto chunk. Run them
         // at once when the view moves and every eighth tick otherwise: a
@@ -2169,6 +2197,7 @@ impl Streaming {
                             shader_pack_lighting: self.shader_pack_lighting,
                             separate_ao: self.separate_ao,
                             shader_pack: self.shader_pack,
+                            looks: self.looks,
                             zoom: self.biome_zoom,
                             blend_radius: self.biome_blend,
                             smooth_lighting: self.smooth_lighting,

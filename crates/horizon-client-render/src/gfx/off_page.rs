@@ -1,5 +1,13 @@
+//! `move_off_page`, moved out of `gfx.rs` unchanged.
 use super::*;
 
+/// `Renderer::compact_arena`'s and `shrink_translucent`'s moves: what the meshes
+/// hold on `page` of `arena` (`part`) goes to its other pages in video memory,
+/// until the next range would pass `budget` bytes (it keeps what is left; the
+/// first range moves whatever its size, so none keeps the page closed), the
+/// copies into `encoder`, the ranges' flat draw ids (`flat`) and, in the
+/// section arena, GPU culling's records (`records`) along. False when the other
+/// pages have no room left.
 pub(super) fn move_off_page<'a>(
     arena: &mut arena::Arena,
     encoder: &mut wgpu::CommandEncoder,
@@ -9,7 +17,6 @@ pub(super) fn move_off_page<'a>(
     page: u32,
     part: Part,
     budget: &mut u64,
-    mut metadata: Option<(&mut terrain_metadata::TerrainMetadata, &wgpu::Device)>,
 ) -> bool {
     debug_assert!(
         records.is_none() || matches!(part, Part::Section { .. }),
@@ -29,19 +36,6 @@ pub(super) fn move_off_page<'a>(
         let Some(to) = arena.alloc_moved(vertices) else {
             return false;
         };
-        if let Some((metadata, device)) = &mut metadata
-            && !metadata.copy_range(
-                device,
-                encoder,
-                (page, start),
-                to,
-                arena.buffer(to.0).size() / arena.stride(),
-                vertices,
-            )
-        {
-            arena.release(to.0, to.1, vertices);
-            return false;
-        }
         arena.copy(encoder, (page, start), to, vertices);
         arena.release(page, start, vertices);
         if let (Some((flat, device, uploads)), Some(id)) = (&mut flat, s.flat_id) {

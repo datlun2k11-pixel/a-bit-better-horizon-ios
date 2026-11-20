@@ -132,6 +132,16 @@ impl Ranges<'_> {
             .iter()
             .any(|f| (x - f.0).abs() <= reach && (z - f.1).abs() <= reach)
     }
+    /// Whether a `/forceload` or a native mod's ticket holds the chunk.
+    pub(super) fn is_forced(&self, x: i32, z: i32) -> bool {
+        self.forced.contains(&(x, z)) || self.mod_forced.contains(&(x, z))
+    }
+    /// Every chunk a `/forceload` or a native mod's ticket holds, once each.
+    pub(super) fn forced_chunks(&self) -> impl Iterator<Item = &(i32, i32)> + '_ {
+        self.forced
+            .iter()
+            .chain(self.mod_forced.iter().filter(|c| !self.forced.contains(c)))
+    }
 }
 
 #[cfg(test)]

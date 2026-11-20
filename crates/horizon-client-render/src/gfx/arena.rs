@@ -448,9 +448,6 @@ impl Arena {
     /// Native meshes allocate no sidecar. Once needed, existing pages also get a zeroed
     /// sidecar so moves can retain sources. Failure leaves geometry intact and attributes
     /// unknown; a later source upload may retry its page.
-    // Production uses rich terrain metadata; retain compact upload coverage for
-    // the upstream arena regression tests without allocating redundant GPU state.
-    #[cfg(test)]
     pub fn write_sources(
         &mut self,
         device: &wgpu::Device,

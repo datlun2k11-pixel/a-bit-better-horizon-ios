@@ -1716,6 +1716,7 @@ impl GraphicsUi {
             hover,
             focused,
             held: self.dragging == Some(item),
+            tag: None,
         };
         shell::row(batch, atlas, cols, y, &view);
     }
@@ -1759,7 +1760,7 @@ impl GraphicsUi {
                 (lang::get(page.about()), style::GREY)
             }
         };
-        shell::dock_note(batch, atlas, cols, text, color);
+        shell::dock_note(batch, atlas, cols, text, color, None);
     }
 
     /// A press (or a drag with `drag`) at `(x, y)`.

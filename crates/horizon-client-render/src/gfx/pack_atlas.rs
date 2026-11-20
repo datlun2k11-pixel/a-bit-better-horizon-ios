@@ -870,6 +870,7 @@ impl PackAtlas {
                 .collect(),
             after: String::new(),
             alpha_test: None,
+            terrain_lighting: None,
             parts: None,
             item_id_declared: false,
             far_depth: false,

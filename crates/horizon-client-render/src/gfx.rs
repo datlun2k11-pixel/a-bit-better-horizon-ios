@@ -1867,6 +1867,43 @@ pub struct Renderer {
     /// Outcome of the last capture: its summary, or the error.
     pub capture_result: Option<std::result::Result<serde_json::Value, String>>,
 }
+/// `Device::create_shader_module` on a thread with a deep stack. naga's WGSL parser recurses per nested
+/// expression, and on an iPhone, whose main thread has 1 MB under `Renderer::new`'s own frame, it overflowed
+/// (a SIGSEGV in `naga::front::wgsl::parse` from `loading_renderer`). Not for a module made under an error
+/// scope: scopes are the calling thread's.
+pub(crate) fn shader_module(
+    device: &wgpu::Device,
+    desc: wgpu::ShaderModuleDescriptor<'_>,
+) -> wgpu::ShaderModule {
+    deep_stack(|| device.create_shader_module(desc))
+}
+/// `Device::create_render_pipeline` as [`shader_module`]: Metal translates the shaders (naga's MSL writer,
+/// recursive too) when the pipeline is made.
+pub(crate) fn render_pipeline(
+    device: &wgpu::Device,
+    desc: &wgpu::RenderPipelineDescriptor<'_>,
+) -> wgpu::RenderPipeline {
+    deep_stack(|| device.create_render_pipeline(desc))
+}
+pub(crate) fn compute_pipeline(
+    device: &wgpu::Device,
+    desc: &wgpu::ComputePipelineDescriptor<'_>,
+) -> wgpu::ComputePipeline {
+    deep_stack(|| device.create_compute_pipeline(desc))
+}
+/// `work` on a thread with a 16 MB stack, waited for: what [`shader_module`] does, for a block that keeps
+/// its error scopes (thread-local) around the modules it makes.
+pub(crate) fn deep_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("horizon-shader".into())
+            .stack_size(16 << 20)
+            .spawn_scoped(scope, work)
+            .expect("a thread to build shaders on")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
 /// Every layer's mip levels, layer major (`first` is the first layer's
 /// index into `settings`), made by `MipmapGenerator`.
 /// Block sprite layers per texture array at most: the
