@@ -1019,6 +1019,9 @@ struct Game<'a> {
     /// `world_biomes` as the biome files made it, before `native_biome_colors`.
     world_biomes_base: Option<Arc<Biomes>>,
     streaming: Streaming,
+    /// The memory warnings' state (game/memory_warning.rs): the lowered render distance and
+    /// the quiet while it comes back after.
+    memory: memory_warning::Memory,
     lod: Option<horizon_client::lod::Lod>,
     lod_source_attempted: bool,
     lod_observe: horizon_client::fast_hash::FxHashSet<(i32, i32)>,
@@ -10516,6 +10519,7 @@ impl<'a> Game<'a> {
             panorama_rotation: Default::default(),
             world,
             streaming,
+            memory: Default::default(),
             lod: None,
             lod_source_attempted: false,
             far_beacons: HashMap::new(),

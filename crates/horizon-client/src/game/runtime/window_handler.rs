@@ -11,6 +11,57 @@ impl Game<'_> {
     pub(super) fn scripted_run(&self) -> bool {
         self.screenshot_sequence.is_some() || self.tick_script.playing() || self.repro.replaying()
     }
+    /// A memory warning (iOS `applicationDidReceiveMemoryWarning`): give back what can be
+    /// given back, and lower the render distance when the warnings come close together in a
+    /// singleplayer world at a long distance.
+    pub(super) fn on_memory_warning(&mut self, now: Instant) {
+        self.streaming.release_memory();
+        horizon_threads::release_free_memory();
+        // A remote server's chunks are not ours to unload, and without a world (or a player)
+        // there is no render distance in use. The warning still counts: while lowered, it
+        // postpones the restore.
+        let second = self.memory.note_warning(now);
+        if self.player.is_none() || self.integrated.is_none() || self.memory.is_lowered() {
+            return;
+        }
+        if self.settings.render_distance <= memory_warning::LOWER_ABOVE || !second {
+            return;
+        }
+        self.memory.lower();
+        self.apply_memory_radius();
+        self.system_message(horizon_client::text::Text::literal(format!(
+            "Running low on memory: render distance lowered to {} until the pressure passes",
+            memory_warning::LOWER_RADIUS
+        )));
+    }
+    /// The restore side of [`Game::on_memory_warning`], once a quiet while has passed;
+    /// leaving the world forgets the lowering.
+    fn memory_tick(&mut self, now: Instant) {
+        if self.player.is_none() {
+            let lowered = self.memory.is_lowered();
+            self.memory.close_world();
+            if lowered {
+                self.apply_memory_radius();
+            }
+            return;
+        }
+        if self.memory.is_lowered() {
+            // A dimension change or a view distance packet sets the radius again: the
+            // lowering holds until it is restored.
+            self.apply_memory_radius();
+        }
+        if self.memory.restore_due(now) {
+            self.memory.restore();
+            self.apply_memory_radius();
+            self.system_message(horizon_client::text::Text::literal(format!(
+                "Memory pressure gone: render distance restored to {}",
+                self.settings.render_distance
+            )));
+        }
+    }
+    fn apply_memory_radius(&mut self) {
+        self.streaming.radius = self.memory.effective(self.settings.render_distance);
+    }
 }
 
 /// A key, a modifier, a click, the wheel, the pointer or the input method. Resize and close are
@@ -312,6 +363,7 @@ impl Game<'_> {
         }
         horizon_client::spans::time("server_packs", || self.tick_server_packs());
         horizon_client::spans::time("control", || self.poll_control(event_loop));
+        self.memory_tick(Instant::now());
         if self.pending_save.is_some() {
             return;
         }

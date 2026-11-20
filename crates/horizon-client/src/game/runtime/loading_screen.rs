@@ -448,6 +448,14 @@ impl ApplicationHandler for App {
             game.device_event(event_loop, id, event);
         }
     }
+    /// iOS's memory warning while the resources load: no world is open yet, so the
+    /// allocator's free pages are all there is to give back.
+    fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
+        match self {
+            App::Loading(_) => horizon_threads::release_free_memory(),
+            App::Ready(split) => split.memory_warning(event_loop),
+        }
+    }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         enum Step {
             Waiting,
