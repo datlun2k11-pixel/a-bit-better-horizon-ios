@@ -64,10 +64,17 @@ jobs:
           # minutes to compile, so the next push rebuilds only the game crates.
           cache-on-failure: true
           shared-key: ios-${{ env.IOS_TARGET }}
+      # Compiler outputs keyed per compilation unit, so a Cargo.lock change (a merge, a bump)
+      # does not recompile the crates whose sources it left alone; rust-cache stays for the
+      # target directory and registry.
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Build the game
         # The public Microsoft sign-in app is shared by the Rust executable and native launcher.
         # The defaults minus `controllers` (GameController reads pads), with `audio`: project.yml's Cargo phase
         # uses the same flags, so HORIZON_GAME_PREBUILT below finds this build.
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
         run: cargo build --release --locked --target "$IOS_TARGET" -p horizon-official --no-default-features --features audio,horizon-extras
       - name: Bundle it
         run: |
