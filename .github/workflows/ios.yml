@@ -19,8 +19,11 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ios-${{ github.sha }}
-  cancel-in-progress: false
+  # One build per branch or pull request: a new commit supersedes the run it replaces, so an
+  # iterating push does not queue behind a superseded 25-minute build. A manual dispatch (a
+  # release) is never cancelled; the newest commit of the ref is the one that publishes.
+  group: ios-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 env:
   HORIZON_TELEMETRY_URL: "off"
   IOS_TARGET: aarch64-apple-ios
@@ -57,6 +60,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: runner.environment == 'github-hosted'
         with:
+          # A failing workspace crate (most CI red) still keeps the ~230 dependencies it cost
+          # minutes to compile, so the next push rebuilds only the game crates.
+          cache-on-failure: true
           shared-key: ios-${{ env.IOS_TARGET }}
       - name: Build the game
         # The public Microsoft sign-in app is shared by the Rust executable and native launcher.
@@ -105,6 +111,8 @@ jobs:
             Horizon-game-unsigned.tipa
           retention-days: 7
           if-no-files-found: error
+          # The .ipa is a zip already; storing it as-is saves re-compressing ~100 MB twice.
+          compression-level: 1
       - name: Send the builds to Discord
         # Delivery is optional: the IPA is already available in the run's artifacts.
         continue-on-error: true
