@@ -1248,7 +1248,7 @@ fn add_sprite_renames(
     dependencies: &mut cache::Dependencies,
 ) {
     use crate::atlas_sources::{
-        SpriteOrigin, SpriteSource, decode, list, list_textures, texture_path,
+        SpriteOrigin, SpriteSource, decode, list, list_textures, texture_path, unasked,
     };
     let png = |id: &str| {
         texture_path(Path::new(""), id, "textures")
@@ -1257,17 +1257,16 @@ fn add_sprite_renames(
     };
     let atlases: Vec<_> = ["blocks", "items"]
         .into_iter()
-        .filter_map(|atlas| {
-            let (_, (_, text)) = merged.get(&format!("assets/minecraft/atlases/{atlas}.json"))?;
-            decode(text)
-        })
+        .filter_map(|atlas| merged.get(&format!("assets/minecraft/atlases/{atlas}.json")))
+        .filter_map(|bytes| decode(std::str::from_utf8(bytes).ok()?).ok())
         .collect();
     let renamed = |source: &SpriteSource| matches!(source, SpriteSource::Single { resource, sprite: Some(sprite) } if sprite != resource);
     if !atlases.iter().flatten().any(renamed) {
         return;
     }
     // The textures a source can list: the packs' and vanilla's the packs leave visible.
-    let mut textures: Vec<String> = list_textures(vanilla)
+    let vanilla_source = crate::resource_source::ResourceSource::directory(vanilla.to_path_buf());
+    let mut textures: Vec<String> = list_textures(&vanilla_source)
         .into_iter()
         .filter(|id| {
             let name = png(id);
@@ -1284,7 +1283,7 @@ fn add_sprite_renames(
     // Each sprite's resource, `None` where an atlas lists it any other way.
     let mut renames: BTreeMap<String, Option<String>> = BTreeMap::new();
     for sources in &atlases {
-        for (sprite, origin) in list(sources, &textures) {
+        for (sprite, origin) in list(sources, &textures, &mut unasked) {
             let from = match origin {
                 SpriteOrigin::File(resource) if resource != sprite => Some(resource),
                 _ => None,

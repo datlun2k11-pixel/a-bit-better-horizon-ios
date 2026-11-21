@@ -275,6 +275,8 @@ impl Opt {
             Opt::DiscreteScroll => "options.discrete_mouse_scroll",
             Opt::AllowCursorChanges => "options.allowCursorChanges",
             Opt::Volume(_) => "soundCategory.master",
+            // The native setting's own label is drawn on its row; nothing asks this one.
+            Opt::ModSetting(_, _) => "options.mods",
             Opt::SoundDevice => "options.audioDevice",
             Opt::GuiScale => "options.guiScale",
             Opt::ViewBobbing => "options.viewBobbing",
