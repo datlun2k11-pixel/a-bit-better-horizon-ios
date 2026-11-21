@@ -1268,6 +1268,7 @@ impl Game<'_> {
             })),
             gate: Some(gate),
             online,
+            elyby_guests: true,
             forwarding_secret,
             arrivals: transfers.as_ref().map(|t| t.expected.clone()),
             log: Some(NetLog {

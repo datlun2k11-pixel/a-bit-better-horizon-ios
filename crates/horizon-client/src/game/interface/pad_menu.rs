@@ -120,7 +120,7 @@ pub(super) struct MenuCursor {
     /// The stick moved the cursor last poll (it settles when let go).
     moving: bool,
     /// Gliding onto a slot or control: from, to, since.
-    glide: Option<((f32, f32), (f32, f32), Instant)>,
+    pub(in crate::game) glide: Option<((f32, f32), (f32, f32), Instant)>,
     /// Where the stick's current movement started.
     gesture: Option<(f32, f32)>,
     /// Pointer mode: the open screen's target centres last poll.
@@ -138,6 +138,10 @@ pub(super) struct MenuCursor {
     repeat: Option<(Button, Instant, bool)>,
     /// Pointer buttons the pad holds down.
     pub(super) held: [bool; 2],
+    /// The system's (IME) keyboard is up for a focused text field, on a phone.
+    pub(super) system_keyboard: bool,
+    /// The player put the system's keyboard away; the field kept its focus.
+    pub(super) system_keyboard_hidden: bool,
     /// The focused button A went down on: letting go presses it, unless the
     /// focus moved or the input was cancelled first.
     pub(super) armed: Option<Rect>,
@@ -284,6 +288,88 @@ impl Game<'_> {
         self.key_focus_screen() || self.prompt_open()
     }
 
+    /// A text field has the focus (the fields IME commits type into, plus the bed's
+    /// chat before the player picks its field): the touch controls' keyboard belongs on it.
+    pub(in crate::game) fn field_focused(&mut self) -> bool {
+        if self.dialog_open() {
+            return self.dialog_text_focused();
+        }
+        self.text_field_focused()
+            // The explicit mobile keyboard button stays available on the bed screen
+            // even before the player chooses its chat field.
+            || (self.title.is_none() && self.screen == Screen::Chat && self.ui.in_bed_chat)
+    }
+
+    /// The focused field's box (GUI pixels), where the screen can say: a title screen's field or
+    /// an options page's search box. `None` for the rest (chat, a sign), which the touch controls
+    /// leave alone.
+    pub(in crate::game) fn focused_field_rect(&self) -> Option<[f32; 4]> {
+        if self.dialog_open() {
+            return None;
+        }
+        if self.screen == Screen::Options {
+            return self.ui.options.focused_rect();
+        }
+        self.title.as_ref()?.focused_rect(self.gui_size())
+    }
+
+    /// Ask for the system's keyboard again, whatever the last request did: a request iOS ignored
+    /// (it can, while a touch is being handled) is otherwise never repeated, as the focus sync
+    /// only asks on a change. The touch controls' keyboard button, when the keyboard is down.
+    pub(in crate::game) fn show_system_keyboard(&mut self) {
+        self.bed_chat_focus(true);
+        self.pad.menu.osk = None;
+        self.pad.menu.system_keyboard = true;
+        self.pad.menu.system_keyboard_hidden = false;
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(false);
+            window.set_ime_allowed(true);
+        }
+    }
+
+    /// Hide IME for a loading overlay without treating it as the player's
+    /// explicit hide preference; the focused field may reopen it afterwards.
+    pub(in crate::game) fn suspend_system_keyboard(&mut self) {
+        self.pad.menu.system_keyboard = false;
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(false);
+        }
+    }
+
+    /// Put the system's keyboard away while the field keeps its focus and text: the touch
+    /// controls' keyboard button, when the keyboard is up, and a finger landing outside the
+    /// focused field.
+    pub(in crate::game) fn hide_system_keyboard(&mut self) {
+        if !self.pad.menu.system_keyboard {
+            return;
+        }
+        self.pad.menu.system_keyboard = false;
+        self.pad.menu.system_keyboard_hidden = true;
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(false);
+        }
+    }
+
+    /// The touch controls' keyboard button: it brings the system's keyboard up, and puts it away
+    /// again.
+    pub(in crate::game) fn toggle_system_keyboard(&mut self) {
+        if self.pad.menu.system_keyboard {
+            self.hide_system_keyboard();
+        } else {
+            self.show_system_keyboard();
+        }
+    }
+
+    /// The system's keyboard is up.
+    pub(in crate::game) fn system_keyboard_up(&self) -> bool {
+        self.pad.menu.system_keyboard
+    }
+
+    /// The player put the system's keyboard away, the field still focused.
+    pub(in crate::game) fn system_keyboard_hidden(&self) -> bool {
+        self.pad.menu.system_keyboard_hidden
+    }
+
     /// A screen the keyboard's focus can drive is open. A prompt over the world isn't one: its
     /// keys are its own.
     fn key_focus_screen(&self) -> bool {
@@ -369,7 +455,7 @@ impl Game<'_> {
     }
 
     /// The open screen is one the crosshair drives, whatever is over it.
-    fn pad_pointer_screen(&self) -> bool {
+    pub(in crate::game) fn pad_pointer_screen(&self) -> bool {
         matches!(
             self.screen,
             Screen::HudEditor
@@ -570,7 +656,7 @@ impl Game<'_> {
     }
 
     /// Send the window a pointer move to `at` (GUI pixels), as the mouse would.
-    fn pad_pointer_to(&mut self, event_loop: &dyn EventLoopCtl, at: (f32, f32)) {
+    pub(in crate::game) fn pad_pointer_to(&mut self, event_loop: &dyn EventLoopCtl, at: (f32, f32)) {
         let (Some(window), Some(batch)) = (self.window.as_ref(), self.gui_batch()) else {
             return;
         };
@@ -1046,7 +1132,7 @@ impl Game<'_> {
     }
 
     /// Pointer mode: hop the cursor to the nearest target that way.
-    fn pad_pointer_step(&mut self, event_loop: &dyn EventLoopCtl, button: Button) {
+    pub(in crate::game) fn pad_pointer_step(&mut self, event_loop: &dyn EventLoopCtl, button: Button) {
         if self.pad.menu.pos.is_none() {
             self.pad_take_pointer(event_loop);
             return;

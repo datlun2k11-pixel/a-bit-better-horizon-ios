@@ -286,7 +286,6 @@ impl Game<'_> {
             return Ok(());
         }
         if let Some(mut remote) = self.remote.take() {
-            self.retire_recording(&remote.session);
             // Minecraft.disconnect closes the connection, so the host sees a clean leave.
             remote.session.disconnect();
             self.saved_for_exit = true;

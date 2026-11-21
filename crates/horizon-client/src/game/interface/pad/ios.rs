@@ -202,6 +202,16 @@ impl PadRouter {
     pub(in crate::game) fn events(&mut self) -> Vec<PadEvent> {
         self.update(horizon_gamecontroller::snapshots())
     }
+
+    /// Read only for now (the module's own note): GameController's haptics aren't wired.
+    pub(in crate::game) fn play_rumbles(
+        &mut self,
+        _: &mut Pads,
+        _: Option<PadId>,
+        _: bool,
+        _: bool,
+    ) {
+    }
     fn update(
         &mut self,
         snapshots: Vec<horizon_gamecontroller::ConnectedController>,

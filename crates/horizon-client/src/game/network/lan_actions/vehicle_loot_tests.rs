@@ -1,4 +1,7 @@
 //! Actual Game/guest/menu regression: vehicle loot must precede the live slot snapshot.
+// Declared by the area's generated module list, which doesn't know the `*_tests` suffix: a
+// regression test, built with the test harness and not into the game (its LAN APIs moved).
+#![cfg(test)]
 use super::*;
 use crate::game::{Audio, Options, Progress, Settings, boats::Boat, load_resources};
 use horizon_client::{

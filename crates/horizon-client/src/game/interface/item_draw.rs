@@ -649,7 +649,6 @@ impl Game<'_> {
         lights: (glam::Vec3, glam::Vec3),
         out: &mut Vec<Vertex>,
     ) {
-        let start = out.len();
         let mut sink = WorldSink {
             out,
             light: item_hdr_light(state, light),
@@ -664,12 +663,6 @@ impl Game<'_> {
             pose,
             &mut sink,
         );
-        if !matches!(
-            state.display,
-            DisplayContext::FirstPersonLeftHand | DisplayContext::FirstPersonRightHand
-        ) {
-            self.mark_rendered_item(start, out.len(), &state.item);
-        }
     }
     /// [`Self::submit_item_world`] without the level's diffuse shading.
     pub(super) fn submit_item_unlit(
@@ -679,7 +672,6 @@ impl Game<'_> {
         light: u32,
         out: &mut Vec<Vertex>,
     ) {
-        let start = out.len();
         let mut sink = WorldSink {
             out,
             light: item_hdr_light(state, light),
@@ -694,12 +686,6 @@ impl Game<'_> {
             pose,
             &mut sink,
         );
-        if !matches!(
-            state.display,
-            DisplayContext::FirstPersonLeftHand | DisplayContext::FirstPersonRightHand
-        ) {
-            self.mark_rendered_item(start, out.len(), &state.item);
-        }
     }
     /// [`Self::submit_item_lit`] of `state` under each of `poses` on the GPU path: the mark
     /// before its draws and their bounds, or `None` (nothing drawn) when the state cannot

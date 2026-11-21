@@ -665,11 +665,6 @@ impl Game<'_> {
         id: u32,
         owner: impl FnOnce() -> Option<[i32; 4]>,
     ) -> Option<&sb::Team> {
-        if let Some(remote) = &self.remote
-            && let Some(team) = remote.entity_team(&self.score.board, id)
-        {
-            return Some(team);
-        }
         let uuid = *self.persist.uuids.get(&id)?;
         let own = self.scoreboard_name(id, uuid);
         if let Some(team) = self.score.board.players_team(&own) {
@@ -700,11 +695,7 @@ impl Game<'_> {
         })
     }
     pub(super) fn player_team(&self) -> Option<&sb::Team> {
-        let name = self.remote.as_ref().map_or_else(
-            || self.acting_player_name(),
-            |remote| remote.profile_name.as_str(),
-        );
-        self.score.board.players_team(name)
+        self.score.board.players_team(self.acting_player_name())
     }
     /// The teams of the player and of the mobs on one (empty without teams).
     pub(super) fn mob_teams(&self) -> horizon_client::mobs::Teams<'_> {
@@ -942,8 +933,9 @@ impl Game<'_> {
     /// objective.
     pub(super) fn draw_tab_list(&mut self, batch: &mut HudBatch) {
         use horizon_client::tab_list::{self, TabInputs};
-        // Skin preparation ran before the frame's optional HUD widgets.
-        // This layer may be cancelled without stopping NPC skin progress.
+        // Player heads and the player list both draw from the same skin
+        // slots: a new frame, with what the last one drew.
+        self.flush_skin_slots();
         let key = self.screen == super::Screen::Playing && self.keys.held(Action::Playerlist);
         let count = self.remote.as_ref().map_or_else(
             || {

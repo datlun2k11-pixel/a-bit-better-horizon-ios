@@ -1068,14 +1068,9 @@ impl Game<'_> {
         self.native_server_starting(false);
         self.native_lifecycle_open_started();
         // `load_world`, with the world `serve` started preparing.
-        if let Err(error) = startup::time("server.wait_rest", || self.join_world_rest()) {
-            // A failed client/server transition must not leave the preparation worker
-            // writing the world after the server reports that it has stopped.
-            if let Ok(world) = opening.world {
-                drop(world.finish());
-            }
-            return Err(error);
-        }
+        // The loader was finished by `prepare_early_game_rules` above: a failure here leaves
+        // nothing of it to finish.
+        startup::time("server.wait_rest", || self.join_world_rest())?;
         self.perf.world_opening();
         let open_step = startup::step("server.open_world");
         self.finish_open_world(prepared)?;

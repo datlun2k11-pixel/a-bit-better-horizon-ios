@@ -6,14 +6,12 @@ pub(super) mod probe;
 
 impl Game<'_> {
     /// No renderer means a headless control session, not an unpresented window.
+    ///
+    /// The fork tracked the renderer's presented geometry (`Renderer::presentation_current`,
+    /// `presentation_generation`), which the merged frame/output API doesn't carry; until that
+    /// is ported input is never retired for an unpresented frame.
     pub(super) fn presentation_stale(&self) -> bool {
-        #[cfg(feature = "test-support")]
-        if self.presentation_test_bypass {
-            return false;
-        }
-        self.renderer
-            .as_ref()
-            .is_some_and(|r| !r.presentation_current())
+        false
     }
 
     pub(super) fn menu_input_blocked(&self) -> bool {

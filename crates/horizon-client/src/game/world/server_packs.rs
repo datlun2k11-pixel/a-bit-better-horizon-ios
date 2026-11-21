@@ -220,13 +220,8 @@ const WORLD_PACK_ID: u128 = 0x640a6a92_b6cb_48a0_b391_831586500359;
 
 impl Game<'_> {
     pub(super) fn shutdown_server_pack_worker(&mut self) -> bool {
-        if self
-            .pack_reload
-            .as_mut()
-            .is_some_and(|reload| !reload.shutdown())
-        {
-            return false;
-        }
+        // The merged reload keeps its own join handle and has no early cancel: dropping it
+        // detaches the stage, which reads only what it was given.
         self.pack_reload = None;
         true
     }

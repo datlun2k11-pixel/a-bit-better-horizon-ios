@@ -156,6 +156,17 @@ impl Game<'_> {
                     .translate_all(*physical)
                     .contains(&Ok(key))
             }),
+            // Touch is a device of its own: the pad's toggle or the keyboard may still hold it.
+            Source::Touch => {
+                !(slot == SNEAK && self.settings.controller.toggle_sneak)
+                    && (self.pad.holds_action(["key.sneak", "key.sprint"][slot])
+                        || self.physical_keys.iter().any(|physical| {
+                            self.settings
+                                .keys
+                                .translate_all(*physical)
+                                .contains(&Ok(key))
+                        }))
+            }
             Source::Agent | Source::Mod => false,
         }
     }
@@ -383,7 +394,7 @@ impl Game<'_> {
         };
         match source {
             Source::Keyboard | Source::Agent | Source::Mod => self.input_holds(mapping),
-            Source::Pad => {
+            Source::Pad | Source::Touch => {
                 let keys = &self.settings.keys;
                 self.physical_buttons
                     .iter()

@@ -311,6 +311,8 @@ impl Game<'_> {
 // Isolated actual-Game fixture: dummy UUIDs and already-completed producer
 // channels, with no authentication or service calls. No world tick is invoked.
 impl Game<'_> {
+    /// Dev fixture (avatar equipment): only a test-support build runs it.
+    #[cfg(feature = "test-support")]
     pub(in crate::game) fn emote_catalogue_fixture(
         &mut self,
     ) -> horizon_client::Result<serde_json::Value> {
@@ -337,7 +339,7 @@ impl Game<'_> {
         // This is the same completion application called by cosmetics_frame and
         // wheel refresh, using an injected owner snapshot instead of credentials.
         self.apply_owned_emotes(Some(101), now);
-        self.draw_emote_wheel(&mut HudBatch::new([480, 320]));
+        self.draw_emote_wheel(&mut HudBatch::scratch([480, 320]));
         assert_eq!(self.cosmetics.wheel.displayed, ["wave"]);
         assert!(self.emote_wheel_pauses());
         assert_eq!(self.mobs.iter().map(|m| m.age).collect::<Vec<_>>(), ages);
@@ -348,7 +350,7 @@ impl Game<'_> {
             complete: false,
         }));
         self.apply_owned_emotes(Some(101), now);
-        self.draw_emote_wheel(&mut HudBatch::new([480, 320]));
+        self.draw_emote_wheel(&mut HudBatch::scratch([480, 320]));
         assert_eq!(self.cosmetics.wheel.displayed, ["wave"]);
         assert!(!self.cosmetics.emotes.catalogue.due(now));
         assert!(
@@ -373,7 +375,7 @@ impl Game<'_> {
             }))
             .is_err()
         );
-        self.draw_emote_wheel(&mut HudBatch::new([480, 320]));
+        self.draw_emote_wheel(&mut HudBatch::scratch([480, 320]));
         assert!(self.cosmetics.wheel.displayed.is_empty());
         assert!(self.cosmetics.emotes.names.is_empty());
         let changed = serde_json::json!({"case":"owner_change","displayed":self.cosmetics.wheel.displayed,"staleResultDiscarded":true});
@@ -383,7 +385,7 @@ impl Game<'_> {
             complete: true,
         }));
         self.apply_owned_emotes(Some(202), now);
-        self.draw_emote_wheel(&mut HudBatch::new([480, 320]));
+        self.draw_emote_wheel(&mut HudBatch::scratch([480, 320]));
         assert!(self.cosmetics.wheel.displayed.is_empty());
         assert!(
             !self

@@ -124,56 +124,70 @@ pub trait Clipboard {
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod system {
     use super::Clipboard;
+    use std::cell::{RefCell, RefMut};
 
     /// The system clipboard (`ClipboardManager`). On Wayland, arboard uses the
     /// data-control protocol and falls back to X11 (XWayland) on compositors
     /// without it. When no system clipboard can be reached, text copied in the
     /// game can still be pasted in the game.
+    ///
+    /// It reads and writes through `&self`, as a mod's `ClientHost` reaches it.
     #[derive(Default)]
     pub struct SystemClipboard {
-        system: Option<arboard::Clipboard>,
+        system: RefCell<Option<arboard::Clipboard>>,
         /// The text Horizon last copied (`horizon-ctl status`).
-        copied: Option<String>,
+        copied: RefCell<Option<String>>,
     }
 
     impl SystemClipboard {
         /// The text last copied by the game.
-        pub fn copied(&self) -> Option<&str> {
-            self.copied.as_deref()
+        pub fn copied(&self) -> Option<String> {
+            self.copied.borrow().clone()
         }
-        fn system(&mut self) -> Option<&mut arboard::Clipboard> {
-            if self.system.is_none() {
-                self.system = arboard::Clipboard::new().ok();
+        fn system(&self) -> RefMut<'_, Option<arboard::Clipboard>> {
+            let mut system = self.system.borrow_mut();
+            if system.is_none() {
+                *system = arboard::Clipboard::new().ok();
             }
-            self.system.as_mut()
+            system
+        }
+        /// `KeyboardHandler.getClipboard`: empty when there is no text.
+        pub fn text(&self) -> String {
+            let mut system = self.system();
+            let Some(board) = system.as_mut() else {
+                return self.copied().unwrap_or_default();
+            };
+            match board.get_text() {
+                Ok(text) => text,
+                Err(arboard::Error::ContentNotAvailable) => String::new(),
+                Err(_) => {
+                    // A lost connection (a restarted compositor): reconnect next time.
+                    *system = None;
+                    String::new()
+                }
+            }
+        }
+        /// `KeyboardHandler.setClipboard`: empty text is not copied.
+        pub fn set_text(&self, text: &str) {
+            if text.is_empty() {
+                return;
+            }
+            *self.copied.borrow_mut() = Some(text.to_owned());
+            let mut system = self.system();
+            if let Some(board) = system.as_mut()
+                && board.set_text(text.to_owned()).is_err()
+            {
+                *system = None;
+            }
         }
     }
 
     impl Clipboard for SystemClipboard {
         fn get(&mut self) -> String {
-            let Some(system) = self.system() else {
-                return self.copied.clone().unwrap_or_default();
-            };
-            match system.get_text() {
-                Ok(text) => text,
-                Err(arboard::Error::ContentNotAvailable) => String::new(),
-                Err(_) => {
-                    // A lost connection (a restarted compositor): reconnect next time.
-                    self.system = None;
-                    String::new()
-                }
-            }
+            self.text()
         }
         fn set(&mut self, text: &str) {
-            if text.is_empty() {
-                return;
-            }
-            self.copied = Some(text.to_owned());
-            if let Some(system) = self.system()
-                && system.set_text(text.to_owned()).is_err()
-            {
-                self.system = None;
-            }
+            self.set_text(text);
         }
     }
 }
@@ -184,34 +198,44 @@ mod system {
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod system {
     use super::Clipboard;
+    use std::cell::RefCell;
 
     #[derive(Default)]
     pub struct SystemClipboard {
         /// The text Horizon last copied (`horizon-ctl status`).
-        copied: Option<String>,
+        copied: RefCell<Option<String>>,
     }
 
     impl SystemClipboard {
         /// The text last copied by the game.
-        pub fn copied(&self) -> Option<&str> {
-            self.copied.as_deref()
+        pub fn copied(&self) -> Option<String> {
+            self.copied.borrow().clone()
+        }
+        /// `KeyboardHandler.getClipboard`: empty when there is no text.
+        pub fn text(&self) -> String {
+            #[cfg(target_os = "ios")]
+            if let Some(text) = horizon_gamecontroller::clipboard_text() {
+                return text;
+            }
+            self.copied().unwrap_or_default()
+        }
+        /// `KeyboardHandler.setClipboard`: empty text is not copied.
+        pub fn set_text(&self, text: &str) {
+            if text.is_empty() {
+                return;
+            }
+            #[cfg(target_os = "ios")]
+            horizon_gamecontroller::set_clipboard_text(text);
+            *self.copied.borrow_mut() = Some(text.to_owned());
         }
     }
 
     impl Clipboard for SystemClipboard {
         fn get(&mut self) -> String {
-            #[cfg(target_os = "ios")]
-            if let Some(text) = horizon_gamecontroller::clipboard_text() {
-                return text;
-            }
-            self.copied.clone().unwrap_or_default()
+            self.text()
         }
         fn set(&mut self, text: &str) {
-            if !text.is_empty() {
-                #[cfg(target_os = "ios")]
-                horizon_gamecontroller::set_clipboard_text(text);
-                self.copied = Some(text.to_owned());
-            }
+            self.set_text(text);
         }
     }
 }

@@ -430,6 +430,8 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
+    /// Dev fixture (avatar equipment): only a test-support build runs it.
+    #[cfg(feature = "test-support")]
     pub(in crate::game) fn emote_visibility_fixture(
         &mut self,
     ) -> horizon_client::Result<serde_json::Value> {

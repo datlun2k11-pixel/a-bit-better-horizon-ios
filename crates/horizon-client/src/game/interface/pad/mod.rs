@@ -641,6 +641,19 @@ impl Game<'_> {
             && self.pad.in_use
     }
 
+    /// iOS: the hardware pad is the GameController one, enabled with the Controller setting.
+    #[cfg(target_os = "ios")]
+    pub(super) fn pad_keeps_playing_unfocused(&self) -> bool {
+        self.settings.controller.enabled
+            && self.settings.controller.play_in_background
+            && self.pad.in_use
+    }
+
+    /// A pack reload is staged or pending: pointer and key input is retired until it lands.
+    pub(in crate::game) fn reload_blocks_input(&self) -> bool {
+        self.pad.reload_pending || self.pack_reload.is_some()
+    }
+
     fn pad_button(
         &mut self,
         event_loop: &dyn EventLoopCtl,

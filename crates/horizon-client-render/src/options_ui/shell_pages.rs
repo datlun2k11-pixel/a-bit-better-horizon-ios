@@ -56,6 +56,11 @@ impl OptionsUi {
     pub fn shell_opened_focus(&self) -> Option<[f32; 4]> {
         self.shell()?.opened_focus()
     }
+    /// The open shell screen's focused search or name box, in GUI pixels: where the touch
+    /// controls' field tap lands (`focused_field_rect`).
+    pub fn focused_rect(&self) -> Option<[f32; 4]> {
+        self.shell()?.focused_rect()
+    }
     /// The clicks until it is set back are a controller's Left or Right on a row: a choice of a
     /// settings shell steps, rather than opens.
     pub fn pad_clicks_step(&mut self, on: bool) {

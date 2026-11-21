@@ -76,6 +76,8 @@ pub(super) struct Loading {
     pub(super) ui_at: Option<Instant>,
     pub(super) title_drawn: bool,
     pub(super) menu: startup_menu::StartupMenu,
+    /// The wait for game files to be brought while there are none (game/import_screen.rs).
+    pub(in crate::game) import: Option<crate::game::import_screen::Import>,
     pub(super) error: Option<Box<dyn std::error::Error>>,
 }
 /// How long the handoff waits for the first title frame before building the

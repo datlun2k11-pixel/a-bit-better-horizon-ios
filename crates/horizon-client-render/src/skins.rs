@@ -1194,7 +1194,7 @@ pub struct Downloader {
     draw_scope: Option<Vec<String>>,
     draw_scratch: Vec<String>,
     /// The resource packs' root, where a profile's `texture` patch is read.
-    resource_root: std::path::PathBuf,
+    resource_root: horizon_assets::resource_source::ResourceSource,
     /// How each `patch/` texture of the resource packs loaded, by location.
     resources: std::collections::HashMap<String, Download>,
     workers: Arc<workers::Pool>,
@@ -1286,7 +1286,10 @@ impl Downloader {
 
     /// The resource packs changed (or were first loaded) at `root`: patch
     /// textures load again from there.
-    pub fn set_resource_root(&mut self, root: std::path::PathBuf) {
+    pub fn set_resource_root(
+        &mut self,
+        root: horizon_assets::resource_source::ResourceSource,
+    ) {
         let removed: std::collections::HashSet<_> =
             std::mem::take(&mut self.resources).into_keys().collect();
         for location in &removed {
@@ -1322,10 +1325,9 @@ impl Downloader {
             }
             None => {}
         }
-        let file = self
+        let image = self
             .resource_root
-            .join(format!("assets/{namespace}/textures/{path}.png"));
-        let image = std::fs::read(file)
+            .read(&format!("assets/{namespace}/textures/{path}.png"))
             .ok()
             .and_then(|b| crate::hud::decode_bytes(&b).ok())
             .and_then(|(w, h, rgba)| resample_64(w, h, &rgba));

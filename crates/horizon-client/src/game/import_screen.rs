@@ -13,7 +13,7 @@ use super::*;
 
 /// The wait: the listener that takes an archive, the atlas the screen draws with, and the words it
 /// says.
-pub(super) struct Import {
+pub(in crate::game) struct Import {
     /// `None` when the port could not be opened, which leaves the cable route and the folder path
     /// on the screen. The screen never promises a page nobody is serving.
     session: Option<horizon_client::import::http::Session>,
@@ -52,16 +52,8 @@ impl Loading {
     /// said on screen that this is what a phone does (`import::waits_on_screen`).
     pub(super) fn wait_for_files(&mut self, reason: String) {
         let home = horizon_client::import::home();
-        let atlas = match HudAtlas::without_pack(&home) {
-            Ok(atlas) => atlas,
-            Err(error) => {
-                // Without even the synthetic atlas there is nothing to draw with, and an exit with
-                // the reason in the log is all that is left.
-                log::error!("Horizon: the import screen has no font to draw with: {error}");
-                self.error = Some(error);
-                return;
-            }
-        };
+        // The atlas that exists before Mojang's files do (the boot atlas).
+        let atlas = HudAtlas::boot();
         horizon_client::ui_theme::reset_atlas();
         // Download them first; the Wi-Fi and cable doors open only if that fails. Once a run: files that
         // downloaded and still don't load would otherwise be downloaded again and again.
@@ -328,6 +320,7 @@ impl Loading {
         let spawned = startup_menu::spawn_loader(
             &options,
             &self.settings,
+            options.execution_role.into(),
             &self.vanilla_root,
             self.started,
             &self.progress,

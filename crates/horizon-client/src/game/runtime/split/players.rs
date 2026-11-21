@@ -470,9 +470,11 @@ impl Split<'_> {
         options_file: &Path,
         settings: horizon_client::settings::Settings,
     ) -> Result<Box<Game<'static>>> {
-        // Each Game owns an Arc. Dropping the last guest releases it, including when
-        // the host returns to the mobile launcher in the same process.
-        let res = self.host.res.clone();
+        // The players' games borrow P1's resources for the process's lifetime: one copy for all.
+        if self.res.is_none() {
+            self.res = Some(Box::leak(Box::new(self.host.res.clone())));
+        }
+        let res = self.res.ok_or("no resources")?;
         let host = &mut self.host;
         std::fs::create_dir_all(options_file.parent().ok_or("bad options path")?)?;
         let mut options = host.options.clone();
@@ -504,7 +506,7 @@ impl Split<'_> {
         let pack = host.pack.clone();
         let mut guest = boxed(|| {
             start_game(
-                &res,
+                res,
                 pack,
                 gui,
                 options,
@@ -624,7 +626,8 @@ impl Split<'_> {
         if let (Some(server), Some(name)) = (&self.host.integrated, &guest.name) {
             server.leave_split(name);
         }
-        self.retire_guest(guest.game);
+        // The guest's `Game` drops here; the merged engine's workers shut down with it.
+        drop(guest.game);
     }
 }
 

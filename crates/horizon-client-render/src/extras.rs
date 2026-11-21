@@ -128,6 +128,9 @@ pub struct Extras {
     /// built-in track and leaving the off ones out (`musicPage`, off by
     /// default: vanilla plays exactly as before).
     pub music_page: bool,
+    /// How much of other players' cosmetics shows (`cosmeticsOthers`): the choice the
+    /// launcher's Wardrobe shares; none until the player makes it (`effective_others`).
+    pub cosmetics_others: Option<horizon_cosmetics::prefs::Others>,
     /// 3D skin layers (`threeDSkinLayers`, Options → Skin Customization): each
     /// painted texel of a player's outer layer drawn as a slab
     /// (`horizon_client::mobs::skin_layers`).
@@ -183,6 +186,7 @@ impl Default for Extras {
             wheel_cycles_settings: false,
             music_off: Vec::new(),
             music_page: false,
+            cosmetics_others: None,
             three_d_skin_layers: false,
             pvp: Default::default(),
         }
@@ -290,6 +294,10 @@ impl Extras {
                         .collect()
                 }
                 "musicPage" => e.music_page = flag(e.music_page),
+                horizon_cosmetics::prefs::OTHERS => {
+                    e.cosmetics_others =
+                        horizon_cosmetics::prefs::Others::parse(value).or(e.cosmetics_others)
+                }
                 SKIN_LAYERS_KEY => e.three_d_skin_layers = flag(e.three_d_skin_layers),
                 key => {
                     e.pvp.parse_line(key, value);
@@ -354,8 +362,20 @@ impl Extras {
             bool_text(self.three_d_skin_layers),
         );
         text.push_str(&format!("{EMOTE_KEY}:{}\n", self.emote_key));
+        if let Some(others) = self.cosmetics_others {
+            text.push_str(&format!(
+                "{}:{}\n",
+                horizon_cosmetics::prefs::OTHERS,
+                others.name()
+            ));
+        }
         self.pvp.serialize(&mut text);
         text
+    }
+    /// How much of other players' cosmetics shows: the player's choice, else nothing (the
+    /// game asks the service for nothing).
+    pub fn effective_others(&self) -> horizon_cosmetics::prefs::Others {
+        horizon_cosmetics::prefs::Others::effective(self.cosmetics_others, false)
     }
     /// Adopts the settings `options.txt` held before they moved here, while
     /// this file (`own`) has no line of its own: 3D skin layers and the emote key were

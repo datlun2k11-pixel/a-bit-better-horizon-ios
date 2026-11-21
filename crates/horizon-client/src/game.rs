@@ -114,7 +114,6 @@ mod host;
 mod native_hooks;
 // The iOS fork's flat game modules, kept out of the generated area list (build.rs).
 mod airplay;
-mod avatar_equipment_fixture;
 mod chat_input;
 mod import_screen;
 mod input_mode;
@@ -1214,6 +1213,11 @@ struct Game<'a> {
     airplay: airplay::Shown,
     splitscreen: splitscreen::Splitscreen,
     splitscreen_guest: Option<Box<Game<'a>>>,
+    /// The launcher asked for the world to be left (Quit, on a phone): the frame loop returns to it.
+    quit_to_launcher: bool,
+    /// Input was retired for an unpresented (or reloading) frame; it stays blocked until
+    /// the renderer catches up (game/presentation.rs).
+    presentation_input_blocked: bool,
     /// The Mojang Studios screen fading out after loading, and when loading finished.
     loading_overlay: Option<(horizon_client::loading_overlay::Overlay, Instant)>,
     frames: u64,
@@ -10627,6 +10631,8 @@ impl<'a> Game<'a> {
             airplay: None,
             splitscreen: Default::default(),
             splitscreen_guest: None,
+            quit_to_launcher: false,
+            presentation_input_blocked: false,
             loading_overlay: None,
             frames: 0,
             glint_frame: Default::default(),

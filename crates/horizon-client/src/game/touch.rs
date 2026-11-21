@@ -306,7 +306,10 @@ impl Game<'_> {
         if self.touch_on_phone() {
             return self.window.as_ref().map(|w| {
                 let size = w.inner_size();
-                HudBatch::new([size.width, size.height])
+                HudBatch::new(
+                    [size.width, size.height],
+                    self.settings.gui_scale_inputs(),
+                )
             });
         }
         self.screen_batch()
@@ -314,9 +317,12 @@ impl Game<'_> {
 
     /// The screen the game draws on, in GUI pixels.
     fn screen_batch(&self) -> Option<HudBatch> {
-        self.renderer
-            .as_ref()
-            .map(|r| HudBatch::new([r.config.width, r.config.height]))
+        self.renderer.as_ref().map(|r| {
+            HudBatch::new(
+                [r.config.width, r.config.height],
+                self.settings.gui_scale_inputs(),
+            )
+        })
     }
 
     /// Splitscreen's second player on the AirPlay display (game/splitscreen.rs): the phone is their

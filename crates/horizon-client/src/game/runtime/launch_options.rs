@@ -5,6 +5,9 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct Options {
     pub(super) resources: PathBuf,
+    /// `--resources` named a folder (else the default): the import screen only downloads game
+    /// files for a run that was given none.
+    pub(super) resources_given: bool,
     pub(super) distance: i32,
     pub(super) distance_override: Option<i32>,
     pub(super) seed: i64,
@@ -190,6 +193,7 @@ impl Options {
             } else {
                 std::path::Path::new(".local/horizon-client").join(horizon_core::VANILLA_VERSION)
             },
+            resources_given: false,
             distance: 12,
             distance_override: None,
             seed: 0,
@@ -288,7 +292,10 @@ impl Options {
                     // A launcher shows the error to the player: it names the option.
                     let read = || -> Result<()> {
                         match arg.as_str() {
-                            "--resources" => o.resources = value.into(),
+                            "--resources" => {
+                                o.resources = value.into();
+                                o.resources_given = true;
+                            }
                             "--render-distance" | "--radius" => {
                                 o.distance = value.parse()?;
                                 o.distance_override = Some(o.distance);
