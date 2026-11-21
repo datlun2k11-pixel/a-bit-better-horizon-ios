@@ -348,6 +348,14 @@ impl Opt {
             Opt::PadGameplayGuide => "horizon.options.gameplay_guide",
             Opt::PadRadialMode => "horizon.options.radial_mode",
             Opt::PadRadialStick => "horizon.options.radial_stick",
+            Opt::TouchOpacity => "horizon.options.touch_opacity",
+            Opt::TouchScale => "horizon.options.touch_scale",
+            Opt::TouchShow(control) => crate::touch::control_caption(control),
+            Opt::TouchStick => "horizon.options.touch_movement",
+            Opt::TouchStickScale => "horizon.options.touch_stick_size",
+            Opt::TouchStickOpacity => "horizon.options.touch_stick_opacity",
+            Opt::TouchPointer => "horizon.options.touch_pointer",
+            Opt::TouchInteract => "horizon.options.touch_interact",
             Opt::ModelPart(i) => [
                 "options.modelPart.cape",
                 "options.modelPart.jacket",
@@ -432,6 +440,14 @@ impl Opt {
             Opt::PadMoveDeadzone => unit(s.controller.move_deadzone, 0.0, 0.5),
             Opt::PadLookDeadzone => unit(s.controller.look_deadzone, 0.0, 0.5),
             Opt::PadTriggerThreshold => unit(s.controller.trigger_threshold, 0.1, 0.9),
+            Opt::TouchOpacity => unit(s.touch.opacity, crate::touch::MIN_OPACITY, 1.0),
+            Opt::TouchScale => unit(s.touch.scale, crate::touch::MIN_SCALE, crate::touch::MAX_SCALE),
+            Opt::TouchStickScale => unit(
+                s.touch.stick_scale,
+                crate::touch::MIN_SCALE,
+                crate::touch::MAX_SCALE,
+            ),
+            Opt::TouchStickOpacity => unit(s.touch.stick_opacity, crate::touch::MIN_OPACITY, 1.0),
             Opt::SprintWindow => unit(s.sprint_window as f32, 0.0, 10.0),
             Opt::Page(page, row) => pages::slider_kind(page, row),
             _ => Kind::Cycle,
@@ -930,6 +946,22 @@ impl Opt {
                 gamepad::TextKeyboard::Steam => "horizon.options.keyboard.steam",
             }),
             Opt::PadRadialMode | Opt::PadRadialStick => self.radial_text(s),
+            Opt::TouchOpacity => percent(c, s.touch.opacity),
+            Opt::TouchScale => percent(c, s.touch.scale),
+            Opt::TouchShow(control) => on_off(s.touch.visible(control)),
+            Opt::TouchStick => tr(if s.touch.movement == crate::touch::Movement::Stick {
+                "horizon.options.touch_movement.stick"
+            } else {
+                "horizon.options.touch_movement.dpad"
+            }),
+            Opt::TouchStickScale => percent(c, s.touch.stick_scale),
+            Opt::TouchStickOpacity => percent(c, s.touch.stick_opacity),
+            Opt::TouchPointer => tr(if s.touch.pointer == crate::touch::PointerMode::Cursor {
+                "horizon.options.touch_pointer.cursor"
+            } else {
+                "horizon.options.touch_pointer.direct"
+            }),
+            Opt::TouchInteract => generic(c, on_off(s.touch.interact)),
             Opt::Page(page, row) => pages::slider_text(page, row),
             _ => Text::empty(),
         }
@@ -1017,6 +1049,10 @@ impl Opt {
             Opt::PadMoveDeadzone => s.controller.move_deadzone = step(0.0, 50.0) / 100.0,
             Opt::PadLookDeadzone => s.controller.look_deadzone = step(0.0, 50.0) / 100.0,
             Opt::PadTriggerThreshold => s.controller.trigger_threshold = step(10.0, 90.0) / 100.0,
+            Opt::TouchOpacity => s.touch.opacity = step(20.0, 100.0) / 100.0,
+            Opt::TouchScale => s.touch.scale = step(75.0, 150.0) / 100.0,
+            Opt::TouchStickScale => s.touch.stick_scale = step(75.0, 150.0) / 100.0,
+            Opt::TouchStickOpacity => s.touch.stick_opacity = step(20.0, 100.0) / 100.0,
             Opt::SprintWindow => s.sprint_window = step(0.0, 10.0) as i32,
             Opt::Page(page, row) => pages::slide(page, row, v),
             _ => {}
@@ -1265,6 +1301,23 @@ impl Opt {
                 s.controller.keyboard = all[usize::from(next(i, 3))];
             }
             Opt::PadRadialMode | Opt::PadRadialStick => self.radial_step(s, back),
+            Opt::TouchShow(control) => {
+                let shown = s.touch.visible(control);
+                s.touch.set_hidden(control, !shown);
+            }
+            Opt::TouchStick => {
+                s.touch.movement = match s.touch.movement {
+                    crate::touch::Movement::DPad => crate::touch::Movement::Stick,
+                    crate::touch::Movement::Stick => crate::touch::Movement::DPad,
+                };
+            }
+            Opt::TouchPointer => {
+                s.touch.pointer = match s.touch.pointer {
+                    crate::touch::PointerMode::Direct => crate::touch::PointerMode::Cursor,
+                    crate::touch::PointerMode::Cursor => crate::touch::PointerMode::Direct,
+                };
+            }
+            Opt::TouchInteract => s.touch.interact = !s.touch.interact,
             _ => {}
         }
         if self.affects_preset() {

@@ -1429,6 +1429,9 @@ pub struct GraphicsScreen {
     /// The window's size in pixels, which a vanilla row's step can need (the fullscreen
     /// resolution): the options screen sets it before each input.
     pub(crate) framebuffer: [i32; 2],
+    /// The output of the renderer the settings are drawn for (`OptionsUi::draw_background`),
+    /// handed in each time the screen is reached.
+    pub(crate) output: crate::gfx::EffectiveOutput,
 }
 
 impl Screen for GraphicsScreen {

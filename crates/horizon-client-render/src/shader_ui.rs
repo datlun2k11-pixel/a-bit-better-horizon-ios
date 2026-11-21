@@ -1138,6 +1138,8 @@ pub(crate) struct ShaderScreen {
     /// The values this screen saved to a `shaders/` pack's file (picking another pack, Apply),
     /// by pack: Undo puts back the ones the screen opened with over them.
     written: BTreeMap<String, BTreeMap<String, String>>,
+    /// What the renderer's ray tracing is to a pack that asks for it (`OptionsUi::draw`).
+    pub(crate) rays: Option<crate::gfx::output::RayStatus>,
 }
 
 impl ShaderScreen {
