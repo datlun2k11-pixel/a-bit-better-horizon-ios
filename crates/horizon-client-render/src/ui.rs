@@ -12,6 +12,8 @@ use std::{
     time::Instant,
 };
 
+pub mod frame_button;
+
 /// `GuiSpriteScaling.NineSlice`: the sprite's size in GUI pixels, whatever
 /// its texture's resolution, its borders (left, top, right, bottom) in the
 /// same units, and whether the edges and centre stretch rather than tile.

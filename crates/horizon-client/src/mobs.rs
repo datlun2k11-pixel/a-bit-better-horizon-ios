@@ -3066,7 +3066,6 @@ pub fn apply_brain_events(
                             },
                             [m.position.x, m.position.y, m.position.z],
                             m.silent,
-                            [m.extra.main_hand_stack().cloned(), None],
                         )
                     })
                     .map(|(aim, pos, silent)| (Some(aim), Some(pos), silent))

@@ -141,8 +141,8 @@ fn run(
             log::error!("Horizon: failed to log download of {}: {e}", request.url);
         }
         match result {
-            Ok(path) => batch.downloaded.push((request.id, path)),
-            Err(_) => batch.failed.push(request.id),
+            Ok(path) => batch.downloaded.push((request.id, request.key, path)),
+            Err(_) => batch.failed.push((request.id, request.key)),
         }
     }
     batch
