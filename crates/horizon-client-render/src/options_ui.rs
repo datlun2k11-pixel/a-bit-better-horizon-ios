@@ -756,6 +756,22 @@ impl Opt {
                     ],
                 )
             }
+            Opt::TouchOpacity => percent(c, s.touch.opacity),
+            Opt::TouchScale => percent(c, s.touch.scale),
+            Opt::TouchShow(control) => on_off(s.touch.visible(control)),
+            Opt::TouchStick => tr(if s.touch.movement == crate::touch::Movement::Stick {
+                "horizon.options.touch_movement.stick"
+            } else {
+                "horizon.options.touch_movement.dpad"
+            }),
+            Opt::TouchStickScale => percent(c, s.touch.stick_scale),
+            Opt::TouchStickOpacity => percent(c, s.touch.stick_opacity),
+            Opt::TouchPointer => tr(if s.touch.pointer == crate::touch::PointerMode::Cursor {
+                "horizon.options.touch_pointer.cursor"
+            } else {
+                "horizon.options.touch_pointer.direct"
+            }),
+            Opt::TouchInteract => generic(c, on_off(s.touch.interact)),
             _ => generic(c, self.value_text(s)),
         }
     }
@@ -946,22 +962,6 @@ impl Opt {
                 gamepad::TextKeyboard::Steam => "horizon.options.keyboard.steam",
             }),
             Opt::PadRadialMode | Opt::PadRadialStick => self.radial_text(s),
-            Opt::TouchOpacity => percent(c, s.touch.opacity),
-            Opt::TouchScale => percent(c, s.touch.scale),
-            Opt::TouchShow(control) => on_off(s.touch.visible(control)),
-            Opt::TouchStick => tr(if s.touch.movement == crate::touch::Movement::Stick {
-                "horizon.options.touch_movement.stick"
-            } else {
-                "horizon.options.touch_movement.dpad"
-            }),
-            Opt::TouchStickScale => percent(c, s.touch.stick_scale),
-            Opt::TouchStickOpacity => percent(c, s.touch.stick_opacity),
-            Opt::TouchPointer => tr(if s.touch.pointer == crate::touch::PointerMode::Cursor {
-                "horizon.options.touch_pointer.cursor"
-            } else {
-                "horizon.options.touch_pointer.direct"
-            }),
-            Opt::TouchInteract => generic(c, on_off(s.touch.interact)),
             Opt::Page(page, row) => pages::slider_text(page, row),
             _ => Text::empty(),
         }
