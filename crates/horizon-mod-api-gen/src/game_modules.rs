@@ -16,6 +16,7 @@ pub(crate) fn declarations(game: &Path) -> Result<String, String> {
             "airplay",
             "avatar_equipment_fixture",
             "chat_input",
+            "extras",
             "extras_ios",
             "import_screen",
             "input_mode",

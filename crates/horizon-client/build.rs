@@ -26,6 +26,7 @@ fn main() {
                 "mods",
                 "packs",
                 "presentation",
+                "extras",
                 "extras_ios",
                 "import_screen",
                 "input_mode",
