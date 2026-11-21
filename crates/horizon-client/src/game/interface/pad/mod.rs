@@ -152,7 +152,7 @@ mod hardware;
 
 /// iPhone and iPad: GameController, whichever features the build has (gilrs has no iOS backend).
 #[cfg(target_os = "ios")]
-#[path = "pad/ios.rs"]
+#[path = "ios.rs"]
 mod hardware;
 #[cfg(test)]
 mod parity_tests;
