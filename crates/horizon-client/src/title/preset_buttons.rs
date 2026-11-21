@@ -636,6 +636,31 @@ impl Title {
                     .collect()
             }
             Mode::Backup { .. } => Vec::new(),
+            Mode::Account => {
+                let top = (h / 4.0).floor() + 48.0;
+                vec![
+                    b(
+                        (w / 2.0).floor() - 100.0,
+                        top + 72.0,
+                        200.0,
+                        if crate::auth::current().is_some() {
+                            "Sign Out"
+                        } else {
+                            "Sign In"
+                        },
+                        !matches!(crate::msa::state(), crate::msa::State::Working(_)),
+                        40,
+                    ),
+                    b(
+                        (w / 2.0).floor() - 100.0,
+                        top + 96.0,
+                        200.0,
+                        &lang::get_or("gui.done", "Done"),
+                        true,
+                        41,
+                    ),
+                ]
+            }
             Mode::Multiplayer(screen) => screen
                 .buttons(w, h)
                 .into_iter()

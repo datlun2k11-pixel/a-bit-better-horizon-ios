@@ -1,5 +1,5 @@
 //! Component data shared by item resolution and model conditions.
-use horizon_world::nbt::{Tag, parse_snbt};
+use horizon_core::nbt::{Tag, parse_snbt};
 use serde_json::Value;
 
 /// An NBT value as the JSON its component codec reads.

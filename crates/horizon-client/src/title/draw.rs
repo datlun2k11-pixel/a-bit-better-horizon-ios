@@ -794,6 +794,36 @@ impl Title {
                 self.ban_buttons
                     .set([layout.buttons[0], layout.buttons[1], layout.buttons[2]]);
             }
+            Mode::Account => {
+                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+                let top = (h / 4.0).floor() + 48.0;
+                centered(atlas, batch, "Microsoft Account", top - 28.0, u32::MAX);
+                let grey = rgba(170, 170, 170, 255);
+                let lines: Vec<(String, u32)> = match crate::msa::state() {
+                    crate::msa::State::Code { code, link } => vec![
+                        ("Open this page on any device:".into(), grey),
+                        (link, rgba(85, 255, 255, 255)),
+                        ("and enter the code".into(), grey),
+                        (code, rgba(255, 255, 85, 255)),
+                    ],
+                    crate::msa::State::Working(step) => vec![(step, grey)],
+                    crate::msa::State::Failed(why) => vec![(why, rgba(255, 85, 85, 255))],
+                    _ => match crate::auth::current() {
+                        Some(session) => vec![
+                            ("Signed in as".into(), grey),
+                            (session.name.clone(), u32::MAX),
+                            ("Online-mode servers let you in.".into(), grey),
+                        ],
+                        None => vec![
+                            ("Not signed in: you play offline.".into(), grey),
+                            ("Sign in to join online-mode servers.".into(), grey),
+                        ],
+                    },
+                };
+                for (i, (line, color)) in lines.iter().enumerate() {
+                    centered(atlas, batch, line, top + i as f32 * 14.0, *color);
+                }
+            }
             Mode::Multiplayer(screen) => screen.draw(
                 atlas,
                 batch,

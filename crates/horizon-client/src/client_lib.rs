@@ -18,11 +18,12 @@ pub mod item_damage;
 pub mod packet_source;
 pub mod parallel;
 pub mod powder_snow;
-pub use horizon_client_render::equipment_color;
 #[cfg(test)]
 mod test_log;
 #[cfg(test)]
 mod test_resources;
+pub use horizon_client_render::equipment_color;
+pub use horizon_client_render::loading_overlay;
 pub use horizon_client_render::{
     assets, atlas_sources, audio, auth, autotune, ban_notice, bidi, biome, block_edit,
     block_entities, block_entity_anim, block_entity_render, block_sprites, block_states, bluemap,
@@ -112,7 +113,6 @@ pub mod move_gate;
 pub use horizon_core::json_nbt;
 pub mod lan;
 pub mod landing;
-pub use horizon_client_render::loading_overlay;
 pub mod legacy_combat;
 pub mod living_attributes;
 pub mod locator_bar;

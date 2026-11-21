@@ -1,7 +1,7 @@
 //! World-list operations. Metadata edits preserve every other NBT field;
 //! backups use vanilla's ZIP layout and never include the session lock.
 use crate::save::{read_dat, write_dat};
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 use std::{
     fs,
     io::{self, Seek, Write},
@@ -24,30 +24,32 @@ fn world_path(saves: &Path, folder: &str) -> crate::Result<PathBuf> {
     Ok(path)
 }
 
-/// EditWorldScreen holds a validated LevelStorageAccess while editing or
-/// backing up. File-command callers need the same ownership for the operation.
-fn world_access(saves: &Path, folder: &str) -> crate::Result<(PathBuf, crate::save::SessionLock)> {
-    let world = world_path(saves, folder)?;
-    let lock =
-        crate::save::SessionLock::acquire_validated(&world, &saves.join("allowed_symlinks.txt"))?;
-    Ok((world, lock))
+/// `DirectoryValidator.validateDirectory`: every symbolic link under the
+/// world folder, never following one. `LevelStorageSource.validateAndCreateAccess`
+/// asks this before it makes an access, and a world holding any link is not
+/// opened at all (`ContentValidationException`), so a link planted in a
+/// downloaded world cannot point the game at the rest of the disk.
+pub fn symlinks(saves: &Path, folder: &str) -> crate::Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    collect_symlinks(&world_path(saves, folder)?, &mut found)?;
+    Ok(found)
 }
 
-/// Forbidden links for the world-open warning. Use the same Java-compatible
-/// allowlist as the access lock, so explicitly permitted links stay usable.
-pub fn symlinks(saves: &Path, folder: &str) -> crate::Result<Vec<PathBuf>> {
-    let world = world_path(saves, folder)?;
-    Ok(
-        crate::world_links::validate(&world, &saves.join("allowed_symlinks.txt"))?
-            .into_iter()
-            .map(|entry| entry.link)
-            .collect(),
-    )
+fn collect_symlinks(dir: &Path, found: &mut Vec<PathBuf>) -> crate::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            found.push(entry.path());
+        } else if kind.is_dir() {
+            collect_symlinks(&entry.path(), found)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn rename(saves: &Path, folder: &str, name: &str) -> crate::Result<()> {
-    let (world, _lock) = world_access(saves, folder)?;
-    let path = world.join("level.dat");
+    let path = world_path(saves, folder)?.join("level.dat");
     let mut root = read_dat(&path).ok_or("Could not read level.dat")?;
     let Some(Tag::Compound(data)) = root.get_mut("Data") else {
         return Err("Missing level data".into());
@@ -57,8 +59,7 @@ pub fn rename(saves: &Path, folder: &str, name: &str) -> crate::Result<()> {
 }
 
 pub(super) fn reset_icon(saves: &Path, folder: &str) -> crate::Result<()> {
-    let (world, _lock) = world_access(saves, folder)?;
-    fs::remove_file(world.join("icon.png"))?;
+    fs::remove_file(world_path(saves, folder)?.join("icon.png"))?;
     Ok(())
 }
 
@@ -121,8 +122,9 @@ pub(super) fn open_folder(path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-pub fn backup(saves: &Path, folder: &str) -> crate::Result<u64> {
-    let (world, _lock) = world_access(saves, folder)?;
+/// A zip of the whole world folder in the backups folder: where it is, and its size.
+pub fn backup(saves: &Path, folder: &str) -> crate::Result<(PathBuf, u64)> {
+    let world = world_path(saves, folder)?;
     let backups = backups_path(saves);
     fs::create_dir_all(&backups)?;
     let base = format!(
@@ -148,15 +150,18 @@ pub fn backup(saves: &Path, folder: &str) -> crate::Result<u64> {
             Err(e) => return Err(e.into()),
         }
     };
-    let result = (|| {
+    let result: crate::Result<u64> = (|| {
         let mut zip = zip::ZipWriter::new(file);
         write_tree(&mut zip, &world, &world, folder)?;
         Ok(zip.finish()?.metadata()?.len())
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(path);
+    match result {
+        Ok(bytes) => Ok((path, bytes)),
+        Err(e) => {
+            let _ = fs::remove_file(path);
+            Err(e)
+        }
     }
-    result
 }
 
 fn write_tree<W: Write + Seek>(
