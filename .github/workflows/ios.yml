@@ -74,8 +74,19 @@ jobs:
         # uses the same flags, so HORIZON_GAME_PREBUILT below finds this build.
         env:
           SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: sccache
-        run: cargo build --release --locked --target "$IOS_TARGET" -p horizon-official --no-default-features --features audio,horizon-extras
+          # tools/ci/compiler-cache.sh routes rustc through sccache and, with this set, compiles
+          # the workspace's own crates instead of replaying them: a cached object is keyed by its
+          # command line, not by the crates it links against, so horizon-game came back built
+          # against an older horizon-client and linking failed with E0460.
+          RUSTC_WRAPPER: ${{ github.workspace }}/tools/ci/compiler-cache.sh
+          HORIZON_SCCACHE_SKIP_WORKSPACE: "1"
+        run: |
+          set -euo pipefail
+          # The failed build's replay left horizon-game's stale rlib in the restored target
+          # directory, and its fingerprint makes Cargo call it fresh; drop those crates so this
+          # build writes real ones (a few seconds, their dependencies stay).
+          cargo clean -p horizon-client -p horizon-game -p horizon-official
+          cargo build --release --locked --target "$IOS_TARGET" -p horizon-official --no-default-features --features audio,horizon-extras
       - name: Bundle it
         run: |
           set -euo pipefail

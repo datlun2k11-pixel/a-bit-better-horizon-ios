@@ -3,16 +3,16 @@
 # Keep clippy-driver direct for hand-written workspace linting.
 # Cargo nests RUSTC_WORKSPACE_WRAPPER (clippy-driver) inside RUSTC_WRAPPER.
 set -euo pipefail
+crate_name= previous=
+for arg in "$@"; do
+  if [ "$previous" = --crate-name ]; then
+    crate_name=$arg
+    break
+  fi
+  previous=$arg
+done
 case "${1##*/}" in
   clippy-driver | clippy-driver.exe)
-    crate_name= previous=
-    for arg in "$@"; do
-      if [ "$previous" = --crate-name ]; then
-        crate_name=$arg
-        break
-      fi
-      previous=$arg
-    done
     if [ "$crate_name" != mod_points ]; then
       exec "$@"
     fi
@@ -39,6 +39,17 @@ case "${1##*/}" in
     set -- "${args[@]}" -D warnings
     ;;
 esac
+# A cached compile is keyed by its command line, not by the contents of the rlibs its
+# `--extern` arguments name: after a change inside one workspace crate, sccache can serve
+# another workspace crate's object built against the previous one, and linking fails with
+# E0460. The iOS build opts in (`HORIZON_SCCACHE_SKIP_WORKSPACE`) to compiling the
+# workspace's own crates directly; the external dependencies, which are the cold build's
+# minutes, still come from the cache.
+if [ -n "${HORIZON_SCCACHE_SKIP_WORKSPACE:-}" ]; then
+  case "$crate_name" in
+    horizon_*) exec "$@" ;;
+  esac
+fi
 # Cargo has already selected incremental compilation in rustc's arguments.
 # sccache refuses CARGO_INCREMENTAL=1 even for non-incremental dependencies.
 unset CARGO_INCREMENTAL
