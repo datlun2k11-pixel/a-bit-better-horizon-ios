@@ -45,6 +45,15 @@ impl Game<'_> {
     fn extras_now(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
+    /// iOS: the fork's hardware-keyboard hook; zoom is `native_zoom` now.
+    #[cfg(target_os = "ios")]
+    pub(super) fn extras_key(
+        &mut self,
+        _key: winit::keyboard::KeyCode,
+        _pressed: bool,
+        _repeat: bool,
+    ) {
+    }
     /// Mouse buttons while playing, for mods' clicks.
     pub(super) fn extras_mouse(&mut self, button: MouseButton, pressed: bool) {
         let i = match button {

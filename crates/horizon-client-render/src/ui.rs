@@ -1210,6 +1210,46 @@ fn tooltip_size(atlas: &HudAtlas, lines: &[Text]) -> (f32, f32) {
     };
     (w, h)
 }
+/// `TooltipRenderUtil.getBackgroundSprite` and `getFrameSprite` of a tooltip style
+/// (`<namespace>:<path>`): `tooltip/<path>_background` and `tooltip/<path>_frame` in the style's
+/// namespace, named as the GUI atlas packs them.
+pub fn tooltip_style_sprites(namespace: &str, path: &str) -> [String; 2] {
+    let prefix = match namespace {
+        "minecraft" => String::new(),
+        namespace => format!("{namespace}:"),
+    };
+    ["background", "frame"].map(|part| format!("{prefix}gui/sprites/tooltip/{path}_{part}"))
+}
+/// `TooltipRenderUtil.renderTooltipBackground`: the background sprite, then the frame sprite,
+/// each drawn by `blitSprite` (nine-sliced as its `gui.scaling` says, stretched without it)
+/// 12 pixels out from the tooltip's contents `[x, y, w, h]` (`PADDING` 3 and `MARGIN` 9 on
+/// every side). Whether the atlas has both sprites; one that lacks either draws nothing.
+pub fn tooltip_sprites(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    [background, frame]: [&str; 2],
+    [x, y, w, h]: [f32; 4],
+) -> bool {
+    if ![background, frame]
+        .iter()
+        .all(|sprite| atlas.sprites.contains_key(*sprite))
+    {
+        return false;
+    }
+    for sprite in [background, frame] {
+        blit_sprite(
+            batch,
+            atlas,
+            sprite,
+            x - 12.0,
+            y - 12.0,
+            w + 24.0,
+            h + 24.0,
+            u32::MAX,
+        );
+    }
+    true
+}
 fn tooltip_box(
     batch: &mut HudBatch,
     atlas: &HudAtlas,

@@ -96,6 +96,68 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+// Limit owned string allocations as well as table entries: obsolete, rejected profile
+// payloads must not accumulate a server's worth of maximum-size properties.
+const SKIN_MEMO_BYTES: usize = 4 * 1024 * 1024;
+struct SkinMemo<K, V> {
+    values: std::collections::HashMap<K, (V, usize)>,
+    bytes: usize,
+}
+impl<K, V> Default for SkinMemo<K, V> {
+    fn default() -> Self {
+        Self {
+            values: std::collections::HashMap::new(),
+            bytes: 0,
+        }
+    }
+}
+impl<K: Eq + std::hash::Hash, V> SkinMemo<K, V> {
+    fn get(&self, key: &K) -> Option<&V> {
+        self.values.get(key).map(|(value, _)| value)
+    }
+    fn remember(&mut self, key: K, value: V, bytes: usize) {
+        if bytes > SKIN_MEMO_BYTES {
+            return;
+        }
+        if self.values.len() >= 4096 || bytes > SKIN_MEMO_BYTES.saturating_sub(self.bytes) {
+            self.values.clear();
+            self.bytes = 0;
+        }
+        if let Some((_, previous)) = self.values.insert(key, (value, bytes)) {
+            self.bytes -= previous;
+        }
+        self.bytes += bytes;
+    }
+}
+thread_local! {
+    static UNPACKED: std::cell::RefCell<SkinMemo<(String, u8), Textures>> =
+        std::cell::RefCell::default();
+}
+
+/// [`unpack`] with [`texture_uris`], remembered by the payload. A frame resolves every drawn
+/// mannequin's skin, and decoding each one's base64 JSON again was most of that.
+pub fn unpack_known(value: &str, signature: Signature) -> Textures {
+    if value.len() > SKIN_MEMO_BYTES {
+        return unpack(value, signature, texture_uris());
+    }
+    let key = (value.to_owned(), signature as u8);
+    if let Some(textures) = UNPACKED.with_borrow(|known| known.get(&key).cloned()) {
+        return textures;
+    }
+    let textures = unpack(value, signature, texture_uris());
+    UNPACKED.with_borrow_mut(|known| {
+        let cached = textures.clone();
+        let bytes = key.0.capacity()
+            + [&cached.skin, &cached.cape, &cached.elytra]
+                .into_iter()
+                .flatten()
+                .map(String::capacity)
+                .sum::<usize>();
+        known.remember(key, cached, bytes);
+    });
+    textures
+}
+
 /// `unpackTextures(property)`: the textures of a `textures` property's
 /// base64 JSON payload.
 pub fn unpack(value: &str, signature: Signature, valid_uris: &[impl AsRef<str>]) -> Textures {

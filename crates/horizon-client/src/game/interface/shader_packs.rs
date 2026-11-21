@@ -1182,6 +1182,63 @@ fn fluid_pairs(layers: usize, fluids: impl IntoIterator<Item = u32>) -> Vec<i32>
     table
 }
 
+pub(super) const HELP: &[&str] =
+    &["shader-pack [list|off|NAME]    list or select a shader pack in shaderpacks/"];
+
+/// `shader-pack [list|off|NAME]`, for the control socket and the phone launcher: the packs in
+/// `shaderpacks/` with the pick, and the pick changed in `options.txt`. The next frame loads
+/// the new pack, or the game's own shaders when off.
+pub(super) fn command(
+    settings: &mut horizon_client::settings::Settings,
+    words: &[&str],
+    line: &str,
+) -> horizon_client::Result<Option<serde_json::Value>> {
+    use serde_json::json;
+    if words.first() != Some(&"shader-pack") {
+        return Ok(None);
+    }
+    let root = std::env::current_dir()?;
+    let packs = horizon_client::shader_pack_list::scan(&root.join("shaderpacks"));
+    let arg = line
+        .trim_start()
+        .strip_prefix("shader-pack")
+        .unwrap_or("")
+        .trim();
+    match arg {
+        "" | "list" => {}
+        "off" => {
+            settings.horizon.shader_pack.clear();
+            settings.save(&root.join("options.txt"));
+        }
+        name => {
+            if !packs.iter().any(|pack| pack.file == name) {
+                return Err(format!("no shader pack {name} in shaderpacks/").into());
+            }
+            settings.horizon.shader_pack = name.to_owned();
+            settings.save(&root.join("options.txt"));
+        }
+    }
+    settings.shader_packs = packs;
+    let selected =
+        (!settings.horizon.shader_pack.is_empty()).then_some(settings.horizon.shader_pack.as_str());
+    let list: Vec<serde_json::Value> = settings
+        .shader_packs
+        .iter()
+        .map(|pack| json!({"name": pack.file, "title": pack.title, "problem": null}))
+        .collect();
+    Ok(Some(json!({"packs": list, "selected": selected})))
+}
+
+impl Game<'_> {
+    pub(super) fn shader_pack_control(
+        &mut self,
+        words: &[&str],
+        line: &str,
+    ) -> horizon_client::Result<Option<serde_json::Value>> {
+        command(&mut self.settings, words, line)
+    }
+}
+
 #[cfg(test)]
 mod fluid_pair_tests {
     use super::fluid_pairs;

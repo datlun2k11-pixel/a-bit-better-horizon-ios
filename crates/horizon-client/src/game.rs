@@ -116,11 +116,6 @@ mod native_hooks;
 mod airplay;
 mod avatar_equipment_fixture;
 mod chat_input;
-#[cfg(not(target_os = "ios"))]
-mod extras;
-#[cfg(target_os = "ios")]
-#[path = "game/extras_ios.rs"]
-mod extras;
 mod import_screen;
 mod input_mode;
 mod launcher;

@@ -12,7 +12,7 @@ use horizon_client::{
         hub::{Hub, HubConfig},
     },
 };
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 use std::sync::Arc;
 
 const ADV: &str = "test:boat_loot";

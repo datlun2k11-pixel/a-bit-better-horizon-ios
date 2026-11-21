@@ -8,6 +8,8 @@
 //! into entity vertices with the level's lighting.
 use horizon_assets::resource_source::{ResourceRoot, ResourceSource};
 pub mod cit;
+mod components;
+pub use components::custom_data_matches;
 mod glint_atlas;
 #[cfg(test)]
 mod glint_tests;
