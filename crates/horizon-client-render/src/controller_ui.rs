@@ -8,8 +8,13 @@ use crate::{
     graphics_style as style,
     hud::{HudAtlas, HudBatch},
     lang,
+    options_ui::Event,
+    pad_glyph::{Glyph, Glyphs},
     settings::{Opt, Settings},
-    settings_shell::{self as shell, Columns},
+    settings_shell::{
+        self as shell, Binding, Capture, Columns, Group, Output, Reset, Row, Screen, Sheet, Shown,
+        Value,
+    },
     text::Text,
     ui,
 };
@@ -1211,6 +1216,202 @@ impl ControllerUi {
             .iter()
             .filter_map(|l| Some(self.parts(l.setting?.item, s).0))
             .collect()
+    }
+}
+
+/// The title under the mark.
+const TITLE: &str = "Controller";
+/// A Reset All row's name, vanilla's.
+const RESET_ALL: &str = "controls.resetAll";
+
+impl Context {
+    /// A line to read: its name (a language key) and what it says now.
+    fn read(&self, which: Info) -> (&'static str, String) {
+        match which {
+            Info::Player => ("Player profile", self.player.clone()),
+            Info::Device => ("Controller", self.device_name()),
+            Info::Ids => (
+                "Vendor and product",
+                match self.device.as_ref().map(|d| (d.vendor, d.product)) {
+                    Some((Some(vendor), Some(product))) => format!("{vendor:04x}:{product:04x}"),
+                    _ => lang::get("Unknown"),
+                },
+            ),
+            Info::Detected => ("Detected glyphs", glyphs_name(self.detected)),
+            Info::Using => ("Glyphs in use", glyphs_name(self.glyphs.family())),
+        }
+    }
+    fn device_name(&self) -> String {
+        self.device
+            .as_ref()
+            .map_or_else(|| lang::get("No controller"), |d| d.name.clone())
+    }
+}
+
+/// An action's binding: its button in the player's glyphs, what else that button does, and a
+/// reset while it isn't the default.
+fn binding(action: &'static str, pad: &PadSettings, glyphs: Glyphs) -> Binding {
+    use crate::gamepad::{GlyphOf, MenuJob};
+    let shared = match pad.binding(action) {
+        Some(button) if pad.conflicts(action) => pad
+            .actions_of(button)
+            .into_iter()
+            .filter(|other| *other != action)
+            .map(|other| lang::get(gamepad::action_caption(other)))
+            .collect(),
+        _ => Vec::new(),
+    };
+    Binding {
+        capture: Capture::Pad(action),
+        shown: Shown::Pad {
+            glyph: Glyph::of(GlyphOf::Bound(action), pad, glyphs),
+            cancel: Glyph::menu(MenuJob::Start, glyphs),
+        },
+        shared,
+        reset: if pad.is_default(action) {
+            Reset::Default
+        } else {
+            Reset::Changed
+        },
+    }
+}
+
+/// A setting's row, as these settings and the game's context read now.
+fn row(setting: Setting, s: &Settings, context: &Context) -> Row<Item> {
+    let item = setting.item;
+    let about = lang::get(setting.text);
+    match item {
+        Item::Option(o) => {
+            let (name, value) = shell::name_and_value(&o.label(s).plain());
+            let text = value.unwrap_or_default();
+            let value = match (item.switch(s), item.slider(s)) {
+                (Some(on), _) => Value::Switch(on),
+                (None, Some(position)) => Value::Slider {
+                    position,
+                    steps: o.slider_steps(),
+                    text,
+                },
+                (None, None) => Value::Choice(text),
+            };
+            Row::new(item, name, value).about(about)
+        }
+        Item::Bind(action) => {
+            let name = lang::get(gamepad::action_caption(action));
+            let value = Value::Binding(binding(action, &s.controller, context.glyphs));
+            Row::new(item, name, value).about(about)
+        }
+        Item::ResetBinds => Row::new(item, lang::get(RESET_ALL), Value::Press).about(about),
+        Item::Info(which) => {
+            let (name, value) = context.read(which);
+            Row::new(item, lang::get(name), Value::Read(value)).about(about)
+        }
+    }
+}
+
+/// The controller settings screen: what it shows besides the settings is the game's.
+#[derive(Default)]
+pub(crate) struct ControllerScreen {
+    /// Who and what the screen is about, which the game sets as it draws.
+    pub(crate) context: Context,
+    /// The window's size in pixels, which `Opt::cycle` takes: the options screen sets it before
+    /// each input.
+    pub(crate) framebuffer: [i32; 2],
+}
+
+impl Screen for ControllerScreen {
+    type Page = Page;
+    type Row = Item;
+    fn title(&self) -> &'static str {
+        TITLE
+    }
+    /// The rows read the controller settings and the game's context.
+    fn stamp(&self, s: &Settings) -> u64 {
+        shell::stamp_of(&(&s.controller, &self.context))
+    }
+    fn sheets(&self, s: &Settings) -> Vec<Sheet<Page, Item>> {
+        let sheet = |(page, groups): (Page, Vec<(&'static str, Vec<Setting>)>)| Sheet {
+            id: page,
+            name: lang::get(page.name()),
+            about: lang::get(page.about()),
+            warning: None,
+            groups: groups
+                .into_iter()
+                .map(|(name, settings)| Group {
+                    name,
+                    rows: settings
+                        .into_iter()
+                        .map(|setting| row(setting, s, &self.context))
+                        .collect(),
+                })
+                .collect(),
+            listed: true,
+            heading: None,
+        };
+        rows().into_iter().map(sheet).collect()
+    }
+    /// A tick box or a value steps; Reset All puts every action back. The shell starts a
+    /// binding's wait and slides a slider; a line to read does nothing.
+    fn press(&mut self, s: &mut Settings, item: Item, back: bool) -> Vec<Output> {
+        match item {
+            Item::Option(o) => {
+                o.cycle(s, back, self.framebuffer);
+                vec![Output::Event(Event::Changed)]
+            }
+            Item::ResetBinds => {
+                s.controller.reset_bindings();
+                vec![Output::Event(Event::Changed)]
+            }
+            Item::Bind(_) | Item::Info(_) => Vec::new(),
+        }
+    }
+    fn slide(&mut self, s: &mut Settings, item: Item, position: f32) {
+        if let Item::Option(o) = item {
+            o.set_slider(s, position);
+        }
+    }
+    /// With the "Scroll wheel changes settings" extra, the wheel steps a value between `<` `>`;
+    /// the other rows leave it to scroll the list.
+    fn wheel_step(&mut self, s: &mut Settings, item: Item, back: bool) -> Option<Vec<Output>> {
+        let Item::Option(o) = item else {
+            return None;
+        };
+        item.steps(s).then(|| {
+            o.cycle(s, back, self.framebuffer);
+            vec![
+                Output::Event(Event::ButtonClick),
+                Output::Event(Event::Changed),
+            ]
+        })
+    }
+    fn reset(&mut self, s: &mut Settings, item: Item) -> Vec<Output> {
+        let Item::Bind(action) = item else {
+            return Vec::new();
+        };
+        s.controller.reset_binding(action);
+        vec![Output::Event(Event::Changed)]
+    }
+    /// Whose profile these settings are, and the controller the game sees.
+    fn side(&self) -> Vec<String> {
+        let player = lang::tr("Editing: %s", &[&self.context.player]);
+        vec![player, self.context.device_name()]
+    }
+    fn undoes(&self) -> bool {
+        true
+    }
+    /// This player's controller settings, bindings included, as the screen found them. The
+    /// radial menu's pages stay as they are: their own screen has its own Undo.
+    fn undo(&mut self, s: &mut Settings, before: &Settings) -> Vec<Output> {
+        let radial = std::mem::take(&mut s.controller.radial);
+        s.controller = before.controller.clone();
+        s.controller.radial = radial;
+        Vec::new()
+    }
+    /// Undo is there exactly while the controller settings differ from what the screen opened
+    /// with.
+    fn differs(&self, s: &Settings, before: &Settings) -> Option<bool> {
+        let mut now = s.controller.clone();
+        now.radial = before.controller.radial.clone();
+        Some(now != before.controller)
     }
 }
 

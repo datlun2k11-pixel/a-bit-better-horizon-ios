@@ -10,12 +10,14 @@ use crate::{
     graphics_style as style,
     hud::{HudAtlas, HudBatch},
     lang,
+    options_ui::Event,
     settings::Settings,
-    settings_shell::{self as shell, Columns},
+    settings_shell::{self as shell, Columns, Group, Output, Row, Sheet, Value},
     text::Text,
     ui,
 };
 use horizon_shader_api::{OptionKind, PageItem};
+use std::collections::BTreeMap;
 
 /// A page of the screen: the pack list, or screen `.0` of the picked pack (`screens`, 0 its
 /// main one).
@@ -1098,6 +1100,287 @@ impl ShaderUi {
     fn searched(&mut self) {
         self.scroll.amount = 0.0;
         self.picked = None;
+    }
+}
+
+/// The title under the mark.
+const TITLE: &str = "Shaders";
+/// The group the picked pack's own screens are under.
+const PACK_OPTIONS: &str = "Pack settings";
+/// What the strip says of a `shaders/` pack's changed options until they apply.
+const PENDING: &str = "Changed options apply with Apply, or when you leave.";
+/// The lines the strip has for a description.
+const NOTE_LINES: usize = 3;
+/// How many links from the main screen the page list holds.
+const LISTED_DEPTH: u8 = 1;
+
+/// A row, as the picked pack reads now.
+fn row(item: Item, s: &Settings, screens: &[Screen]) -> Row<Item> {
+    let (name, value) = ShaderUi::parts(item, s, screens);
+    let value = match (ShaderUi::switch(item, s), ShaderUi::slider(item, s)) {
+        (Some(on), _) => Value::Switch(on),
+        (None, Some(position)) => Value::Slider {
+            position,
+            steps: None,
+            text: value.unwrap_or_default(),
+        },
+        _ => value.map_or(Value::Press, Value::Choice),
+    };
+    Row::new(item, name, value).about(ShaderUi::description(item, s, screens))
+}
+
+/// The shader packs screen on the settings shell (`settings_shell`): the pack list, then the
+/// picked pack's own screens, and what pressing their rows does.
+#[derive(Default)]
+pub(crate) struct ShaderScreen {
+    /// The Horizon pack whose slider a drag moved: saved once, when it lets go.
+    drag_changed: Option<usize>,
+    /// The values this screen saved to a `shaders/` pack's file (picking another pack, Apply),
+    /// by pack: Undo puts back the ones the screen opened with over them.
+    written: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl ShaderScreen {
+    /// The picked `shaders/` pack's options are saved: what Undo has to put back over.
+    fn saving(&mut self, s: &Settings) {
+        if let Some(o) = s.shader_options.as_ref() {
+            self.written.insert(o.pack.clone(), o.chosen.clone());
+        }
+    }
+}
+
+impl shell::Screen for ShaderScreen {
+    type Page = Tab;
+    type Row = Item;
+    fn title(&self) -> &'static str {
+        TITLE
+    }
+    fn note_lines(&self) -> usize {
+        NOTE_LINES
+    }
+    /// The rows read the packs, the pick, its options and the Shadow Cache.
+    fn stamp(&self, s: &Settings) -> u64 {
+        let packs: Vec<_> = (s.shader_packs.iter())
+            .map(|p| (&p.key, &p.title, &p.values, p.options.len(), p.pages.len()))
+            .collect();
+        let options = (s.shader_options.as_ref()).map(|o| (&o.pack, &o.chosen, o.changed));
+        let h = &s.horizon;
+        shell::stamp_of(&(&h.shader_pack, h.shadow_cache, packs, options))
+    }
+    /// The pack list, then the picked pack's screens under its name.
+    fn sheets(&self, s: &Settings) -> Vec<Sheet<Tab, Item>> {
+        let screens = screens(s);
+        let pending = ShaderUi::pending(s);
+        let pack_rows = ShaderUi::items(Tab::Packs, s, &screens)
+            .into_iter()
+            .map(|item| row(item, s, &screens))
+            .collect();
+        let mut sheets = vec![Sheet::new(
+            Tab::Packs,
+            lang::get("Shader packs"),
+            lang::get("Shader packs in shaderpacks/: press one to use it."),
+            vec![Group {
+                name: "Shader packs",
+                rows: pack_rows,
+            }],
+        )];
+        for (i, screen) in screens.iter().enumerate() {
+            let about = if pending {
+                lang::get(PENDING)
+            } else {
+                screen.about.clone()
+            };
+            let rows = (screen.items.iter())
+                .map(|&item| row(item, s, &screens))
+                .collect();
+            let groups = vec![Group {
+                name: PACK_OPTIONS,
+                rows,
+            }];
+            let mut sheet = Sheet::new(Tab::Screen(i as u16), screen.title.clone(), about, groups);
+            sheet.listed = screen.depth <= LISTED_DEPTH;
+            sheets.push(sheet);
+        }
+        sheets
+    }
+    fn link(&self, item: Item) -> Option<Tab> {
+        match item {
+            Item::Link(i) => Some(Tab::Screen(i)),
+            _ => None,
+        }
+    }
+    /// A pack is picked (or turned off), an option steps (back with Shift), the folder opens.
+    fn press(&mut self, s: &mut Settings, item: Item, back: bool) -> Vec<Output> {
+        let changed = vec![Output::Event(Event::Changed)];
+        let pack = s.horizon.shader_pack.clone();
+        let native = picked(s)
+            .filter(|p| p.1 == Kind::Horizon)
+            .map(|p| p.0);
+        match item {
+            Item::Pack(i) => {
+                let Some(p) = s.shader_packs.get(usize::from(i)) else {
+                    return Vec::new();
+                };
+                s.horizon.shader_pack = if s.horizon.shader_pack == p.key {
+                    String::new()
+                } else {
+                    p.key.clone()
+                };
+                let mut outputs = Vec::new();
+                // The last pack's changed options are kept before the next one's are read.
+                if s.shader_options.as_ref().is_some_and(|o| o.changed) {
+                    self.saving(s);
+                    outputs.push(Output::Event(Event::ShaderOptions));
+                }
+                outputs.push(Output::Event(Event::ShaderPack));
+                outputs.push(Output::Event(Event::OpenShaderOptions));
+                outputs
+            }
+            Item::Folder => vec![Output::Event(Event::OpenShaderPackFolder)],
+            Item::ShadowCache => {
+                s.horizon.shadow_cache = !s.horizon.shadow_cache;
+                changed
+            }
+            // The shell follows a link (`link`).
+            Item::Link(_) => Vec::new(),
+            Item::Profile => match s.shader_options.as_mut().filter(|o| o.pack == pack) {
+                Some(o) => {
+                    o.next_profile();
+                    changed
+                }
+                None => Vec::new(),
+            },
+            Item::Reset => match native {
+                Some(p) => {
+                    s.shader_packs[p].reset_options();
+                    vec![Output::Event(Event::NativePackOptions(p))]
+                }
+                None => match s.shader_options.as_mut().filter(|o| o.pack == pack) {
+                    Some(o) => {
+                        o.reset();
+                        changed
+                    }
+                    None => Vec::new(),
+                },
+            },
+            Item::Option(i) => match native {
+                Some(p) if s.shader_packs[p].step_option(usize::from(i), back, false) => {
+                    vec![Output::Event(Event::NativePackOptions(p))]
+                }
+                Some(_) => Vec::new(),
+                None => {
+                    let options = s.shader_options.as_mut().filter(|o| o.pack == pack);
+                    match options.and_then(|o| Some((option_name(o, i)?.to_owned(), o))) {
+                        Some((name, o)) => {
+                            o.cycle(&name, back);
+                            changed
+                        }
+                        None => Vec::new(),
+                    }
+                }
+            },
+        }
+    }
+    /// A slider moves an option to the value nearest it.
+    fn slide(&mut self, s: &mut Settings, item: Item, position: f32) {
+        let Item::Option(i) = item else {
+            return;
+        };
+        if let Some(p) = picked(s).filter(|p| p.1 == Kind::Horizon).map(|p| p.0) {
+            if s.shader_packs[p].set_slider_position(usize::from(i), position) {
+                self.drag_changed = Some(p);
+            }
+            return;
+        }
+        let pack = s.horizon.shader_pack.clone();
+        if let Some(o) = s.shader_options.as_mut().filter(|o| o.pack == pack)
+            && let Some(name) = option_name(o, i).map(str::to_owned)
+        {
+            o.set_position(&name, position);
+        }
+    }
+    /// A Horizon pack's options are saved, and the pack rebuilt, once a drag.
+    fn slider_released(&mut self) -> Vec<Output> {
+        let changed = self.drag_changed.take();
+        changed.map_or_else(Vec::new, |p| {
+            vec![Output::Event(Event::NativePackOptions(p))]
+        })
+    }
+    /// With the "Scroll wheel changes settings" extra, the wheel steps an option between `<` `>`
+    /// and the profile (up goes back); the other rows leave it to scroll the list.
+    fn wheel_step(&mut self, s: &mut Settings, item: Item, back: bool) -> Option<Vec<Output>> {
+        let steps = match item {
+            Item::Profile => true,
+            Item::Option(_) => ShaderUi::switch(item, s).is_none() && ShaderUi::slider(item, s).is_none(),
+            _ => false,
+        };
+        if !steps {
+            return None;
+        }
+        let mut outputs = vec![Output::Event(Event::ButtonClick)];
+        outputs.extend(self.press(s, item, back));
+        Some(outputs)
+    }
+    fn undoes(&self) -> bool {
+        true
+    }
+    /// The pick, the Shadow Cache, the Horizon packs' options and the options of the `shaders/`
+    /// pack picked when the screen opened, as the screen opened with them.
+    fn undo(&mut self, s: &mut Settings, before: &Settings) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        s.horizon.shadow_cache = before.horizon.shadow_cache;
+        for (i, pack) in s.shader_packs.iter_mut().enumerate() {
+            let was = before.shader_packs.iter().find(|p| p.key == pack.key);
+            if let Some(was) = was.filter(|was| was.values != pack.values) {
+                pack.values = was.values.clone();
+                outputs.push(Output::Event(Event::NativePackOptions(i)));
+            }
+        }
+        if s.horizon.shader_pack != before.horizon.shader_pack {
+            s.horizon.shader_pack = before.horizon.shader_pack.clone();
+            s.shader_options = before.shader_options.clone();
+            if let Some(o) = s.shader_options.as_mut()
+                && let Some(written) = self.written.get(&o.pack)
+            {
+                o.saved_as(written.clone());
+            }
+            outputs.push(Output::Event(Event::ShaderPack));
+            if s.shader_options.is_none() {
+                outputs.push(Output::Event(Event::OpenShaderOptions));
+            }
+        } else if let Some(o) = s.shader_options.as_mut()
+            && let Some(was) = before.shader_options.as_ref().filter(|w| w.pack == o.pack)
+        {
+            o.restore(was.chosen.clone());
+        }
+        outputs
+    }
+    /// Undo shows exactly while the pick, the Shadow Cache or a pack's options differ from what
+    /// the screen opened with.
+    fn differs(&self, s: &Settings, before: &Settings) -> Option<bool> {
+        let native = s.shader_packs.iter().any(|pack| {
+            let was = before.shader_packs.iter().find(|p| p.key == pack.key);
+            was.is_some_and(|was| was.values != pack.values)
+        });
+        let options = match (classic(s), before.shader_options.as_ref()) {
+            (Some(o), Some(was)) => o.pack == was.pack && o.chosen != was.chosen,
+            _ => false,
+        };
+        let h = (&s.horizon, &before.horizon);
+        let pick = h.0.shader_pack != h.1.shader_pack;
+        Some(pick || h.0.shadow_cache != h.1.shadow_cache || native || options)
+    }
+    /// A `shaders/` pack's options wait for Apply until the pack loads again with them.
+    fn pending(&self, s: &Settings) -> bool {
+        classic(s).is_some_and(|o| o.changed)
+    }
+    /// The options are saved, and the pack loads again with them.
+    fn apply(&mut self, s: &mut Settings) -> Vec<Output> {
+        self.saving(s);
+        vec![
+            Output::Event(Event::ShaderOptions),
+            Output::Event(Event::OpenShaderOptions),
+        ]
     }
 }
 

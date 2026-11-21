@@ -12,8 +12,9 @@ use crate::{
     graphics_style::{self as style, Cost},
     hud::{HudAtlas, HudBatch},
     lang,
+    options_ui::{Event, Page as OptionsPage},
     settings::{Opt, Settings},
-    settings_shell::{self as shell, Columns},
+    settings_shell::{self as shell, Columns, Group, Output, Row, Screen, Sheet, Value},
     text::Text,
     ui,
 };
@@ -1393,6 +1394,184 @@ fn parts(item: Item, s: &Settings, binding: bool) -> (String, Option<String>) {
     }
     shell::name_and_value(&item.label(s).plain())
 }
+
+/// The title under the mark.
+const TITLE: &str = "Graphics";
+
+/// A setting's row, as these settings read now.
+fn row(setting: Setting, s: &Settings) -> Row<Item> {
+    let item = setting.item;
+    let (name, value) = parts(item, s, false);
+    let value = match (item.switch(s), item.slider(s)) {
+        (Some(on), _) => Value::Switch(on),
+        (None, Some(position)) => Value::Slider {
+            position,
+            steps: item.slider_steps(),
+            text: value.unwrap_or_default(),
+        },
+        _ => value.map_or(Value::Press, Value::Choice),
+    };
+    let about = lang::get(setting.text);
+    let chosen = lang::get(description(item, s, setting.text));
+    Row {
+        chosen: (chosen != about).then_some(chosen),
+        ..Row::new(item, name, value)
+            .about(about)
+            .cost(setting.cost)
+            .blocked(item.blocked(s).map(lang::get))
+    }
+}
+
+/// Horizon's graphics screen on the settings shell (`settings_shell`): its pages and rows from
+/// [`rows`], what pressing them does, and Undo.
+#[derive(Default)]
+pub struct GraphicsScreen {
+    /// The window's size in pixels, which a vanilla row's step can need (the fullscreen
+    /// resolution): the options screen sets it before each input.
+    pub(crate) framebuffer: [i32; 2],
+}
+
+impl Screen for GraphicsScreen {
+    type Page = Page;
+    type Row = Item;
+    fn title(&self) -> &'static str {
+        TITLE
+    }
+    /// The rows read the settings: every row's label, value and why it is greyed.
+    fn stamp(&self, s: &Settings) -> u64 {
+        let rows: Vec<_> = rows()
+            .into_iter()
+            .flat_map(|(_, groups)| groups)
+            .flat_map(|(_, rows)| rows)
+            .map(|r| {
+                (
+                    parts(r.item, s, false),
+                    r.item.blocked(s),
+                    r.item.switch(s),
+                    r.item.slider(s).map(f32::to_bits),
+                    shown(r.item, s),
+                )
+            })
+            .collect();
+        shell::stamp_of(&rows)
+    }
+    fn sheets(&self, s: &Settings) -> Vec<Sheet<Page, Item>> {
+        let sheet = |(page, groups): (Page, Vec<(&'static str, Vec<Setting>)>)| Sheet {
+            id: page,
+            name: lang::get(page.name()),
+            about: lang::get(page.about()),
+            warning: None,
+            groups: groups
+                .into_iter()
+                .map(|(name, settings)| Group {
+                    name,
+                    rows: settings
+                        .into_iter()
+                        .filter(|r| shown(r.item, s))
+                        .map(|r| row(r, s))
+                        .collect(),
+                })
+                .collect(),
+            listed: true,
+            heading: None,
+        };
+        rows().into_iter().map(sheet).collect()
+    }
+    fn press(&mut self, s: &mut Settings, item: Item, back: bool) -> Vec<Output> {
+        match item {
+            Item::Horizon(H::HdrCalibrate) if setup(s) == Setup::Changed => {
+                s.horizon.hdr_peak = 0;
+                s.horizon.hdr_paper_white = 0;
+                vec![Output::Event(Event::Changed)]
+            }
+            Item::Horizon(H::HdrCalibrate) => vec![Output::Push(OptionsPage::HdrCalibration)],
+            // The list of either kind, as the Shaders page opens it from anywhere.
+            Item::Horizon(H::ShaderPacks) => {
+                s.shader_options = None;
+                vec![
+                    Output::Event(Event::ListShaderPacks),
+                    Output::Event(Event::OpenShaderOptions),
+                    Output::Push(OptionsPage::ShaderPacks),
+                ]
+            }
+            _ => {
+                item.cycle(s, back, self.framebuffer);
+                vec![Output::Event(Event::Changed)]
+            }
+        }
+    }
+    fn slide(&mut self, s: &mut Settings, item: Item, position: f32) {
+        item.set_slider(s, position);
+    }
+    /// With the "Scroll wheel changes settings" extra, the wheel steps a value between `<` `>`
+    /// (up goes back); a slider and a tick box leave it to scroll the list.
+    fn wheel_step(&mut self, s: &mut Settings, item: Item, back: bool) -> Option<Vec<Output>> {
+        item.steps(s).then(|| {
+            item.cycle(s, back, self.framebuffer);
+            vec![
+                Output::Event(Event::ButtonClick),
+                Output::Event(Event::Changed),
+            ]
+        })
+    }
+    fn undoes(&self) -> bool {
+        true
+    }
+    /// What this screen edits back to what it was when the screen opened: Horizon's graphics
+    /// settings and the vanilla options on its rows.
+    fn undo(&mut self, s: &mut Settings, b: &Settings) -> Vec<Output> {
+        s.horizon = s.horizon.undone_to(&b.horizon);
+        s.render_distance = b.render_distance;
+        s.simulation_distance = b.simulation_distance;
+        s.gamma = b.gamma;
+        s.gui_scale = b.gui_scale;
+        s.vsync = b.vsync;
+        s.max_fps = b.max_fps;
+        s.inactivity_fps_limit = b.inactivity_fps_limit.clone();
+        s.menu_blur = b.menu_blur;
+        s.extras.fullbright = b.extras.fullbright;
+        s.extras.dynamic_lights = b.extras.dynamic_lights;
+        s.extras.hide_block_particles = b.extras.hide_block_particles;
+        s.attack_indicator = b.attack_indicator;
+        s.autosave_indicator = b.autosave_indicator;
+        s.clouds = b.clouds.clone();
+        s.cloud_range = b.cloud_range;
+        s.weather_radius = b.weather_radius;
+        s.particles = b.particles;
+        s.smooth_lighting = b.smooth_lighting;
+        s.biome_blend = b.biome_blend;
+        s.entity_distance = b.entity_distance;
+        s.entity_shadows = b.entity_shadows;
+        s.vignette = b.vignette;
+        s.chunk_fade = b.chunk_fade;
+        s.mipmap_levels = b.mipmap_levels;
+        s.cutout_leaves = b.cutout_leaves;
+        s.improved_transparency = b.improved_transparency;
+        s.prioritize_chunk_updates = b.prioritize_chunk_updates;
+        // Presets set it beside the options above.
+        s.graphics_preset = b.graphics_preset.clone();
+        for key in FILE_KEYS {
+            if let Some(value) = b.file.get(key) {
+                s.file.set(key, value.clone());
+            }
+        }
+        s.file.fullscreen_resolution = b.file.fullscreen_resolution.clone();
+        Vec::new()
+    }
+    /// Calibration can change what Undo puts back, as a row does.
+    fn changes(&self, outputs: &[Output]) -> bool {
+        let calibrates = outputs.contains(&Output::Push(OptionsPage::HdrCalibration));
+        calibrates || shell::changes_settings(outputs)
+    }
+}
+
+/// The vanilla rows `options.txt` keeps as it read them, not in `Settings`' own fields.
+const FILE_KEYS: [&str; 4] = [
+    "exclusiveFullscreen",
+    "textureFiltering",
+    "maxAnisotropyBit",
+    "fovEffectScale",
+];
 
 pub struct GraphicsUi {
     /// The list's scroll amount and its held scrollbar (`AbstractScrollArea`).
