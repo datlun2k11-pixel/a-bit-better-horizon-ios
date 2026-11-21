@@ -3045,7 +3045,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         });
     }
     /// The focused field's box on screen.
-    pub(crate) fn focused_rect(&self, (w, h): (f32, f32)) -> Option<[f32; 4]> {
+    pub fn focused_rect(&self, (w, h): (f32, f32)) -> Option<[f32; 4]> {
         let x = (w / 2.0).floor() - 100.0;
         match &self.mode {
             Mode::Select { .. } if self.search_focused => Some([x, 21.0, 200.0, 20.0]),
