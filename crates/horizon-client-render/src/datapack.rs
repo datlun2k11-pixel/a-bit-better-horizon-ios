@@ -105,6 +105,7 @@ impl DataPack {
             source: match source {
                 crate::packs::Source::Dir(root) => ResourceSource::directory(root.clone()),
                 crate::packs::Source::Zip(path) => ResourceSource::archive(path)?,
+                crate::packs::Source::Opened(source) => source.clone(),
             },
             selection: None,
         })
@@ -455,6 +456,12 @@ pub fn install(dir: &Path, world: &Path, selected: &[String]) -> Result<(), Stri
     for pack in crate::packs::folder(dir, horizon_core::version::DATA_PACK_FORMAT) {
         let from = match &pack.source {
             crate::packs::Source::Dir(from) | crate::packs::Source::Zip(from) => from,
+            crate::packs::Source::Opened(_) => {
+                return Err(format!(
+                    "{}: an open resource layer cannot be installed as a file pack",
+                    pack.id
+                ));
+            }
         };
         copy(from, &target.join(pack.id.trim_start_matches("file/")))?;
         if !selected.contains(&pack.id) {
