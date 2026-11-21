@@ -28,6 +28,8 @@ pub fn main() {
     horizon_guest_stack::prepare_main();
     horizon_mod_host::exit_if_compile_child();
     let startup = horizon_client::entry::prepare();
+    // The mod holder keeps launcher imports alive; iOS has no launcher and no holder.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     std::hint::black_box(&horizon_mod_package::holder::CAPABILITY);
     horizon_mod_host::main_with(Vec::new(), &[], &[], startup);
 }
