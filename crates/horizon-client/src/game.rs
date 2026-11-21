@@ -9278,10 +9278,9 @@ impl Game<'_> {
                     horizon_client::preedit::set_preedit(None)
                 }
                 WindowEvent::Resized(size) => {
-                    // On AirPlay the surface is the display's, sized by it.
-                    if let Some(r) = &mut self.renderer
-                        && !r.targeted()
-                    {
+                    // AirPlay's display target isn't ported onto the merged renderer yet: the
+                    // phone's window is always the surface.
+                    if let Some(r) = &mut self.renderer {
                         r.resize(size.width, size.height);
                     }
                     self.observe_fullscreen();
