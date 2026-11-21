@@ -22,16 +22,36 @@
 pub const GAME_IDENTITY: [u8; horizon_mod_package::game_identity::MARK.len()] =
     horizon_mod_package::game_identity::MARK;
 
+/// A launch stage in `Documents/horizon-boot.log` (`entry::boot_log`), so a build that dies
+/// before logging starts still says how far it got.
+pub use horizon_client::entry::boot_log;
+
+#[cfg(target_os = "ios")]
+fn log_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        boot_log(&format!("panic: {info}"));
+        previous(info);
+    }));
+}
+
 /// Runs the game with the hooks registered so far, and returns when it ends. Register hooks
 /// (`horizon_platform::hooks::register`) before calling it.
 pub fn main() {
+    boot_log("main: enter");
+    #[cfg(target_os = "ios")]
+    log_panics();
     horizon_guest_stack::prepare_main();
+    boot_log("main: stack ready");
     horizon_mod_host::exit_if_compile_child();
+    boot_log("main: not a compile child");
     let startup = horizon_client::entry::prepare();
+    boot_log("main: entry ready");
     // The mod holder keeps launcher imports alive; iOS has no launcher and no holder.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     std::hint::black_box(&horizon_mod_package::holder::CAPABILITY);
     horizon_mod_host::main_with(Vec::new(), &[], &[], startup);
+    boot_log("main: returned");
 }
 
 /// Establish the executable main thread stack before initialization.

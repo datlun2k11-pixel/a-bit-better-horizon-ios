@@ -51,6 +51,34 @@ impl Startup {
     }
 }
 
+/// Appends a launch line to `Documents/horizon-boot.log` on iOS, where a phone build that dies
+/// before `logs/` exists still leaves the stage it reached in a file the Files app shows. A
+/// missing file means the process never reached Rust (signature, install or dyld).
+#[cfg(target_os = "ios")]
+pub fn boot_log(stage: &str) {
+    use std::io::Write as _;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join("Documents");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("horizon-boot.log"))
+    else {
+        return;
+    };
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let _ = writeln!(file, "{ms} {stage}");
+    let _ = file.flush();
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn boot_log(_stage: &str) {}
+
 /// Holder mode runs first. The game's sole Options validation reads arguments/environment
 /// and resource marker metadata only: no logging, account loading, mods or worker threads.
 /// Account IO, cwd changes and command registration remain in Options::read, after leases.
@@ -68,9 +96,11 @@ pub fn prepare() -> Startup {
     })();
     let (launch, options) = result.unwrap_or_else(|error| {
         eprintln!("Horizon: {error}");
+        boot_log(&format!("entry: usage error: {error}"));
         std::process::exit(game::exit_code::USAGE);
     });
     let Some(options) = options else {
+        boot_log("entry: validated to no game (help or launch-api): exiting");
         std::process::exit(0);
     };
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
