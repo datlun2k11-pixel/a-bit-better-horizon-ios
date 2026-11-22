@@ -19,22 +19,23 @@ use std::{
 
 use super::{Installed, MAX_PACKED, Pack};
 
-/// Where the game files are downloaded from: this followed by `<version>.zip`.
-/// `HORIZON_GAME_FILES_URL` replaces it (a folder URL ending in `/`).
-pub const BASE_URL: &str = "https://cdn.gayfeet.lol/horizon/";
+/// The archive the game files come from: the release asset this fork's builds are prepared from.
+/// A source ending in `/` is a folder that `<version>.zip` is appended to;
+/// `HORIZON_GAME_FILES_URL` replaces either form.
+pub const GAME_FILES_URL: &str =
+    "https://github.com/datcao1102/a-bit-better-horizon-ios/releases/download/test/Horizon-26.3-with-sounds.zip";
 
 /// The archive's address for this version.
 pub fn url(version: &str) -> String {
-    let base = std::env::var("HORIZON_GAME_FILES_URL")
+    let source = std::env::var("HORIZON_GAME_FILES_URL")
         .ok()
         .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| BASE_URL.to_owned());
-    let base = if base.ends_with('/') {
-        base
+        .unwrap_or_else(|| GAME_FILES_URL.to_owned());
+    if source.ends_with('/') {
+        format!("{source}{version}.zip")
     } else {
-        format!("{base}/")
-    };
-    format!("{base}{version}.zip")
+        source
+    }
 }
 
 /// What the download is doing now.
@@ -344,8 +345,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_archive_is_named_for_the_version() {
-        assert_eq!(url("26.3"), "https://cdn.gayfeet.lol/horizon/26.3.zip");
+    fn a_direct_url_is_used_as_it_is() {
+        assert_eq!(url("26.3"), GAME_FILES_URL);
     }
 
     /// One HTTP answer from a local socket: `length` in the header, `body` sent.

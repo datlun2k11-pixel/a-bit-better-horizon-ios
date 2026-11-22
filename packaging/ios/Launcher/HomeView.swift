@@ -321,12 +321,13 @@ struct HomeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 28))
     }
 
-    /// A dropped zip is offered before the network: it is what the player already did. The game's
-    /// launch-time install owns the folder until it says it is done, so neither door runs twice.
+    /// A dropped zip is the one thing taken without being asked: it is what the player already did.
+    /// Downloading stays theirs to choose (the card's button), so nobody is parked on a transfer
+    /// they did not start. The game's launch-time install owns the folder until it says it is done,
+    /// so neither door runs twice.
     private func beginGameFilesSetup() async {
         guard link.phase == .waiting, !link.bootImporting else { return }
-        if link.importDroppedArchives() { return }
-        await download.startAutomaticallyIfNeeded()
+        _ = link.importDroppedArchives()
     }
 
     private var playLabel: String {

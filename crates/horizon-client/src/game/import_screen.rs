@@ -7,6 +7,11 @@
 //! restart is the same one a resource-pack change already makes (`restart_menu_resources`), which is
 //! why nothing here needs new machinery in the loader itself.
 //!
+//! Downloading is the launcher's offer, never a step this screen takes by itself (the launcher's
+//! home screen has a download card, and its Play stays disabled until files are there). What waits
+//! here is the doors that need no server: the folder the Files app shows and a Wi-Fi listener for
+//! an upload.
+//!
 //! Everything drawn is drawn from `horizon_client::import::screen`, with the one atlas that exists
 //! before Mojang's files do.
 use super::*;
@@ -26,8 +31,8 @@ pub(in crate::game) struct Import {
     error: Option<String>,
     received: u64,
     total: u64,
-    /// The game files coming from the download server (`import::download`): the first door, tried
-    /// before the screen asks anyone to send them. `None` once it is over or failed.
+    /// A download the launcher asked for after this screen was up (`download-retry`). Nothing
+    /// starts one here: fetching is the player's choice, from the launcher's home screen.
     download: Option<horizon_client::import::download::Download>,
     /// A look for an archive dropped into the folder while this screen is up. It runs on its own
     /// thread: an install is the same hundreds of megabytes the launch loader unpacks.
@@ -44,9 +49,6 @@ struct Watch {
     installed: std::sync::mpsc::Receiver<Vec<horizon_client::import::Installed>>,
 }
 
-/// Whether this run has downloaded the game files already.
-static DOWNLOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 impl Loading {
     /// Stop waiting for a game that cannot start and wait for files instead. The caller has already
     /// said on screen that this is what a phone does (`import::waits_on_screen`).
@@ -55,37 +57,10 @@ impl Loading {
         // The atlas that exists before Mojang's files do (the boot atlas).
         let atlas = HudAtlas::boot();
         horizon_client::ui_theme::reset_atlas();
-        // Download them first; the Wi-Fi and cable doors open only if that fails. Once a run: files that
-        // downloaded and still don't load would otherwise be downloaded again and again.
-        let url = horizon_client::import::download::url(horizon_core::VANILLA_VERSION);
-        let mut error = None;
-        let download = if DOWNLOADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            log::warn!(
-                "Horizon: the downloaded game files did not load ({reason}); not downloading again"
-            );
-            error = Some(format!(
-                "The game files downloaded but did not load: {reason}"
-            ));
-            None
-        } else {
-            match horizon_client::import::download::Download::start(url.clone(), home.clone()) {
-                Ok(download) => {
-                    log::info!("Horizon: no game files ({reason}); downloading {url}");
-                    Some(download)
-                }
-                Err(error) => {
-                    log::warn!("Horizon: could not start downloading the game files: {error}");
-                    None
-                }
-            }
-        };
-        let session = if download.is_some() {
-            // On a phone the download shows in SwiftUI over this screen; it asks `download-state`.
-            horizon_ios_launcher::present_download();
-            None
-        } else {
-            open_session(&home)
-        };
+        // No download here: the launcher's home screen offers one, and a phone that only wants to
+        // browse must not be held on a transfer it did not ask for. These are the doors that need
+        // no server: the folder the Files app shows, and a Wi-Fi listener for an upload.
+        let session = open_session(&home);
         log::warn!(
             "Horizon: no game files to load ({reason}); waiting for an import in {}",
             home.display()
@@ -96,10 +71,10 @@ impl Loading {
             atlas,
             home,
             reason,
-            error,
+            error: None,
             received: 0,
             total: 0,
-            download,
+            download: None,
             watch: None,
             listing: Vec::new(),
             next_watch,

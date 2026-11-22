@@ -363,6 +363,11 @@ impl Game<'_> {
         }
         horizon_client::spans::time("server_packs", || self.tick_server_packs());
         horizon_client::spans::time("control", || self.poll_control(event_loop));
+        // The launcher's home screen asks the game for worlds, servers and options, and starts
+        // it; its answers travel the same queue the control socket's do.
+        horizon_client::spans::time("launcher", || {
+            self.poll_launcher(event_loop);
+        });
         self.memory_tick(Instant::now());
         if self.pending_save.is_some() {
             return;
@@ -375,6 +380,16 @@ impl Game<'_> {
         {
             self.error = Some(format!("run timed out after {} s", limit.as_secs()).into());
             event_loop.exit();
+            return;
+        }
+        // The launcher's home screen covers the game: frames under an opaque screen only drain
+        // the battery, so keep answering it without drawing until Play uncovers the game. The
+        // frame clock starts again from here, not from the last frame drawn under the launcher.
+        if horizon_ios_launcher::covered() {
+            self.previous = Instant::now();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(33),
+            ));
             return;
         }
         if let Some(w) = &self.window {

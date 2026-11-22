@@ -498,6 +498,11 @@ impl Loading {
                         let accepted =
                             horizon_ios_launcher::start_owned(start_owner(&request.line));
                         request.answer(&json!({ "ok": accepted, "phase": "loading" }).to_string());
+                        // Play while the wait is still up (the files were already in place, or
+                        // arrived another way): the loader starts on them now.
+                        if accepted && self.importing() {
+                            self.files_arrived()?;
+                        }
                     }
                 }
                 "launcher-commit-start" => commit_start(request),

@@ -192,6 +192,14 @@ impl Loading {
         }
 
         self.window = Some(window);
+        // iPhone and iPad: the launcher's home screen covers the game from its first window until
+        // Play. A bundle without the framework starts by itself (horizon-ios-launcher).
+        let shown = horizon_ios_launcher::present();
+        crate::entry::boot_log(if shown {
+            "launcher: presented"
+        } else {
+            "launcher: not this bundle"
+        });
     }
     pub(super) fn window_event(
         &mut self,
@@ -293,7 +301,22 @@ impl Loading {
             event_loop.exit();
             return;
         }
+        // The launcher's requests: the start, `launcher-state`, imports (how a phone with no
+        // files gets them from its home screen) and the lines that are only files.
+        if let Err(error) = self.poll_launcher() {
+            self.error = Some(error);
+            event_loop.exit();
+            return;
+        }
         self.poll_menu_realms(event_loop);
+        // The launcher covers the game: there is nothing of it to draw until Play, and no
+        // reason to spin the phone's loop meanwhile.
+        if horizon_ios_launcher::covered() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(33),
+            ));
+            return;
+        }
         if let Some(w) = &self.window {
             if self.options.as_ref().is_some_and(|o| o.offscreen) {
                 self.draw();
@@ -304,6 +327,11 @@ impl Loading {
         event_loop.set_control_flow(ControlFlow::Poll);
     }
     pub(super) fn draw(&mut self) {
+        // What the launcher covers is not seen (and the import screen under it is the game's
+        // own fallback for when the launcher cannot be shown).
+        if horizon_ios_launcher::covered() {
+            return;
+        }
         let Some(size) = self
             .renderer
             .as_ref()

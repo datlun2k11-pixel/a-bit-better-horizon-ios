@@ -81,12 +81,8 @@ final class GameFilesDownload: NSObject, ObservableObject {
         begin(url: url, token: token.isEmpty ? nil : token)
     }
 
-    /// First-run setup stays in the launcher; it starts no game or renderer.
-    func startAutomaticallyIfNeeded() async {
-        guard !GameFolder.hasGameFiles, !automaticAttempted, state == .idle, !busy else { return }
-        await startAutomatic()
-    }
-
+    /// The card's Download button: the only way a network transfer starts, since downloading is
+    /// the player's choice.
     func startAutomatic() async {
         guard !busy else { return }
         automaticAttempted = true
@@ -365,7 +361,7 @@ struct GameFilesCard: View {
                     .font(Theme.pixel(18)).foregroundStyle(Theme.text)
             }
             if missing {
-                Text("Horizon downloads and installs the game files automatically. Keep this screen open until setup finishes.")
+                Text("Download the game files below, or import a ZIP from Files. They are installed once and kept on this device.")
                     .font(Theme.sans(12)).foregroundStyle(Theme.textMuted)
             }
             progress
