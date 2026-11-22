@@ -11144,7 +11144,9 @@ pub(crate) fn run_with(
     options: Options,
     native: horizon_mod_package::runtime::Runtime,
 ) -> Result<()> {
+    crate::entry::boot_log("play: run_with");
     let mut options = Options::read(options)?;
+    crate::entry::boot_log("play: options read");
     options.mods.native = Arc::new(native);
     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
         && !dedicated::preflight(&mut options)?
@@ -11290,6 +11292,7 @@ pub(crate) fn run_with(
     // shared resources.
     Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
     if !synchronous_startup(&options) {
+        crate::entry::boot_log("play: loading");
         return run_loading(options, early_settings, vanilla_root, None, started);
     }
     let mut pack_error = None;

@@ -8,13 +8,17 @@ pub fn main_with(
     built: &'static [mod_api::__private::native::BuiltMod],
     startup: horizon_client::entry::Startup,
 ) {
+    horizon_client::entry::boot_log("start: main_with");
     horizon_engine_slots::install_seal(mod_points::__private::seal)
         .expect("engine seal provider must be installed once before startup");
+    horizon_client::entry::boot_log("start: seal");
     // Platform instrumentation must precede registration and the first mod guard.
     if let Err(error) = mod_api::__private::initialize() {
         eprintln!("Horizon: refusing startup because mod instrumentation is unavailable: {error}");
+        horizon_client::entry::boot_log(&format!("start: instrumentation refused: {error}"));
         std::process::exit(1);
     }
+    horizon_client::entry::boot_log("start: instrumentation");
     if let Err(error) = horizon_engine_slots::install_platform(horizon_engine_slots::Platform {
         install_packages: mod_api::__private::install_packages,
         install_registration_data: mod_api::__private::install_registration_data,
@@ -26,8 +30,10 @@ pub fn main_with(
         profiler_firefox_profile: mod_api::__private::profiler::firefox_profile,
     }) {
         eprintln!("Horizon: {error}");
+        horizon_client::entry::boot_log(&format!("start: platform refused: {error}"));
         std::process::exit(1);
     }
+    horizon_client::entry::boot_log("start: platform");
     let exe = std::env::current_exe();
     let native: Result<_, Box<dyn std::error::Error + Send + Sync>> = exe
         .as_ref()
@@ -39,10 +45,13 @@ pub fn main_with(
         Ok(native) => native,
         Err(error) => {
             eprintln!("Horizon: {error}");
+            horizon_client::entry::boot_log(&format!("start: native runtime refused: {error}"));
             std::process::exit(1);
         }
     };
+    horizon_client::entry::boot_log("start: native runtime");
     mod_render::render::install();
+    horizon_client::entry::boot_log("start: render installed");
     horizon_client::entry::start(
         native,
         |native, launch| {
