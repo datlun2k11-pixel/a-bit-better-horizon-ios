@@ -56,3 +56,6 @@ pub fn main() {
 
 /// Establish the executable main thread stack before initialization.
 pub use horizon_guest_stack::prepare_main as prepare_main_stack;
+
+/// The main thread's stack size, where the platform reports it (`launch:` lines in the iOS boot log).
+pub use horizon_guest_stack::current_stack_bytes;

@@ -18,11 +18,14 @@ fn main() {
             .map(|(key, value)| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
             .collect();
         horizon_game::boot_log(&format!(
-            "launch: args={:?} env={envs:?}",
+            "launch: stack={:?} bytes, args={:?} env={envs:?}",
+            horizon_game::current_stack_bytes(),
             std::env::args().collect::<Vec<_>>()
         ));
     }
     horizon_game::prepare_main_stack();
+    #[cfg(target_os = "ios")]
+    horizon_game::boot_log("launch: stack ready");
     std::hint::black_box(&GAME_IDENTITY);
     horizon_official::register();
     horizon_game::boot_log("launch: hooks registered");

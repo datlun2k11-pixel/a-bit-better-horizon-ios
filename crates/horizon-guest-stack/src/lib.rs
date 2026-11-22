@@ -46,10 +46,33 @@ pub fn prepare_main() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "ios")))]
 fn prepare() -> std::io::Result<()> {
     // Executable link settings reserve the same stack on Windows and macOS.
     inspect_current().map_err(std::io::Error::other)
+}
+
+#[cfg(target_os = "ios")]
+fn prepare() -> std::io::Result<()> {
+    // UIKit's main loop must run on the main thread, and iOS fixes that thread's stack at about
+    // 1 MiB: the link setting asks for more, but the kernel may ignore it, and refusing to start
+    // would leave the game unlaunchable. The guest shares this thread as it did before the stack
+    // policy existed, so only the probe is skipped; guest-capable workers still reserve 136 MiB.
+    Ok(())
+}
+
+/// The calling thread's stack size, on platforms that report it. Logged before the main-thread
+/// probe so a launch that dies inside it still says what the kernel granted.
+pub fn current_stack_bytes() -> Option<usize> {
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: pthread_self names the live calling thread.
+        Some(unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) })
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
