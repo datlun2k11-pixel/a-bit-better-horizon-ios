@@ -1,6 +1,6 @@
 [package]
 name = "horizon-prepare"
-version = "0.2.98"
+version = "0.2.99"
 edition = "2021"
 rust-version.workspace = true
 license = "LGPL-3.0-or-later"

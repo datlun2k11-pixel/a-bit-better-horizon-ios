@@ -115,11 +115,25 @@ impl Loading {
         let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
             attributes, "horizon", "horizon",
         );
+        // The game's window is landscape; the launcher widens this to both while it is up
+        // (game/launcher.rs, launcher-visible). A phone asks its root view controller, not the
+        // bundle's `UISupportedInterfaceOrientations`.
+        #[cfg(target_os = "ios")]
+        let attributes = winit::platform::ios::WindowAttributesExtIOS::with_valid_orientations(
+            attributes,
+            winit::platform::ios::ValidOrientations::Landscape,
+        );
+        // winit makes the iOS UIWindow's frame out of the inner size, so a desktop size larger
+        // than the screen in points crops the game off the right and bottom; with none the window
+        // is the screen.
+        #[cfg(not(target_os = "ios"))]
+        let attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(size[0], size[1]));
+        #[cfg(target_os = "ios")]
+        let _ = size;
         // `--offscreen` renders into a texture: its window would only show white.
         let window_step = startup::step("window.create");
         let window = match event_loop.create_window(
             attributes
-                .with_inner_size(winit::dpi::LogicalSize::new(size[0], size[1]))
                 .with_fullscreen(fullscreen.then_some(winit::window::Fullscreen::Borderless(None)))
                 .with_visible(!self.options.as_ref().is_some_and(|o| o.offscreen)),
         ) {
@@ -136,6 +150,20 @@ impl Loading {
             horizon_threads::system_menu::suppress(hwnd);
         }
         drop(window_step);
+        crate::entry::boot_log("load: window");
+        // iPhone and iPad, from the first window: the launcher covers the game while it is idle,
+        // and the renderer is not built until Play (the loader's bundle builds it, set_ui), so a
+        // phone that only browses holds no GPU context and shows no black surface in the meantime.
+        if horizon_ios_launcher::waiting() {
+            self.window = Some(window);
+            let shown = horizon_ios_launcher::present();
+            crate::entry::boot_log(if shown {
+                "launcher: presented"
+            } else {
+                "launcher: not this bundle"
+            });
+            return;
+        }
         // The renderer takes seconds to build and winit's window sits white
         // until the first frame presents, so paint the boot screen on it and
         // keep repainting it as the console's lines arrive; the wgpu frames
