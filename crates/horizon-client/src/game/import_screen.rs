@@ -316,11 +316,24 @@ impl Loading {
         }
         self.progress = Progress::new();
         self.refresh_import_root(&home)?;
+        // The start pointed the save upgrader at the root it saw before the import.
+        horizon_world::datafix::set_resources(
+            &std::path::absolute(&self.vanilla_root).unwrap_or_else(|_| self.vanilla_root.clone()),
+        );
         let options = self.options.take().ok_or("loading already finished")?;
+        crate::entry::boot_log("import: files arrived");
+        // A phone's first start has not registered its content yet: the prepared files were
+        // missing then, and every registration reads them.
+        if std::mem::take(&mut self.register_content_on_import)
+            && let Err(error) = super::register_content(&options, &self.vanilla_root)
+        {
+            self.options = Some(options);
+            return Err(error);
+        }
         let spawned = startup_menu::spawn_loader(
             &options,
             &self.settings,
-            options.execution_role.into(),
+            mods::LoadRole::startup(options.execution_role),
             &self.vanilla_root,
             self.started,
             &self.progress,

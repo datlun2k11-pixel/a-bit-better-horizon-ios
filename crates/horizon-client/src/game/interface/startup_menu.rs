@@ -1353,6 +1353,11 @@ impl Loading {
     }
 
     pub(super) fn draw_menu(&mut self, batch: &mut HudBatch) {
+        if self.importing() {
+            // The one screen a game with no files can draw, in the one font it has without them.
+            self.draw_import(batch);
+            return;
+        }
         let logs = horizon_client::logging::recent_lines();
         let Some(gui) = &self.gui else {
             // The pack's screens do not exist yet: the boot screen holds the
@@ -1573,6 +1578,7 @@ mod tests {
             title_drawn: false,
             menu: StartupMenu::default(),
             import: None,
+            register_content_on_import: false,
             error: None,
         }
     }

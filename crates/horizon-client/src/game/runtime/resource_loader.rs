@@ -259,17 +259,26 @@ pub(super) fn run_loading(
     vanilla_root: PathBuf,
     pack_error: Option<String>,
     started: Instant,
+    wait_for_files: bool,
 ) -> Result<()> {
     let progress = Progress::new();
-    crate::entry::boot_log("load: spawn loader");
-    let (receiver, loader) = startup_menu::spawn_loader(
-        &options,
-        &settings,
-        mods::LoadRole::startup(options.execution_role),
-        &vanilla_root,
-        started,
-        &progress,
-    )?;
+    // A phone with no game files starts no loader: the import screen waits for them and starts
+    // one itself once they arrive (game/import_screen.rs).
+    let (receiver, loader) = if wait_for_files {
+        let (_sender, receiver) = std::sync::mpsc::channel::<LoaderMsg>();
+        (receiver, None)
+    } else {
+        crate::entry::boot_log("load: spawn loader");
+        let (receiver, loader) = startup_menu::spawn_loader(
+            &options,
+            &settings,
+            mods::LoadRole::startup(options.execution_role),
+            &vanilla_root,
+            started,
+            &progress,
+        )?;
+        (receiver, Some(loader))
+    };
     let menu = startup_menu::StartupMenu::new(&options, pack_error.as_deref())?;
     let loading = Loading {
         window: None,
@@ -288,12 +297,13 @@ pub(super) fn run_loading(
         receiver,
         loaded: None,
         delivered: false,
-        handle: Some(loader),
+        handle: loader,
         shown: false,
         ui_at: None,
         title_drawn: false,
         menu,
         import: None,
+        register_content_on_import: wait_for_files,
         error: None,
     };
     let mut app = App::Loading(Box::new(loading));

@@ -187,12 +187,22 @@ impl Options {
             .parent()
             .ok_or("missing executable directory")?
             .join("resources");
+        // On a phone, the folder an import unpacked into `Documents` is the one a player can
+        // reach; on Linux the game files a start downloaded live in the game's home
+        // (`import::home`). A desktop without them keeps its usual answer.
+        let sandbox = if cfg!(any(target_os = "ios", target_os = "android")) {
+            std::env::current_dir().ok()
+        } else if cfg!(target_os = "linux") {
+            Some(horizon_client::import::home())
+        } else {
+            None
+        };
         let mut o = Self {
-            resources: if sibling.join("horizon-resources.json").exists() {
-                sibling
-            } else {
-                std::path::Path::new(".local/horizon-client").join(horizon_core::VANILLA_VERSION)
-            },
+            resources: horizon_client::import::resources_root(&sibling, sandbox.as_deref())
+                .unwrap_or_else(|| {
+                    std::path::Path::new(".local/horizon-client")
+                        .join(horizon_core::VANILLA_VERSION)
+                }),
             resources_given: false,
             distance: 12,
             distance_override: None,

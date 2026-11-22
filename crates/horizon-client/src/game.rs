@@ -11140,6 +11140,98 @@ fn hwnd(window: &Window) -> Option<isize> {
 
 pub use launch_api::{UsageError, exit_code};
 
+/// The content every start registers before a loader reads a resource: the native runtime's
+/// packages, the registries built from `registries.json`, and what the mods add to them. A phone's
+/// first start runs it when the import brings the game files (`game/import_screen.rs`), because a
+/// bundle has no prepared resources to read.
+fn register_content(options: &Options, vanilla_root: &std::path::Path) -> Result<()> {
+    crate::entry::boot_log("play: register content");
+    let mod_phase = mod_api::__private::PhaseOwner::new(mod_api::__private::ModPhase::Packages);
+    api_values::install_packages(options.mods.native.packages(), &options.mods.selected)?;
+    mods::install_registration_data(vanilla_root)?;
+    {
+        use mod_api::__private::game::RegistrationContextNew;
+        let context = mod_api::RegistrationContext::new();
+        let inventory: Vec<_> = context.mods().iter().cloned().collect();
+        crate::entry::initialize_code(&inventory);
+    }
+    horizon_engine_slots::seal().expect("engine registration seals once at startup");
+    arm_points!();
+    mod_phase.advance(mod_api::__private::ModPhase::Registration)?;
+    crate::game::part_admission::admit_parts(mod_api::__private::mods())?;
+    // The structure types those mods registered, handed to the engine before
+    // any world opens, as its StructureRegistry reads them.
+    if horizon_world::worldgen::structure::mod_types::install_mod_structure_types(
+        native_structure_types::installed_structure_types(),
+    )
+    .is_err()
+    {
+        log::warn!("Mod structure types already installed; keeping the first table");
+    }
+    // The levels they registered, below the data packs of every world opened.
+    if horizon_world::worldgen::overrides::install_mod_dimensions(
+        native_dimensions::installed_dimensions(),
+    )
+    .is_err()
+    {
+        log::warn!("Mod dimensions already installed; keeping the first table");
+    }
+    // Their chunk generators and biome sources, which those levels' and the packs' stems name,
+    // and density function types, which the packs' density JSON names.
+    native_chunk_generator::install();
+    native_biome_source::install();
+    native_density_function::install();
+    mods::register_components(vanilla_root)?;
+    mods::register_standalone_models(options.execution_role);
+    mods::register_layer_definitions(options.execution_role, vanilla_root);
+    mods::register_debug_entries(options.execution_role);
+    mods::register_gui_layers(options.execution_role);
+    mods::register_map_decoration_types();
+    mods::register_range_select_item_model_properties(options.execution_role);
+    mods::register_select_item_model_properties(options.execution_role);
+    mods::register_resource_sources(options.execution_role);
+    mods::register_enchantment_damage_effects();
+    mods::register_client_presentations(options.execution_role);
+    mods::register_meshing(options.execution_role);
+    mods::register_particles(options.execution_role);
+    mods::freeze_declarations()?;
+    mod_phase.advance(mod_api::__private::ModPhase::Setup)?;
+    Ok(())
+}
+
+/// Minecraft's constructor and the window's hooks, which a start runs once however the content
+/// was registered. A phone's first start runs them before the wait for its game files, and
+/// `register_content` follows the import (`game/import_screen.rs`).
+fn start_session(options: &Options, early_settings: &mut Settings) -> Result<()> {
+    // Minecraft.<init>: read the last start's flag, then mark this one as not
+    // finished until onGameLoadFinished. A dedicated server has no options.txt.
+    if options.execution_role.is_client() && !horizon_ios_launcher::waiting() {
+        mark_game_start(early_settings);
+    }
+    // Minecraft's constructor opens the narrator; a server has none.
+    if options.execution_role.is_client() {
+        narrator::start(early_settings);
+    }
+    // Someone is playing: the anonymous ping behind the launcher's "N playing now", and the
+    // official server in their list (servers.dat in the game folder, the working directory). Not
+    // for a server, a benchmark, a run that quits by itself, a harness's fixture or a run that
+    // horizon-ctl drives: those start in a source checkout and wrote the list there.
+    if !options.offscreen && !synchronous_startup(options) && !horizon_ios_launcher::waiting() {
+        let version = horizon_client::telemetry::version();
+        let game_dir = horizon_client::logging::player_dir();
+        horizon_hooks::engine::started(&horizon_hooks::Started::new(&version, &game_dir));
+    }
+    // A game window's hooks (Discord's presence): never for a server, and not while
+    // the iOS launcher still owns the session.
+    if !horizon_ios_launcher::waiting() {
+        activity::client_started(options);
+    }
+    // Snapshots of derived tables live in the game folder, never beside the
+    // shared resources.
+    Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+    Ok(())
+}
+
 pub(crate) fn run_with(
     options: Options,
     native: horizon_mod_package::runtime::Runtime,
@@ -11215,85 +11307,23 @@ pub(crate) fn run_with(
     options
         .mods
         .select(&std::env::current_dir()?, &early_settings.mods.enabled);
-    let mod_phase = mod_api::__private::PhaseOwner::new(mod_api::__private::ModPhase::Packages);
-    api_values::install_packages(options.mods.native.packages(), &options.mods.selected)?;
-    mods::install_registration_data(&vanilla_root)?;
+    // A phone that has no game files yet has nothing to register from: the loading screen
+    // waits for them (the download, Wi-Fi, or the Files app) and registers the content the
+    // moment they are in place (game/import_screen.rs). iOS allows one event loop per process,
+    // so this start must use it for the wait rather than for a load that cannot finish.
+    if !synchronous_startup(&options)
+        && import_loading_screen(&options)
+        && missing_resources(&vanilla_root, horizon_hooks::engine::get_the_game()).is_some()
     {
-        use mod_api::__private::game::RegistrationContextNew;
-        let context = mod_api::RegistrationContext::new();
-        let inventory: Vec<_> = context.mods().iter().cloned().collect();
-        crate::entry::initialize_code(&inventory);
+        crate::entry::boot_log("play: waiting for game files");
+        start_session(&options, &mut early_settings)?;
+        return run_loading(options, early_settings, vanilla_root, None, started, true);
     }
-    horizon_engine_slots::seal().expect("engine registration seals once at startup");
-    arm_points!();
-    mod_phase.advance(mod_api::__private::ModPhase::Registration)?;
-    crate::game::part_admission::admit_parts(mod_api::__private::mods())?;
-    // The structure types those mods registered, handed to the engine before
-    // any world opens, as its StructureRegistry reads them.
-    if horizon_world::worldgen::structure::mod_types::install_mod_structure_types(
-        native_structure_types::installed_structure_types(),
-    )
-    .is_err()
-    {
-        log::warn!("Mod structure types already installed; keeping the first table");
-    }
-    // The levels they registered, below the data packs of every world opened.
-    if horizon_world::worldgen::overrides::install_mod_dimensions(
-        native_dimensions::installed_dimensions(),
-    )
-    .is_err()
-    {
-        log::warn!("Mod dimensions already installed; keeping the first table");
-    }
-    // Their chunk generators and biome sources, which those levels' and the packs' stems name,
-    // and density function types, which the packs' density JSON names.
-    native_chunk_generator::install();
-    native_biome_source::install();
-    native_density_function::install();
-    mods::register_components(&vanilla_root)?;
-    mods::register_standalone_models(options.execution_role);
-    mods::register_layer_definitions(options.execution_role, &vanilla_root);
-    mods::register_debug_entries(options.execution_role);
-    mods::register_gui_layers(options.execution_role);
-    mods::register_map_decoration_types();
-    mods::register_range_select_item_model_properties(options.execution_role);
-    mods::register_select_item_model_properties(options.execution_role);
-    mods::register_resource_sources(options.execution_role);
-    mods::register_enchantment_damage_effects();
-    mods::register_client_presentations(options.execution_role);
-    mods::register_meshing(options.execution_role);
-    mods::register_particles(options.execution_role);
-    mods::freeze_declarations()?;
-    mod_phase.advance(mod_api::__private::ModPhase::Setup)?;
-    // Minecraft.<init>: read the last start's flag, then mark this one as not
-    // finished until onGameLoadFinished. A dedicated server has no options.txt.
-    if options.execution_role.is_client() && !horizon_ios_launcher::waiting() {
-        mark_game_start(&mut early_settings);
-    }
-    // Minecraft's constructor opens the narrator; a server has none.
-    if options.execution_role.is_client() {
-        narrator::start(&early_settings);
-    }
-    // Someone is playing: the anonymous ping behind the launcher's "N playing now", and the
-    // official server in their list (servers.dat in the game folder, the working directory). Not
-    // for a server, a benchmark, a run that quits by itself, a harness's fixture or a run that
-    // horizon-ctl drives: those start in a source checkout and wrote the list there.
-    if !options.offscreen && !synchronous_startup(&options) && !horizon_ios_launcher::waiting() {
-        let version = horizon_client::telemetry::version();
-        let game_dir = horizon_client::logging::player_dir();
-        horizon_hooks::engine::started(&horizon_hooks::Started::new(&version, &game_dir));
-    }
-    // A game window's hooks (Discord's presence): never for a server, and not while
-    // the iOS launcher still owns the session.
-    if !horizon_ios_launcher::waiting() {
-        activity::client_started(&options);
-    }
-    // Snapshots of derived tables live in the game folder, never beside the
-    // shared resources.
-    Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+    register_content(&options, &vanilla_root)?;
+    start_session(&options, &mut early_settings)?;
     if !synchronous_startup(&options) {
         crate::entry::boot_log("play: loading");
-        return run_loading(options, early_settings, vanilla_root, None, started);
+        return run_loading(options, early_settings, vanilla_root, None, started, false);
     }
     let mut pack_error = None;
     let selected_root = packs::startup_root(

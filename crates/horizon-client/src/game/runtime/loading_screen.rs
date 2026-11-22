@@ -78,6 +78,9 @@ pub(super) struct Loading {
     pub(super) menu: startup_menu::StartupMenu,
     /// The wait for game files to be brought while there are none (game/import_screen.rs).
     pub(in crate::game) import: Option<crate::game::import_screen::Import>,
+    /// A phone's first start: the content is registered when the import brings the files,
+    /// before the loader reads them (game/import_screen.rs and `register_content`).
+    pub(in crate::game) register_content_on_import: bool,
     pub(super) error: Option<Box<dyn std::error::Error>>,
 }
 /// How long the handoff waits for the first title frame before building the
@@ -265,7 +268,27 @@ impl Loading {
             event_loop.exit();
             return;
         }
-        if let Err(error) = self.poll_menu_resources() {
+        // A phone's first start begins its wait only once the window is up: the download
+        // overlay and the screen both need it.
+        if self.register_content_on_import && self.import.is_none() && self.window.is_some() {
+            crate::entry::boot_log("load: waiting for game files");
+            self.wait_for_files(
+                "Horizon has no game files yet: they have to be downloaded or sent once".into(),
+            );
+        }
+        // A phone waiting for its game files reads the doors that bring them, not a loader
+        // that has not started (game/import_screen.rs).
+        if let Err(error) = if self.importing() {
+            self.poll_import()
+        } else {
+            self.poll_menu_resources()
+        } {
+            // A phone says why on the screen it is already showing, and waits for a fresh
+            // import, rather than closing with nothing said.
+            if horizon_client::import::waits_on_screen() && !self.importing() {
+                self.wait_for_files(error.to_string());
+                return;
+            }
             self.error = Some(error);
             event_loop.exit();
             return;
@@ -496,6 +519,16 @@ impl ApplicationHandler for App {
             Step::Ready(game) => *self = App::Ready(game),
             Step::Done => event_loop.exit(),
             Step::Failed(e) => {
+                // A phone with nothing to load has one useful move left: stay open, say what
+                // it needs, and take the files over Wi-Fi, a cable or the download. There is no
+                // terminal behind the window to read the reason in.
+                if let App::Loading(loading) = self
+                    && horizon_client::import::waits_on_screen()
+                {
+                    loading.error = None;
+                    loading.wait_for_files(e.to_string());
+                    return;
+                }
                 if let App::Loading(loading) = self {
                     loading.error = Some(e);
                 }
