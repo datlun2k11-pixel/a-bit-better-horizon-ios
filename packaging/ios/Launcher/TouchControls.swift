@@ -186,6 +186,33 @@ struct TouchConfiguration: Codable, Equatable {
     }
 }
 
+/// The synchronous C reader may be called from a different thread. Only plain
+/// values are read under this lock; there are no UIKit calls in the render loop.
+final class TouchPreferences: ObservableObject {
+    static let shared = TouchPreferences()
+    static let key = "touchControls.v1"
+    @Published private(set) var configuration: TouchConfiguration
+    private let defaults: UserDefaults
+    private let lock = NSLock()
+    private var cached: TouchConfiguration
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let config = defaults.data(forKey: Self.key).flatMap { try? JSONDecoder().decode(TouchConfiguration.self, from: $0) } ?? TouchConfiguration()
+        configuration = config; cached = config
+    }
+    func save(_ value: TouchConfiguration) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        defaults.set(data, forKey: Self.key)
+        lock.lock(); cached = value; lock.unlock()
+        configuration = value
+    }
+    func snapshot() -> ([Float], UInt32) {
+        lock.lock(); defer { lock.unlock() }
+        return cached.snapshot()
+    }
+}
+
 /// UIKit recognizes the same tap/long-press/two-finger gestures used by the
 /// reference launcher. The Rust frontend consumes their results on its frame
 /// thread; the callbacks never access game state or player files.
