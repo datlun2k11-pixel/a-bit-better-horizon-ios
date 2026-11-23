@@ -1491,6 +1491,14 @@ fn prepared_at(resources: &Path) -> bool {
     if read_json(&resources.join(RESOURCES_MANIFEST)).is_none() {
         return false;
     }
+    // The game crashes on "registries.json not found" without it, so a prepared
+    // folder must hold it non-empty before Play is allowed to start.
+    let registries = resources.join("registries.json");
+    if !registries.is_file()
+        || fs::metadata(&registries).is_ok_and(|meta| meta.len() == 0)
+    {
+        return false;
+    }
     let Ok(entries) = fs::read_dir(resources) else {
         return false;
     };
