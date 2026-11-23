@@ -186,9 +186,6 @@ struct TouchConfiguration: Codable, Equatable {
     }
 }
 
-    }
-}
-
 /// UIKit recognizes the same tap/long-press/two-finger gestures used by the
 /// reference launcher. The Rust frontend consumes their results on its frame
 /// thread; the callbacks never access game state or player files.
