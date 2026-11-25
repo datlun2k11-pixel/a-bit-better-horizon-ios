@@ -150,14 +150,14 @@ impl Loading {
             horizon_threads::system_menu::suppress(hwnd);
         }
         drop(window_step);
-        crate::entry::boot_log("load: window");
+        crate::boot_log!("load: window");
         // iPhone and iPad, from the first window: the launcher covers the game while it is idle,
         // and the renderer is not built until Play (the loader's bundle builds it, set_ui), so a
         // phone that only browses holds no GPU context and shows no black surface in the meantime.
         if horizon_ios_launcher::waiting() {
             self.window = Some(window);
             let shown = horizon_ios_launcher::present();
-            crate::entry::boot_log(if shown {
+            crate::boot_log!(if shown {
                 "launcher: presented"
             } else {
                 "launcher: not this bundle"
@@ -223,7 +223,7 @@ impl Loading {
         // iPhone and iPad: the launcher's home screen covers the game from its first window until
         // Play. A bundle without the framework starts by itself (horizon-ios-launcher).
         let shown = horizon_ios_launcher::present();
-        crate::entry::boot_log(if shown {
+        crate::boot_log!(if shown {
             "launcher: presented"
         } else {
             "launcher: not this bundle"

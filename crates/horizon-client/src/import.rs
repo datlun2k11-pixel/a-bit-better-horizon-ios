@@ -97,6 +97,7 @@ pub fn boot(home: &Path) {
     {
         return;
     }
+    crate::boot_log!("import: boot started");
     *BOOT_DONE.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
     let home = home.to_owned();
     let spawned = std::thread::Builder::new()
@@ -104,18 +105,30 @@ pub fn boot(home: &Path) {
         .spawn(move || {
             // Also on a panic: the loader must never wait on a thread that is gone.
             let _finished = FinishBoot;
+            crate::boot_log!("import: worker started");
             // A swap that a flat battery or a crash left half done is finished, or the old tree put
             // back, before anything reads the folder it was working on.
             match recover(&home) {
-                Ok(Some(path)) => log::info!("Horizon: finished the import at {}", path.display()),
-                Ok(None) => {}
-                Err(error) => log::error!("Horizon: could not finish the last import: {error}"),
+                Ok(Some(path)) => {
+                    crate::boot_log!("import: recovered");
+                    log::info!("Horizon: finished the import at {}", path.display())
+                }
+                Ok(None) => {
+                    crate::boot_log!("import: nothing to recover");
+                }
+                Err(error) => {
+                    crate::boot_log!("import: recover failed");
+                    log::error!("Horizon: could not finish the last import: {error}")
+                }
             }
             // The cable's door: an archive dropped into `Documents` is installed here, so the
             // launch it was dropped for is the one that finds it.
+            crate::boot_log!("import: scanning");
             scan(&home);
+            crate::boot_log!("import: scan done");
         });
     if let Err(error) = spawned {
+        crate::boot_log!("import: worker spawn failed");
         log::error!("Horizon: could not start the import worker: {error}");
         finish_boot();
     }
@@ -584,6 +597,7 @@ impl Pack {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.item.clone());
         let total_files = self.total_files;
+        crate::boot_log!("import: install start {} ({} files)", label, total_files);
         set_status(Some(ImportStatus {
             label,
             files: 0,
@@ -594,9 +608,13 @@ impl Pack {
         let result = self.install_now(home);
         let mut status = STATUS.lock().unwrap_or_else(PoisonError::into_inner);
         match &result {
-            Ok(_) => *status = None,
+            Ok(_) => {
+                crate::boot_log!("import: install success");
+                *status = None
+            }
             // Kept for the launcher to show: a phone's player can read the screen, not the log.
             Err(error) => {
+                crate::boot_log!("import: install failed: {error}");
                 if let Some(status) = status.as_mut() {
                     status.error = Some(error.to_string());
                 } else {
@@ -623,6 +641,7 @@ impl Pack {
                 // A pack stays an archive: the game reads zips straight out of `resourcepacks`
                 // (`packs::discover`), so unpacking one would only lose what vanilla players expect.
                 Kind::ResourcePack => {
+                    crate::boot_log!("import: installing resource pack");
                     let dest = unique(&home.join(folder).join(format!("{}.zip", self.item)));
                     if self.prefix.is_empty() {
                         move_file(&archive, &dest)?;
@@ -630,22 +649,27 @@ impl Pack {
                         self.normalize_resource_pack(&dest)?;
                     }
                     let bytes = fs::metadata(&dest)?.len();
+                    crate::boot_log!("import: resource pack installed");
                     (dest, 1, bytes)
                 }
                 // A world is never written over: what would be overwritten is the player's own.
                 Kind::World => {
+                    crate::boot_log!("import: installing world");
                     let dest = unique(&home.join(folder).join(&self.item));
                     let (files, bytes) = self.unpack(&dest, &mut report_progress)?;
                     fs::remove_file(&archive)?;
+                    crate::boot_log!("import: world installed");
                     (dest, files, bytes)
                 }
                 Kind::Resources => {
+                    crate::boot_log!("import: installing game resources");
                     let scratch = home.join("resources.unpacking");
                     let _ = fs::remove_dir_all(&scratch);
                     let (files, bytes) = self.unpack(&scratch, &mut report_progress)?;
                     let dest = home.join(folder);
                     publish(&scratch, &dest)?;
                     fs::remove_file(&archive)?;
+                    crate::boot_log!("import: game resources installed");
                     (dest, files, bytes)
                 }
             };
@@ -689,21 +713,25 @@ pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
     if !home.exists() {
         return Ok(None);
     }
+    crate::boot_log!("import: recover started");
     with_home_access(home, || {
         let scratch = home.join("resources.unpacking");
         let dest = home.join(Kind::Resources.folder());
         let previous = home.join("resources.previous");
         if scratch.is_dir() && !dest.exists() {
+            crate::boot_log!("import: recover from scratch");
             fs::rename(&scratch, &dest)?;
             horizon_core::prepared_files::invalidate(&dest);
             return Ok(Some(dest));
         }
         if !dest.exists() && previous.is_dir() {
+            crate::boot_log!("import: recover from previous");
             fs::rename(&previous, &dest)?;
             horizon_core::prepared_files::invalidate(&dest);
             return Ok(Some(dest));
         }
         // Both landed: the new tree is in place, so what is left over is scratch and the old copy.
+        crate::boot_log!("import: recover: cleaning up");
         let _ = fs::remove_dir_all(&scratch);
         let _ = fs::remove_dir_all(&previous);
         Ok(None)
@@ -856,21 +884,25 @@ pub fn scan(home: &Path) -> Vec<Installed> {
     let Ok(entries) = fs::read_dir(home) else {
         return installed;
     };
+    crate::boot_log!("import: scan started");
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("zip") {
             continue;
         }
+        crate::boot_log!("import: found archive {}", path.display());
         let pack = match Pack::open(&path) {
             Ok(pack) => pack,
             // Somebody else's archive, or not an archive: not ours to touch.
             Err(error) => {
+                crate::boot_log!("import: not a horizon archive {}", path.display());
                 log::info!("Horizon: leaving {} alone: {error}", path.display());
                 continue;
             }
         };
         match pack.install(home) {
             Ok(placed) => {
+                crate::boot_log!("import: installed {} ({})", placed.kind.label(), placed.path.display());
                 log::info!(
                     "Horizon: imported {} {} to {} ({} files, {} bytes)",
                     placed.kind.label(),
@@ -887,6 +919,7 @@ pub fn scan(home: &Path) -> Vec<Installed> {
             }
             Err(error) => {
                 let parked = path.with_extension("zip.failed");
+                crate::boot_log!("import: failed {} -> {}", path.display(), parked.display());
                 log::error!(
                     "Horizon: {} would not import: {error}; leaving it as {}",
                     path.display(),
@@ -896,6 +929,7 @@ pub fn scan(home: &Path) -> Vec<Installed> {
             }
         }
     }
+    crate::boot_log!("import: scan complete ({} archives)", installed.len());
     installed
 }
 

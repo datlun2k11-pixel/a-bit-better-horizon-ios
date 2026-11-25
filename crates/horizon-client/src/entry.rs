@@ -6,6 +6,31 @@ use horizon_mod_package::selection::{Argument, LaunchArguments};
 pub(crate) mod dedicated_arguments;
 pub(crate) mod runtime_environment;
 
+/// Macro for detailed boot logging with automatic file/line capture.
+#[macro_export]
+macro_rules! boot_log {
+    ($stage:expr $(,)?) => {
+        #[cfg(target_os = "ios")]
+        crate::entry::boot_log_detailed($stage, file!(), line!());
+        #[cfg(not(target_os = "ios"))]
+        crate::entry::boot_log($stage);
+    };
+}
+
+/// Macro for boot logging with captured backtrace.
+#[macro_export]
+macro_rules! boot_log_bt {
+    ($stage:expr $(,)?) => {
+        #[cfg(target_os = "ios")]
+        {
+            let bt = std::backtrace::Backtrace::capture();
+            crate::entry::boot_log_with_backtrace($stage, &bt.to_string());
+        }
+        #[cfg(not(target_os = "ios"))]
+        crate::entry::boot_log($stage);
+    };
+}
+
 /// Start the game where a phone lets it write.
 ///
 /// iOS hands an app a working directory of `/`, which is read-only, while the game builds its world saves,
@@ -72,12 +97,70 @@ pub fn boot_log(stage: &str) {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let _ = writeln!(file, "{ms} {stage}");
+    let thread_name = std::thread::current().name().unwrap_or("unnamed");
+    let _ = writeln!(file, "{ms} [{thread_name}] {stage}");
+    let _ = file.flush();
+}
+
+/// Enhanced boot log with file/line context and optional backtrace capture.
+#[cfg(target_os = "ios")]
+pub fn boot_log_detailed(stage: &str, file: &str, line: u32) {
+    use std::io::Write as _;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join("Documents");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut file_handle) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("horizon-boot.log"))
+    else {
+        return;
+    };
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let thread_name = std::thread::current().name().unwrap_or("unnamed");
+    let _ = writeln!(file_handle, "{ms} [{thread_name}] {stage} @ {file}:{line}");
+    let _ = file_handle.flush();
+}
+
+/// Boot log with captured backtrace (for error checkpoints).
+#[cfg(target_os = "ios")]
+pub fn boot_log_with_backtrace(stage: &str, backtrace: &str) {
+    use std::io::Write as _;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join("Documents");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("horizon-boot.log"))
+    else {
+        return;
+    };
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let thread_name = std::thread::current().name().unwrap_or("unnamed");
+    let _ = writeln!(file, "{ms} [{thread_name}] {stage}");
+    for line in backtrace.lines() {
+        let _ = writeln!(file, "{ms} [{thread_name}]   {line}");
+    }
     let _ = file.flush();
 }
 
 #[cfg(not(target_os = "ios"))]
 pub fn boot_log(_stage: &str) {}
+
+#[cfg(not(target_os = "ios"))]
+pub fn boot_log_detailed(_stage: &str, _file: &str, _line: u32) {}
+
+#[cfg(not(target_os = "ios"))]
+pub fn boot_log_with_backtrace(_stage: &str, _backtrace: &str) {}
 
 /// Holder mode runs first. The game's sole Options validation reads arguments/environment
 /// and resource marker metadata only: no logging, account loading, mods or worker threads.
@@ -100,7 +183,7 @@ pub fn prepare() -> Startup {
         std::process::exit(game::exit_code::USAGE);
     });
     let Some(options) = options else {
-        boot_log("entry: validated to no game (help or launch-api): exiting");
+        boot_log!("entry: validated to no game (help or launch-api): exiting");
         std::process::exit(0);
     };
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -166,7 +249,7 @@ pub fn start<G>(
     startup: Startup,
 ) {
     let _ = CODE_RUNTIME.set(code);
-    boot_log("run: entry start");
+    boot_log!("run: entry start");
     let Startup {
         launch,
         options,
@@ -177,13 +260,13 @@ pub fn start<G>(
     // Before the event loop: iOS asks for the AirPlay scene's delegate by name when a display connects.
     horizon_airplay::register();
     horizon_airplay::audio::start();
-    boot_log("run: airplay");
+    boot_log!("run: airplay");
     #[cfg(target_os = "ios")]
     let documents = match into_app_sandbox() {
         Ok(documents) => documents,
         Err(error) => {
             eprintln!("Horizon: {error}");
-            boot_log(&format!("run: sandbox refused: {error}"));
+            boot_log!("run: sandbox refused: {error}");
             std::process::exit(1);
         }
     };
@@ -240,14 +323,14 @@ pub fn start<G>(
         logging::player_dir_override().unwrap_or(home.as_path()),
         thread,
     );
-    boot_log("run: logging ready");
+    boot_log!("run: logging ready");
     // The log's first line names the build, so a bug report that carries the log says which one it was.
     log::info!("Horizon {}", crash::version());
     // Mods' startup bars and lines (`RegistrationContext::progress`), before they register.
     game::startup_progress::install(side == "server");
     // Mod loading emits refusals; both client and dedicated logs must exist first.
     let (_ids, _loaded_code) = load(&native, &launch);
-    boot_log("run: mods loaded");
+    boot_log!("run: mods loaded");
     crash::install(home.clone(), side);
     // winit has no logger of its own on a phone: its lines stay in the device console, which is
     // not in the log a player shares. Its side of a missed touch, a dead gesture or a memory
@@ -265,7 +348,7 @@ pub fn start<G>(
     // only door an archive dropped into `Documents` has.
     #[cfg(any(target_os = "ios", target_os = "android"))]
     horizon_client::import::boot(&documents);
-    boot_log("run: import boot");
+    boot_log!("run: import boot");
     if horizon_world::native_load_hooks::install(
         horizon_world::native_load_hooks::NativeLoadHooks {
             item_ability_default: horizon_items::item_abilities::vanilla_can_perform,
@@ -322,9 +405,9 @@ pub fn start<G>(
     }
     install_client_hooks();
     raise_open_file_limit();
-    boot_log("run: event loop");
+    boot_log!("run: event loop");
     if let Err(error) = game::run_with(options, native) {
-        boot_log(&format!("run: returned an error: {error}"));
+        boot_log!("run: returned an error: {error}");
         // A bad command line is the caller's mistake, not a crash: no report.
         let missing_mods = game::dedicated::is_missing_mods_refusal(error.as_ref());
         let usage = error.is::<game::UsageError>() || missing_mods;
@@ -334,6 +417,7 @@ pub fn start<G>(
         logging::flush();
         // The report's path is the last line on stderr (crash::SAVED_LINE).
         if !usage {
+            boot_log_bt!("run: crash report");
             crash::report_error(&home, side, &*error);
         }
         // Started from Explorer, the console window closes with the game:

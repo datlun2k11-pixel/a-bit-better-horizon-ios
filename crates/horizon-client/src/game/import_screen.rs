@@ -61,6 +61,7 @@ impl Loading {
         // browse must not be held on a transfer it did not ask for. These are the doors that need
         // no server: the folder the Files app shows, and a Wi-Fi listener for an upload.
         let session = open_session(&home);
+        crate::boot_log!("import_screen: waiting for files ({reason})");
         log::warn!(
             "Horizon: no game files to load ({reason}); waiting for an import in {}",
             home.display()
@@ -190,6 +191,7 @@ impl Loading {
             }
         }
         if ready {
+            crate::boot_log!("import_screen: files arrived, restarting loader");
             return self.files_arrived();
         }
         Ok(())
@@ -203,6 +205,7 @@ impl Loading {
             .take()
             .map(|import| import.home)
             .unwrap_or_default();
+        crate::boot_log!("import_screen: files_arrived, restarting load");
         self.load_the_files_that_arrived(home)
     }
 
@@ -296,7 +299,7 @@ impl Loading {
             &std::path::absolute(&self.vanilla_root).unwrap_or_else(|_| self.vanilla_root.clone()),
         );
         let options = self.options.take().ok_or("loading already finished")?;
-        crate::entry::boot_log("import: files arrived");
+        crate::boot_log!("import_screen: files arrived, spawning loader");
         // A phone's first start has not registered its content yet: the prepared files were
         // missing then, and every registration reads them.
         if std::mem::take(&mut self.register_content_on_import)
