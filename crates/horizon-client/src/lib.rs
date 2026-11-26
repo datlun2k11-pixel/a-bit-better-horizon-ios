@@ -10,6 +10,7 @@ pub use horizon_client_lib::carrier_store;
 pub use horizon_client_lib::*;
 #[doc(hidden)]
 pub mod entry;
+pub mod boot_logging;
 
 // The game's allocator lives in the library, not the executable: the prebuilt game (arismoko/horizon#589) is this crate as a
 // dylib, and the allocator must be the one its code and the mods' executable share. The Windows and macOS archives

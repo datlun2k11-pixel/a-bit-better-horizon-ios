@@ -6,6 +6,8 @@ extern crate self as horizon_client;
 #[global_allocator]
 static TEST_ALLOCATOR: horizon_threads::allocation_probe::Allocator =
     horizon_threads::allocation_probe::Allocator;
+pub mod boot_logging;
+pub mod entry;
 pub mod advancements;
 pub mod ambience;
 pub mod animate_tick;
