@@ -17,6 +17,11 @@ pub fn data_dir_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBu
         if let Some(h) = &home {
             return h.join("Library/Application Support");
         }
+    } else if cfg!(target_os = "ios") {
+        // iOS apps are sandboxed; the writable place is Documents inside the app container.
+        if let Some(h) = &home {
+            return h.join("Documents");
+        }
     } else if let Some(d) = path("XDG_DATA_HOME") {
         return d;
     } else if let Some(h) = &home {
