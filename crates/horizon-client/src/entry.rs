@@ -68,7 +68,7 @@ pub fn prepare() -> Startup {
     })();
     let (launch, options) = result.unwrap_or_else(|error| {
         eprintln!("Horizon: {error}");
-        boot_log(&format!("entry: usage error: {error}"));
+        boot_log!("entry: usage error: {error}");
         std::process::exit(game::exit_code::USAGE);
     });
     let Some(options) = options else {
