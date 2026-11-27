@@ -4,25 +4,25 @@
 /// Macro for detailed boot logging with automatic file/line capture.
 #[macro_export]
 macro_rules! boot_log {
-    ($stage:expr $(,)?) => {
+    ($($arg:tt)*) => {
         #[cfg(target_os = "ios")]
-        crate::boot_logging::boot_log_detailed($stage, file!(), line!());
+        crate::boot_logging::boot_log_detailed(&format!($($arg)*), file!(), line!());
         #[cfg(not(target_os = "ios"))]
-        crate::boot_logging::boot_log($stage);
+        crate::boot_logging::boot_log(&format!($($arg)*));
     };
 }
 
 /// Macro for boot logging with captured backtrace.
 #[macro_export]
 macro_rules! boot_log_bt {
-    ($stage:expr $(,)?) => {
+    ($($arg:tt)*) => {
         #[cfg(target_os = "ios")]
         {
             let bt = std::backtrace::Backtrace::capture();
-            crate::boot_logging::boot_log_with_backtrace($stage, &bt.to_string());
+            crate::boot_logging::boot_log_with_backtrace(&format!($($arg)*), &bt.to_string());
         }
         #[cfg(not(target_os = "ios"))]
-        crate::boot_logging::boot_log($stage);
+        crate::boot_logging::boot_log(&format!($($arg)*));
     };
 }
 
