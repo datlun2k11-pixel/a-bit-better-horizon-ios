@@ -45,7 +45,8 @@ pub fn boot_log(stage: &str) {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let thread_name = std::thread::current().name().unwrap_or("unnamed");
+    let thread = std::thread::current();
+    let thread_name = thread.name().unwrap_or("unnamed");
     let _ = writeln!(file, "{ms} [{thread_name}] {stage}");
     let _ = file.flush();
 }
@@ -69,7 +70,8 @@ pub fn boot_log_detailed(stage: &str, file: &str, line: u32) {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let thread_name = std::thread::current().name().unwrap_or("unnamed");
+    let thread = std::thread::current();
+    let thread_name = thread.name().unwrap_or("unnamed");
     let _ = writeln!(file_handle, "{ms} [{thread_name}] {stage} @ {file}:{line}");
     let _ = file_handle.flush();
 }
@@ -93,7 +95,8 @@ pub fn boot_log_with_backtrace(stage: &str, backtrace: &str) {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let thread_name = std::thread::current().name().unwrap_or("unnamed");
+    let thread = std::thread::current();
+    let thread_name = thread.name().unwrap_or("unnamed");
     let _ = writeln!(file, "{ms} [{thread_name}] {stage}");
     for line in backtrace.lines() {
         let _ = writeln!(file, "{ms} [{thread_name}]   {line}");
