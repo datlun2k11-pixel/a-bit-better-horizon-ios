@@ -157,7 +157,7 @@ impl Loading {
         if horizon_ios_launcher::waiting() {
             self.window = Some(window);
             let shown = horizon_ios_launcher::present();
-            crate::boot_log!(if shown {
+            crate::boot_log!("{}", if shown {
                 "launcher: presented"
             } else {
                 "launcher: not this bundle"
@@ -223,7 +223,7 @@ impl Loading {
         // iPhone and iPad: the launcher's home screen covers the game from its first window until
         // Play. A bundle without the framework starts by itself (horizon-ios-launcher).
         let shown = horizon_ios_launcher::present();
-        crate::boot_log!(if shown {
+        crate::boot_log!("{}", if shown {
             "launcher: presented"
         } else {
             "launcher: not this bundle"
