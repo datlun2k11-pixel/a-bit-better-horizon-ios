@@ -268,7 +268,7 @@ pub(super) fn run_loading(
         let (_sender, receiver) = std::sync::mpsc::channel::<LoaderMsg>();
         (receiver, None)
     } else {
-        crate::entry::boot_log("load: spawn loader");
+        crate::boot_log!("load: spawn loader");
         let (receiver, loader) = startup_menu::spawn_loader(
             &options,
             &settings,
@@ -307,11 +307,11 @@ pub(super) fn run_loading(
         error: None,
     };
     let mut app = App::Loading(Box::new(loading));
-    crate::entry::boot_log("load: event loop");
+    crate::boot_log!("load: event loop");
     let event_loop = EventLoop::new()?;
-    crate::entry::boot_log("load: event loop built");
+    crate::boot_log!("load: event loop built");
     let result = event_loop.run_app(&mut app);
-    crate::entry::boot_log("load: event loop returned");
+    crate::boot_log!("load: event loop returned");
     narrator::stop();
     match &mut app {
         // Ready: splitscreen around P1's game.

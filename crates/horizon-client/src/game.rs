@@ -11145,7 +11145,7 @@ pub use launch_api::{UsageError, exit_code};
 /// first start runs it when the import brings the game files (`game/import_screen.rs`), because a
 /// bundle has no prepared resources to read.
 fn register_content(options: &Options, vanilla_root: &std::path::Path) -> Result<()> {
-    crate::entry::boot_log("play: register content");
+    crate::boot_log!("play: register content");
     let mod_phase = mod_api::__private::PhaseOwner::new(mod_api::__private::ModPhase::Packages);
     api_values::install_packages(options.mods.native.packages(), &options.mods.selected)?;
     mods::install_registration_data(vanilla_root)?;
@@ -11236,9 +11236,9 @@ pub(crate) fn run_with(
     options: Options,
     native: horizon_mod_package::runtime::Runtime,
 ) -> Result<()> {
-    crate::entry::boot_log("play: run_with");
+    crate::boot_log!("play: run_with");
     let mut options = Options::read(options)?;
-    crate::entry::boot_log("play: options read");
+    crate::boot_log!("play: options read");
     options.mods.native = Arc::new(native);
     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
         && !dedicated::preflight(&mut options)?
@@ -11315,14 +11315,14 @@ pub(crate) fn run_with(
         && import_loading_screen(&options)
         && missing_resources(&vanilla_root, horizon_hooks::engine::get_the_game()).is_some()
     {
-        crate::entry::boot_log("play: waiting for game files");
+        crate::boot_log!("play: waiting for game files");
         start_session(&options, &mut early_settings)?;
         return run_loading(options, early_settings, vanilla_root, None, started, true);
     }
     register_content(&options, &vanilla_root)?;
     start_session(&options, &mut early_settings)?;
     if !synchronous_startup(&options) {
-        crate::entry::boot_log("play: loading");
+        crate::boot_log!("play: loading");
         return run_loading(options, early_settings, vanilla_root, None, started, false);
     }
     let mut pack_error = None;

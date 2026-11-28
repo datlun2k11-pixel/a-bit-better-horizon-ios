@@ -307,7 +307,7 @@ impl Loading {
         // A phone's first start begins its wait only once the window is up: the download
         // overlay and the screen both need it.
         if self.register_content_on_import && self.import.is_none() && self.window.is_some() {
-            crate::entry::boot_log("load: waiting for game files");
+            crate::boot_log!("load: waiting for game files");
             self.wait_for_files(
                 "Horizon has no game files yet: they have to be downloaded or sent once".into(),
             );
